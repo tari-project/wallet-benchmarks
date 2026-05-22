@@ -1,0 +1,17 @@
+{
+  "environment": {
+    "cpu_model": "",
+    "cpu_cores": 0,
+    "ram_gb": 0.0,
+    "disk_type": "",
+    "os": "",
+    "network_to_base_node": "",
+    "console_wallet_version": "",
+    "cli_version": "",
+    "base_node_version": "",
+    "benchmark_tool_version": "1.0.0",
+    "run_timestamp_utc": ""
+  },
+  "configuration": {},
+  "results": {}
+}

@@ -19,6 +19,7 @@ TOOLS_DIR="${POSITIONAL[1]:-tools}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="${SCRIPT_DIR}/../patches/payment-processor-fee-rate.patch"
 MANIFEST="${TOOLS_DIR}/build-manifest.json"
+PROTOC="${SCRIPT_DIR}/protoc-compat.sh"
 source "${SCRIPT_DIR}/build-provenance.sh"
 PP_DIR="${CACHE_DIR}/minotari_payment_processor"
 
@@ -115,6 +116,7 @@ mkdir -p "${PP_DIR}/data"
     sqlite3 data/payments.db < "${migration}"
   done
   DATABASE_URL=sqlite://data/payments.db \
+    PROTOC="${PROTOC}" \
     TARI_TARGET_NETWORK=testnet \
     cargo +"${RUST_TOOLCHAIN}" build --release --locked
 )

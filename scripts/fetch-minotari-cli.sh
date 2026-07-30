@@ -18,6 +18,7 @@ CACHE_DIR="${POSITIONAL[0]:-.bench-cache}"
 TOOLS_DIR="${POSITIONAL[1]:-tools}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${SCRIPT_DIR}/../patches"
+PROTOC="${SCRIPT_DIR}/protoc-compat.sh"
 source "${SCRIPT_DIR}/build-provenance.sh"
 MINOTARI_DIR="${CACHE_DIR}/minotari-cli"
 
@@ -148,18 +149,21 @@ fi
 
 (
   cd "${MINOTARI_DIR}"
-  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari
+  env PROTOC="${PROTOC}" TARI_TARGET_NETWORK=testnet \
+    cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari
 )
 
 (
   cd "${TARI_DIR}"
-  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_console_wallet
+  env PROTOC="${PROTOC}" TARI_TARGET_NETWORK=testnet \
+    cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_console_wallet
 )
 
 verify_checkout "${TARI_DIR}" "${TARI_NODE_REV}" "${TARI_NODE_COMMIT}" "${TARI_NODE_TREE}" "Tari node"
 (
   cd "${TARI_DIR}"
-  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_node
+  env PROTOC="${PROTOC}" TARI_TARGET_NETWORK=testnet \
+    cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_node
 )
 
 mkdir -p "${TOOLS_DIR}"

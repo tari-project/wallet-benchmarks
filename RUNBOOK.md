@@ -183,6 +183,8 @@ runtime preflight compares it against provenance embedded by `build.rs` and fail
 closed on missing, extra, reordered, or changed claims. Both fetchers source the
 same manifest-claim definitions, and CI exercises that emitter with placeholder
 artifact hashes to detect drift without building the four upstream binaries.
+On macOS, the fetchers ad-hoc re-sign copied executables before hashing them so
+the manifest binds the runnable artifact bytes accepted by kernel code signing.
 
 ### Source Wallet
 

@@ -16,13 +16,22 @@ use crate::{
 #[path = "profile_validation/mod.rs"]
 pub mod profile_validation;
 
-pub const RESULT_SCHEMA_VERSION: u32 = 6;
-pub const REFERENCE_BASE_NODE_REVISION: &str = "v5.4.0";
+pub const RESULT_SCHEMA_VERSION: u32 = 7;
+pub const LEGACY_RESULT_SCHEMA_VERSION: u32 = 6;
+pub const REFERENCE_BASE_NODE_REVISION: &str = "v5.5.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileProvenance {
     pub measurement_commit: String,
     pub export_commit: String,
+    #[serde(default)]
+    pub measurement_worktree_clean: bool,
+    #[serde(default)]
+    pub export_worktree_clean: bool,
+    #[serde(default)]
+    pub measurement_build_worktree_clean: bool,
+    #[serde(default)]
+    pub export_build_worktree_clean: bool,
     pub measurement_build_manifest: serde_json::Value,
     pub export_build_manifest: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +176,8 @@ pub struct BaseNodeMetadata {
     pub tip_end_height: Option<u64>,
     pub tip_end_hash: Option<String>,
     pub pruning_horizon: Option<u64>,
+    #[serde(default)]
+    pub pruned_height: Option<u64>,
     pub is_synced: Option<bool>,
     pub authority_tip_start_height: Option<u64>,
     pub authority_tip_start_hash: Option<String>,
@@ -486,6 +497,8 @@ pub struct TransactionObservation {
     pub construction_timing_reason: Option<String>,
     pub submission_ms: Option<u128>,
     pub submission_timing_origin: Option<String>,
+    #[serde(default)]
+    pub submission_started: Option<bool>,
     pub mempool_available: Option<bool>,
     pub mempool_reason: Option<String>,
     pub confirmation_ms: Option<u128>,
@@ -505,6 +518,8 @@ pub struct TransactionObservation {
     pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<ObservationFailureClass>,
+    #[serde(default)]
+    pub deadline_expired: bool,
     pub terminal_outcome: TerminalOutcome,
     pub error: Option<String>,
     pub mined_height: Option<u64>,
@@ -599,28 +614,36 @@ impl ResultProfile {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
         scenario_config.insert("build_manifest".to_string(), build_manifest.clone());
+        let harness_executable_sha256 = current_harness_executable_sha256()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
         scenario_config.insert(
             "harness_executable_sha256".to_string(),
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| fs::read(path).ok())
-                .map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
+            harness_executable_sha256.clone(),
+        );
+        scenario_config.insert(
+            "export_harness_executable_sha256".to_string(),
+            harness_executable_sha256,
         );
         scenario_config.insert(
             "scenario_order".to_string(),
             serde_json::json!(ScenarioName::ALL.map(ScenarioName::as_str)),
         );
 
+        let harness_commit = harness_git_commit();
+        let worktree_clean = harness_worktree_clean().unwrap_or(false);
         Self {
             schema_version: RESULT_SCHEMA_VERSION,
             run_id: new_run_id(),
             profile_kind: ProfileKind::Checkpoint,
             run_complete: false,
             provenance: ProfileProvenance {
-                measurement_commit: harness_git_commit(),
-                export_commit: harness_git_commit(),
+                measurement_commit: harness_commit.clone(),
+                export_commit: harness_commit,
+                measurement_worktree_clean: worktree_clean,
+                export_worktree_clean: worktree_clean,
+                measurement_build_worktree_clean: harness_build_worktree_clean(),
+                export_build_worktree_clean: harness_build_worktree_clean(),
                 measurement_build_manifest: build_manifest.clone(),
                 export_build_manifest: build_manifest,
                 correction: None,
@@ -639,6 +662,7 @@ impl ResultProfile {
                 tip_end_height: None,
                 tip_end_hash: None,
                 pruning_horizon: None,
+                pruned_height: None,
                 is_synced: None,
                 authority_tip_start_height: None,
                 authority_tip_start_hash: None,
@@ -673,8 +697,24 @@ impl ResultProfile {
     }
 
     pub fn mark_final(&mut self) {
+        self.provenance.export_commit = harness_git_commit();
+        self.provenance.export_worktree_clean = harness_worktree_clean().unwrap_or(false);
+        self.provenance.export_build_worktree_clean = harness_build_worktree_clean();
         self.profile_kind = ProfileKind::Final;
         self.run_complete = true;
+    }
+
+    pub fn mark_final_with_runtime_provenance(&mut self, config: &Config) -> anyhow::Result<()> {
+        crate::build_manifest::verify(config)?;
+        self.provenance.export_build_manifest =
+            serde_json::from_slice(&fs::read(&config.paths.build_manifest)?)
+                .context("parsing export build manifest")?;
+        self.config.insert(
+            "export_harness_executable_sha256".to_string(),
+            serde_json::Value::String(current_harness_executable_sha256()?),
+        );
+        self.mark_final();
+        Ok(())
     }
 
     pub fn set_tip_start(&mut self, height: u64, hash: Option<String>) {
@@ -738,7 +778,7 @@ pub(crate) fn durable_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(destination).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
+    sync_parent_directory(parent)?;
     Ok(())
 }
 
@@ -749,12 +789,20 @@ pub(crate) fn durable_remove_file(path: &Path) -> anyhow::Result<()> {
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            fs::File::open(parent)?.sync_all()?;
+            sync_parent_directory(parent)?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
     }
+}
+
+fn sync_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
 }
 
 fn new_run_id() -> String {
@@ -770,6 +818,41 @@ fn harness_git_commit() -> String {
         .map(ToString::to_string)
         .filter(|commit| !commit.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn harness_build_worktree_clean() -> bool {
+    option_env!("GIT_WORKTREE_CLEAN_AT_BUILD") == Some("true")
+}
+
+fn current_harness_executable_sha256() -> anyhow::Result<String> {
+    let path = std::env::current_exe().context("resolving current harness executable")?;
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading current harness executable {}", path.display()))?;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+pub(crate) fn harness_worktree_clean() -> anyhow::Result<bool> {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(root)
+        .output()
+        .context("checking harness git worktree")?;
+    if !status.status.success() {
+        anyhow::bail!("could not verify the harness git worktree state");
+    }
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("checking harness git HEAD")?;
+    if !head.status.success() {
+        anyhow::bail!("could not verify the harness git HEAD");
+    }
+    let runtime_commit = String::from_utf8(head.stdout).context("harness git HEAD is not UTF-8")?;
+    Ok(status.stdout.is_empty()
+        && runtime_commit.trim() == harness_git_commit()
+        && harness_build_worktree_clean())
 }
 
 pub(super) fn computed_deltas(profile: &ResultProfile) -> BTreeMap<String, serde_json::Value> {
@@ -856,9 +939,21 @@ fn scenario_wall_ms(profile: &ResultProfile, mode: &str, scenario: &str) -> Opti
         .iter()
         .filter_map(|run| {
             let metrics = run.metrics.as_ref()?;
+            let exact_target = metrics.get("max_height") == metrics.get("H_tip_end")
+                && metrics.get("H_scan_cursor_hash") == metrics.get("H_tip_target_hash");
+            let anchored_overshoot = metrics
+                .get("scan_target_overshoot_allowed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && metrics
+                    .get("max_height")
+                    .and_then(serde_json::Value::as_u64)?
+                    >= metrics
+                        .get("H_tip_end")
+                        .and_then(serde_json::Value::as_u64)?
+                && metrics.get("H_scan_target_cursor_hash") == metrics.get("H_tip_target_hash");
             if metrics.get("scan_reached_tip")?.as_bool() == Some(true)
-                && metrics.get("max_height") == metrics.get("H_tip_end")
-                && metrics.get("H_scan_cursor_hash") == metrics.get("H_tip_target_hash")
+                && (exact_target || anchored_overshoot)
             {
                 metrics.get("T_scan_ms")?.as_u64().map(u128::from)
             } else {
@@ -1060,6 +1155,29 @@ mod tests {
     }
 
     #[test]
+    fn profile_uses_v5_5_0_base_node_compatibility_reference() {
+        let profile = ResultProfile::new(&Config::default(), env_capture::capture());
+        assert_eq!(REFERENCE_BASE_NODE_REVISION, "v5.5.0");
+        assert_eq!(
+            profile.base_node.configured_revision,
+            REFERENCE_BASE_NODE_REVISION
+        );
+    }
+
+    #[test]
+    fn historical_profile_without_pruned_height_deserializes() {
+        let profile = ResultProfile::new(&Config::default(), env_capture::capture());
+        let mut document = serde_json::to_value(profile).unwrap();
+        document["base_node"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pruned_height");
+
+        let decoded: ResultProfile = serde_json::from_value(document).unwrap();
+        assert_eq!(decoded.base_node.pruned_height, None);
+    }
+
+    #[test]
     fn durable_atomic_write_replaces_only_complete_documents() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("profile.json");
@@ -1178,10 +1296,12 @@ mod tests {
                 metrics: Some(serde_json::json!({
                     "T_scan_ms": 175,
                     "scan_reached_tip": true,
-                    "max_height": 175,
+                    "max_height": 176,
                     "H_tip_end": 175,
-                    "H_scan_cursor_hash": "bb",
-                    "H_tip_target_hash": "bb"
+                    "H_scan_cursor_hash": "cc",
+                    "H_scan_target_cursor_hash": "bb",
+                    "H_tip_target_hash": "bb",
+                    "scan_target_overshoot_allowed": true
                 })),
             });
         old.scenarios

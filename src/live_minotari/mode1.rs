@@ -9,6 +9,9 @@ pub(super) async fn annotate_mode1_console_wallet(
     let Some(old_seed) = book.addresses.get(WalletRole::OldWallet.label()) else {
         return Ok(());
     };
+    let Some(recipient_sink) = book.addresses.get(WalletRole::RecipientSink.label()) else {
+        return Ok(());
+    };
     let start = Instant::now();
     let topology = start_mode1_console_wallet(config, old_seed).await;
     match topology {
@@ -39,7 +42,14 @@ pub(super) async fn annotate_mode1_console_wallet(
                 context.process.shutdown().await?;
                 return Ok(());
             }
-            run_mode1_send_cells(config, profile, old_seed, &mut context).await?;
+            run_mode1_send_cells(
+                config,
+                profile,
+                old_seed,
+                &recipient_sink.address,
+                &mut context,
+            )
+            .await?;
             context.process.shutdown().await?;
         }
         Err(error) => {
@@ -81,6 +91,7 @@ pub(super) async fn start_mode1_console_wallet_with_recovery(
         .context("encoding Mode 1 console-wallet recovery seed birthday")?;
 
     let mut command = Command::new(&config.paths.minotari_console_wallet);
+    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
     command
         .env("MINOTARI_WALLET_SEED_WORDS", recovery_seed_words)
         .env("MINOTARI_WALLET_PASSWORD", &password)
@@ -132,11 +143,12 @@ pub(super) fn write_mode1_runtime_config(config: &Config, path: &Path) -> anyhow
         .collect::<Vec<_>>()
         .join(", ");
     let contents = format!(
-        "[wallet]\nbase_node_service_peers = [{peers}]\nhttp_server_url = \"{}\"\nfallback_http_server_url = \"{}\"\nfee_per_gram = {}\nnum_required_confirmations = {}\n",
+        "[wallet]\nbase_node_service_peers = [{peers}]\nhttp_server_url = \"{}\"\nfallback_http_server_url = \"{}\"\nfee_per_gram = {}\nnum_required_confirmations = {}\nbirthday_offset = {}\n",
         config.network.base_node_http_url.replace('"', "\\\""),
         config.network.base_node_http_url.replace('"', "\\\""),
         config.fee_rate()?.0,
-        config.benchmark.c_min
+        config.benchmark.c_min,
+        super::STOCK_BIRTHDAY_OFFSET_DAYS,
     );
     fs::write(path, contents)
         .with_context(|| format!("writing Mode 1 runtime config {}", path.display()))
@@ -304,6 +316,15 @@ pub(super) async fn wait_for_mode1_scan_to_tip(
             );
         }
         if start.elapsed() > timeout {
+            if let Some(scanned_height) = last_scanned_height {
+                return Err(Mode1ScanTimeout {
+                    target_tip,
+                    scanned_height,
+                    timeout,
+                    reason: "total_deadline",
+                }
+                .into());
+            }
             bail!(
                 "console wallet fresh scan did not reach target tip {:?} within {:?}; scanned_height={:?}; stdout_log={} stderr_log={}",
                 target_tip,
@@ -355,23 +376,46 @@ pub(super) async fn wait_for_mode1_scan_to_tip(
             return Ok(scanned_height);
         }
         if last_progress.elapsed() > no_progress_timeout {
-            bail!(
-                "console wallet fresh scan made no height progress for {:?}; target_tip={:?}; scanned_height={scanned_height}; stdout_log={} stderr_log={}",
-                no_progress_timeout,
+            return Err(Mode1ScanTimeout {
                 target_tip,
-                process.stdout_path.display(),
-                process.stderr_path.display()
-            );
+                scanned_height,
+                timeout: no_progress_timeout,
+                reason: "no_progress_deadline",
+            }
+            .into());
         }
         if start.elapsed() > timeout {
-            bail!(
-                "console wallet fresh scan did not reach target tip {target_tip} within {:?}; scanned_height={scanned_height}",
-                timeout
-            );
+            return Err(Mode1ScanTimeout {
+                target_tip,
+                scanned_height,
+                timeout,
+                reason: "total_deadline",
+            }
+            .into());
         }
         println!("mode1 fresh scan wait: scanned_height={scanned_height} target={target_tip}");
     }
 }
+
+#[derive(Debug, Clone)]
+pub(super) struct Mode1ScanTimeout {
+    pub(super) target_tip: u64,
+    pub(super) scanned_height: u64,
+    pub(super) timeout: Duration,
+    pub(super) reason: &'static str,
+}
+
+impl std::fmt::Display for Mode1ScanTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "console wallet fresh scan timed out ({}) after {:?}: target_tip={} scanned_height={}",
+            self.reason, self.timeout, self.target_tip, self.scanned_height
+        )
+    }
+}
+
+impl std::error::Error for Mode1ScanTimeout {}
 
 async fn wait_for_mode1_balance(
     config: &Config,
@@ -524,6 +568,7 @@ async fn run_mode1_send_cells(
     config: &Config,
     profile: &mut ResultProfile,
     old_seed: &crate::seeds::SeedMaterial,
+    recipient_sink_address: &str,
     context: &mut Mode1ConsoleContext,
 ) -> anyhow::Result<()> {
     let amount = parse_amount(&config.benchmark.mode1_payment_amount)?;
@@ -583,7 +628,7 @@ async fn run_mode1_send_cells(
         .await?;
     }
 
-    let s4_recipients = derive_distinct_recipient_pool(128)?;
+    let s4_recipients = derive_distinct_recipient_pool(recipient_sink_address, 128)?;
     let s4_components_before = mode1_balance_components(&mut context.client).await.ok();
     let s4_balance_before = mode1_available_balance(&mut context.client).await.ok();
     let mut s4 = run_mode1_s4_batches(
@@ -628,7 +673,8 @@ async fn run_mode1_send_cells(
             config.benchmark.concurrent_batches, config.benchmark.mode1_live_max_s4_batch
         )],
     );
-    let s5_recipients = derive_distinct_recipient_pool(config.benchmark.s5_m)?;
+    let s5_recipients =
+        derive_distinct_recipient_pool(recipient_sink_address, config.benchmark.s5_m)?;
     let s5_components_before = mode1_balance_components(&mut context.client).await.ok();
     let s5_balance_before = mode1_available_balance(&mut context.client).await.ok();
     let s5_unspent_before = mode1_unspent_count(&mut context.client).await.ok();
@@ -721,22 +767,38 @@ async fn run_mode1_s1(
             Ok(amounts) => amounts,
             Err(error) => {
                 total.failure_count = total.failure_count.saturating_add(1);
-                total.errors.push(format!(
+                let message = format!(
                     "mode1 S1 round {} could not read spendable amounts: {error:#}",
                     round.round_index
-                ));
+                );
+                record_s1_preflight_failure(
+                    &mut total.extra_metrics,
+                    round.round_index,
+                    None,
+                    "read_spendable_inputs",
+                    &message,
+                );
+                total.errors.push(message);
                 break;
             }
         };
         spendable_amounts.sort_unstable_by(|a, b| b.cmp(a));
         if spendable_amounts.len() != round.tx_count as usize {
             total.failure_count = total.failure_count.saturating_add(1);
-            total.errors.push(format!(
+            let message = format!(
                 "mode1 S1 round {} expected {} spendable inputs before dispatch, observed {}; refusing noncanonical state",
                 round.round_index,
                 round.tx_count,
                 spendable_amounts.len()
-            ));
+            );
+            record_s1_preflight_failure(
+                &mut total.extra_metrics,
+                round.round_index,
+                None,
+                "validate_spendable_input_count",
+                &message,
+            );
+            total.errors.push(message);
             break;
         }
         let mut round_summary = Mode1TransferSummary {
@@ -751,10 +813,18 @@ async fn run_mode1_s1(
                 Ok(plan) => plan,
                 Err(error) => {
                     round_summary.failure_count = round_summary.failure_count.saturating_add(1);
-                    round_summary.errors.push(format!(
+                    let message = format!(
                         "mode1 S1 round {} tx {tx_index} exact planner failed: {error:#}",
                         round.round_index
-                    ));
+                    );
+                    record_s1_preflight_failure(
+                        &mut round_summary.extra_metrics,
+                        round.round_index,
+                        Some(tx_index),
+                        "plan_transaction",
+                        &message,
+                    );
+                    round_summary.errors.push(message);
                     break;
                 }
             };
@@ -773,6 +843,7 @@ async fn run_mode1_s1(
                 submit_mode1_coin_split(client, plan.amount_per_split, plan.split_count, fee_rate)
                     .await;
             let completed_offset_ms = round_start.elapsed().as_millis();
+            let first_new_tx_id = round_summary.tx_ids.len();
             round_summary.record_batch(
                 tx_index,
                 round.outputs_per_tx,
@@ -781,9 +852,14 @@ async fn run_mode1_s1(
                 Vec::new(),
                 result,
             );
-            round_summary
-                .construction_complete_ms
-                .push(completed_offset_ms);
+            round_summary.retain_constructed_output_shape_for_new_tx_ids(
+                first_new_tx_id,
+                ConstructedOutputShape {
+                    payment_output_count: plan.split_count,
+                    change_output_count: 1,
+                    total_output_count: round.outputs_per_tx,
+                },
+            );
         }
         wait_for_mode1_summary_verification(
             client,
@@ -929,6 +1005,8 @@ async fn run_mode1_s4_batches(
 ) -> Mode1TransferSummary {
     let mut total = Mode1TransferSummary::default();
     let start = Instant::now();
+    let mut deadline_measurements = Vec::new();
+    let mut cleanup_measurements = Vec::new();
     for configured_batch in &config.benchmark.concurrent_batches {
         let attempts = capped_attempts(*configured_batch, config.benchmark.mode1_live_max_s4_batch);
         let selected = recipients.iter().take(attempts as usize).cloned().collect();
@@ -944,9 +1022,39 @@ async fn run_mode1_s4_batches(
             &config.network.base_node_http_url,
         )
         .await;
+        if let Some(mut measurement) = batch.extra_metrics.get("s4_deadline_measurement").cloned() {
+            if let Some(map) = measurement.as_object_mut() {
+                map.insert(
+                    "configured_batch".to_string(),
+                    serde_json::json!(configured_batch),
+                );
+            }
+            deadline_measurements.push(measurement);
+        }
+        if let Some(mut cleanup) = batch.extra_metrics.get("s4_post_deadline_cleanup").cloned() {
+            if let Some(map) = cleanup.as_object_mut() {
+                map.insert(
+                    "configured_batch".to_string(),
+                    serde_json::json!(configured_batch),
+                );
+            }
+            cleanup_measurements.push(cleanup);
+        }
+        total.wall_ms = total.wall_ms.saturating_add(batch.wall_ms);
         total.add_batch(*configured_batch, batch);
     }
-    total.wall_ms = start.elapsed().as_millis();
+    total.extra_metrics.insert(
+        "s4_deadline_measurements".to_string(),
+        serde_json::Value::Array(deadline_measurements),
+    );
+    total.extra_metrics.insert(
+        "s4_post_deadline_cleanups".to_string(),
+        serde_json::Value::Array(cleanup_measurements),
+    );
+    total.extra_metrics.insert(
+        "s4_actual_return_wall_ms".to_string(),
+        serde_json::json!(start.elapsed().as_millis()),
+    );
     total
 }
 
@@ -973,6 +1081,7 @@ async fn run_mode1_transfers_concurrent(
     let deadline = time::Instant::now() + budget;
     let mut join_set = JoinSet::new();
     let mut pending = BTreeMap::new();
+    let mut deadline_expired = false;
     for (index, recipient) in recipients.into_iter().enumerate() {
         let batch_index = u32::try_from(index + 1).unwrap_or(u32::MAX);
         println!("{label} batch {batch_index}/{batch_count} dispatching");
@@ -1013,14 +1122,17 @@ async fn run_mode1_transfers_concurrent(
         });
     }
     while !join_set.is_empty() {
-        let Ok(Some(result)) = time::timeout_at(deadline, join_set.join_next()).await else {
-            join_set.abort_all();
-            break;
+        let result = match time::timeout_at(deadline, join_set.join_next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                deadline_expired = true;
+                break;
+            }
         };
         match result {
             Ok((batch_index, submit_offset_ms, completed_ms, recipient, transfer)) => {
                 pending.remove(&batch_index);
-                summary.construction_complete_ms.push(completed_ms);
                 summary.record_batch(
                     batch_index,
                     1,
@@ -1033,19 +1145,48 @@ async fn run_mode1_transfers_concurrent(
             Err(error) => summary.errors.push(format!("task join error: {error}")),
         }
     }
-    let timed_out_at = start.elapsed().as_millis();
-    for (batch_index, (submit_offset_ms, recipient)) in pending {
-        summary.record_batch(
-            batch_index,
-            1,
-            submit_offset_ms,
-            timed_out_at,
-            vec![recipient],
-            Err(anyhow::anyhow!(
-                "{label} absolute deadline expired before dispatch task completed"
-            )),
-        );
+    let pending_at_deadline = if deadline_expired { pending.len() } else { 0 };
+    if deadline_expired {
+        for (&batch_index, (submit_offset_ms, recipient)) in &pending {
+            summary.record_deadline_timeout(
+                batch_index,
+                1,
+                *submit_offset_ms,
+                budget.as_millis(),
+                vec![recipient.clone()],
+                format!("{label} absolute deadline expired before dispatch task completed"),
+            );
+        }
     }
+
+    let cleanup_start = Instant::now();
+    let abort_requested_tasks = if deadline_expired { join_set.len() } else { 0 };
+    if deadline_expired {
+        join_set.abort_all();
+    }
+    let mut drained_tasks = 0usize;
+    let mut forced_shutdown_tasks = 0usize;
+    let mut completed_after_deadline_discarded_tasks = 0usize;
+    let mut post_deadline_join_errors = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(_) => {
+                drained_tasks = drained_tasks.saturating_add(1);
+                completed_after_deadline_discarded_tasks =
+                    completed_after_deadline_discarded_tasks.saturating_add(1);
+            }
+            Err(error) if error.is_cancelled() => {
+                forced_shutdown_tasks = forced_shutdown_tasks.saturating_add(1);
+            }
+            Err(error) => {
+                drained_tasks = drained_tasks.saturating_add(1);
+                post_deadline_join_errors.push(error.to_string());
+            }
+        }
+    }
+    let cleanup_drain_ms = cleanup_start.elapsed().as_millis();
+    let tasks_quiesced = join_set.is_empty();
+    debug_assert!(tasks_quiesced);
     let remaining = deadline.saturating_duration_since(time::Instant::now());
     if !remaining.is_zero() && !summary.tx_ids.is_empty() {
         let mut verifier = client.clone();
@@ -1065,7 +1206,54 @@ async fn run_mode1_transfers_concurrent(
             "{label} reached its absolute deadline before every submitted transaction was C_min-deep"
         ));
     }
-    summary.wall_ms = start.elapsed().as_millis();
+    deadline_expired |= time::Instant::now() >= deadline;
+    summary.wall_ms = if deadline_expired {
+        budget.as_millis()
+    } else {
+        start.elapsed().as_millis().min(budget.as_millis())
+    };
+    let unmatched_pending_attempts_after_drain = if pending_at_deadline == 0 {
+        Vec::new()
+    } else {
+        pending
+            .into_iter()
+            .map(|(batch_index, (submit_offset_ms, recipient))| {
+                serde_json::json!({
+                    "batch_index": batch_index,
+                    "submit_offset_ms": submit_offset_ms,
+                    "recipient": recipient,
+                    "terminal_outcome": "timed_out",
+                    "submission_state": "ambiguous"
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    summary.extra_metrics.insert(
+        "s4_deadline_measurement".to_string(),
+        serde_json::json!({
+            "deadline_expired": deadline_expired,
+            "deadline_offset_ms": budget.as_millis(),
+            "pending_tasks_at_deadline": pending_at_deadline,
+            "measured_wall_ms": summary.wall_ms
+        }),
+    );
+    summary.extra_metrics.insert(
+        "s4_post_deadline_cleanup".to_string(),
+        serde_json::json!({
+            "drain_ms": cleanup_drain_ms,
+            "cleanup_grace_ms": 0,
+            "cleanup_deadline_exhausted": false,
+            "abort_requested_tasks": abort_requested_tasks,
+            "drained_tasks": drained_tasks,
+            "forced_shutdown_tasks": forced_shutdown_tasks,
+            "completed_after_deadline_discarded_tasks": completed_after_deadline_discarded_tasks,
+            "post_deadline_join_errors": post_deadline_join_errors,
+            "tasks_quiesced": tasks_quiesced,
+            "unmatched_pending_attempts_after_drain": unmatched_pending_attempts_after_drain,
+            "late_results_accepted": false,
+            "actual_return_offset_ms": start.elapsed().as_millis()
+        }),
+    );
     summary
 }
 
@@ -1112,7 +1300,6 @@ async fn run_mode1_recipient_batches_sequential(
         )
         .await;
         let completed_offset_ms = start.elapsed().as_millis();
-        summary.construction_complete_ms.push(completed_offset_ms);
         summary.record_batch(
             batch_index,
             items_per_batch,
@@ -1194,29 +1381,45 @@ async fn submit_mode1_transfer_to_recipients(
             let Some(tx_id) = mode1_not_found_tx_id(&status) else {
                 return Err(status.into());
             };
-            let error = status.to_string();
-            Ok(Mode1TransferOutcome {
-                success_count: 0,
-                failure_count: 1,
-                fee_microtari: 0,
-                tx_ids: vec![tx_id.to_string()],
-                errors: vec![error.clone()],
-                tx_timings: vec![serde_json::json!({
-                    "batch_index": batch_index,
-                    "tx_id": tx_id.to_string(),
-                    "construction_complete_ms": elapsed,
-                    "grpc_round_trip_ms": elapsed,
-                    "construction_timing_reason": "console-wallet gRPC does not expose internal construction completion",
-                    "submission_timing_origin": "console_wallet_grpc_round_trip",
-                    "api_accepted": false,
-                    "api_error": error,
-                    "grpc_code": "NotFound",
-                    "chain_reconciliation_candidate": true,
-                    "broadcast_to_mempool_ms": null,
-                    "broadcast_to_mempool_unavailable_reason": "console_wallet_grpc_transfer_response_does_not_expose_mempool_timestamp"
-                })],
-            })
+            Ok(mode1_not_found_timeout_outcome(
+                tx_id,
+                batch_index,
+                elapsed,
+                status.to_string(),
+            ))
         }
+    }
+}
+
+fn mode1_not_found_timeout_outcome(
+    tx_id: u64,
+    batch_index: u32,
+    elapsed: u128,
+    error: String,
+) -> Mode1TransferOutcome {
+    Mode1TransferOutcome {
+        success_count: 0,
+        failure_count: 1,
+        fee_microtari: 0,
+        tx_ids: vec![tx_id.to_string()],
+        errors: vec![error.clone()],
+        tx_timings: vec![serde_json::json!({
+            "batch_index": batch_index,
+            "tx_id": tx_id.to_string(),
+            "construction_complete_ms": null,
+            "grpc_round_trip_ms": elapsed,
+            "construction_timing_reason": "console-wallet gRPC does not expose internal construction completion",
+            "submission_timing_origin": "console_wallet_grpc_timeout_after_transaction_id_ambiguous",
+            "submission_started": true,
+            "submission_ambiguous": true,
+            "api_accepted": null,
+            "api_error": error,
+            "failure_class": "request_timeout",
+            "grpc_code": "NotFound",
+            "chain_reconciliation_candidate": true,
+            "broadcast_to_mempool_ms": null,
+            "broadcast_to_mempool_unavailable_reason": "console_wallet_grpc_transfer_response_does_not_expose_mempool_timestamp"
+        })],
     }
 }
 
@@ -1471,6 +1674,26 @@ mod tests {
     }
 
     #[test]
+    fn not_found_after_transaction_id_is_an_ambiguous_request_timeout() {
+        let outcome = mode1_not_found_timeout_outcome(
+            42,
+            7,
+            1_234,
+            "NotFound: Transaction 42 not found within timeout".to_string(),
+        );
+        let timing = &outcome.tx_timings[0];
+
+        assert_eq!(outcome.tx_ids, ["42"]);
+        assert_eq!(timing["batch_index"], 7);
+        assert_eq!(timing["tx_id"], "42");
+        assert_eq!(timing["submission_started"], true);
+        assert_eq!(timing["submission_ambiguous"], true);
+        assert!(timing["api_accepted"].is_null());
+        assert_eq!(timing["failure_class"], "request_timeout");
+        assert_eq!(timing["chain_reconciliation_candidate"], true);
+    }
+
+    #[test]
     fn runtime_config_pins_primary_and_fallback_http_endpoints() {
         let mut config = Config::default();
         config.network.base_node_http_url = "http://127.0.0.1:18142".to_string();
@@ -1483,6 +1706,41 @@ mod tests {
         assert!(contents.contains("http_server_url = \"http://127.0.0.1:18142\""));
         assert!(contents.contains("fallback_http_server_url = \"http://127.0.0.1:18142\""));
         assert!(!contents.contains("rpc.esmeralda.tari.com"));
+    }
+
+    #[test]
+    fn s4_concurrent_runner_aborts_at_deadline_without_late_acceptance_or_throttling() {
+        let source = include_str!("mode1.rs");
+        let start = source
+            .find("async fn run_mode1_transfers_concurrent")
+            .unwrap();
+        let end = source[start..]
+            .find("async fn run_mode1_recipient_batches_sequential")
+            .map(|offset| start + offset)
+            .unwrap();
+        let runner = &source[start..end];
+
+        assert!(!runner.contains("Semaphore"));
+        assert!(!runner.contains("sleep("));
+        assert!(!runner.contains("request_cleanup_deadline"));
+        assert!(!runner.contains("cleanup_join_deadline"));
+        assert!(!runner.contains("join_set.shutdown().await"));
+        assert_eq!(runner.matches("join_set.join_next()").count(), 2);
+        let timeout = runner.find("record_deadline_timeout").unwrap();
+        let abort = runner.find("join_set.abort_all()").unwrap();
+        let reap = runner
+            .find("while let Some(result) = join_set.join_next().await")
+            .unwrap();
+        assert!(timeout < abort);
+        assert!(abort < reap);
+        assert!(!runner[abort..].contains("summary.record_batch("));
+        assert!(runner.contains("\"cleanup_grace_ms\": 0"));
+        assert!(runner.contains("\"late_results_accepted\": false"));
+        assert!(runner.contains("\"submission_state\": \"ambiguous\""));
+        assert!(runner.contains("debug_assert!(tasks_quiesced)"));
+        assert!(runner.contains("\"s4_deadline_measurement\""));
+        assert!(runner.contains("\"s4_post_deadline_cleanup\""));
+        assert!(runner.contains("budget.as_millis()"));
     }
 
     #[test]

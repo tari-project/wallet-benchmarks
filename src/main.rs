@@ -231,9 +231,12 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             profile,
             submission,
             legacy_v5,
+            legacy_v6,
         } => {
             if legacy_v5 {
                 profile_validation::validate_legacy_v5_path(&profile)?;
+            } else if legacy_v6 {
+                profile_validation::validate_legacy_v6_path(&profile)?;
             } else {
                 profile_validation::validate_path(&profile, submission)?;
             }
@@ -243,13 +246,27 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             profile,
             out,
             legacy_v5,
+            legacy_v6,
         } => {
             if legacy_v5 {
                 profile_validation::write_legacy_v5_summary(&profile, &out)?;
+            } else if legacy_v6 {
+                profile_validation::write_legacy_v6_summary(&profile, &out)?;
             } else {
                 profile_validation::write_summary(&profile, &out)?;
             }
             println!("wrote {}", out.display());
+        }
+        Command::Mode2S4Worker { request, events } => {
+            #[cfg(feature = "live-minotari")]
+            {
+                wallet_bench::live_minotari::run_mode2_s4_worker(&request, &events).await?;
+            }
+            #[cfg(not(feature = "live-minotari"))]
+            {
+                let _ = (request, events);
+                anyhow::bail!("Mode 2 S4 worker requires --features live-minotari");
+            }
         }
     }
 

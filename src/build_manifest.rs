@@ -155,6 +155,40 @@ fn verify_manifest(
     artifact_paths: &BTreeMap<String, PathBuf>,
     source_root: &Path,
 ) -> anyhow::Result<()> {
+    verify_portable_manifest(manifest)?;
+    if artifact_paths.len() != EXPECTED_ARTIFACTS.len() {
+        bail!("build manifest artifact path set is not exact");
+    }
+    for expected in EXPECTED_ARTIFACTS {
+        let artifact = manifest
+            .artifacts
+            .get(expected.name)
+            .expect("portable manifest verification checked every artifact");
+        let path = artifact_paths
+            .get(expected.name)
+            .with_context(|| format!("runtime path is missing for artifact {}", expected.name))?;
+        if sha256_file(path)? != artifact.sha256 {
+            bail!(
+                "{} SHA-256 does not match the build manifest",
+                expected.name
+            );
+        }
+    }
+    for expected in EXPECTED_SOURCES {
+        for expected_patch in expected.patches {
+            let patch_path = source_root.join(expected_patch.path);
+            if sha256_file(&patch_path)? != expected_patch.sha256 {
+                bail!(
+                    "tracked patch {} SHA-256 does not match embedded provenance",
+                    expected_patch.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_portable_manifest(manifest: &BuildManifest) -> anyhow::Result<()> {
     if manifest.schema_version != BUILD_MANIFEST_SCHEMA_VERSION {
         bail!(
             "unsupported build manifest schema {}; expected {}",
@@ -174,12 +208,10 @@ fn verify_manifest(
             .sources
             .get(expected.name)
             .with_context(|| format!("build manifest is missing source {}", expected.name))?;
-        verify_source(source_root, expected, source)?;
+        verify_source_claims(expected, source)?;
     }
 
-    if manifest.artifacts.len() != EXPECTED_ARTIFACTS.len()
-        || artifact_paths.len() != EXPECTED_ARTIFACTS.len()
-    {
+    if manifest.artifacts.len() != EXPECTED_ARTIFACTS.len() {
         bail!("build manifest artifact set is not exact");
     }
     for expected in EXPECTED_ARTIFACTS {
@@ -197,24 +229,18 @@ fn verify_manifest(
             );
         }
         require_sha256_hex(&artifact.sha256, &format!("artifact {}", expected.name))?;
-        let path = artifact_paths
-            .get(expected.name)
-            .with_context(|| format!("runtime path is missing for artifact {}", expected.name))?;
-        if sha256_file(path)? != artifact.sha256 {
-            bail!(
-                "{} SHA-256 does not match the build manifest",
-                expected.name
-            );
-        }
     }
     Ok(())
 }
 
-fn verify_source(
-    source_root: &Path,
+fn verify_source_claims(
     expected: &ExpectedSource,
     source: &SourceProvenance,
 ) -> anyhow::Result<()> {
+    require_sha256_hex(
+        &source.complete_diff_sha256,
+        &format!("source {} complete diff", expected.name),
+    )?;
     if source.repository != expected.repository
         || source.upstream.revision != expected.upstream_revision
         || source.upstream.commit != expected.upstream_commit
@@ -234,6 +260,10 @@ fn verify_source(
         .zip(expected.patches.iter())
         .enumerate()
     {
+        require_sha256_hex(
+            &patch.sha256,
+            &format!("source {} patch {}", expected.name, index + 1),
+        )?;
         if patch.path != expected_patch.path
             || patch.sha256 != expected_patch.sha256
             || patch.result_tree != expected_patch.result_tree
@@ -242,13 +272,6 @@ fn verify_source(
                 "build manifest source {} patch {} is not the expected ordered patch",
                 expected.name,
                 index + 1
-            );
-        }
-        let patch_path = source_root.join(expected_patch.path);
-        if sha256_file(&patch_path)? != expected_patch.sha256 {
-            bail!(
-                "tracked patch {} SHA-256 does not match embedded provenance",
-                expected_patch.path
             );
         }
     }
@@ -273,6 +296,56 @@ pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn portable_manifest_fixture() -> BuildManifest {
+    let sources = EXPECTED_SOURCES
+        .iter()
+        .map(|source| {
+            (
+                source.name.to_string(),
+                SourceProvenance {
+                    repository: source.repository.to_string(),
+                    upstream: UpstreamSource {
+                        revision: source.upstream_revision.to_string(),
+                        commit: source.upstream_commit.to_string(),
+                        tree: source.upstream_tree.to_string(),
+                    },
+                    patches: source
+                        .patches
+                        .iter()
+                        .map(|patch| AppliedPatch {
+                            path: patch.path.to_string(),
+                            sha256: patch.sha256.to_string(),
+                            result_tree: patch.result_tree.to_string(),
+                        })
+                        .collect(),
+                    complete_diff_sha256: source.complete_diff_sha256.to_string(),
+                    result_tree: source.result_tree.to_string(),
+                },
+            )
+        })
+        .collect();
+    let artifacts = EXPECTED_ARTIFACTS
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.name.to_string(),
+                BuildArtifact {
+                    source: artifact.source.to_string(),
+                    source_revision: artifact.source_revision.to_string(),
+                    source_tree: artifact.source_tree.to_string(),
+                    sha256: "00".repeat(32),
+                },
+            )
+        })
+        .collect();
+    BuildManifest {
+        schema_version: BUILD_MANIFEST_SCHEMA_VERSION,
+        sources,
+        artifacts,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -281,6 +354,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (manifest, paths) = manifest_fixture(dir.path());
         verify_manifest(&manifest, &paths, Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    }
+
+    #[test]
+    fn base_node_manifest_pin_is_tari_v5_5_0() {
+        let source = EXPECTED_SOURCES
+            .iter()
+            .find(|source| source.name == "minotari_node")
+            .unwrap();
+        assert_eq!(source.upstream_revision, "v5.5.0");
+        assert_eq!(
+            source.upstream_commit,
+            "b32dba96aa0d4ffdd715a0bb724f69c567d47d9f"
+        );
+        assert_eq!(
+            source.upstream_tree,
+            "449b76bc4121400265927561a661c5c381d55bcd"
+        );
+        assert_eq!(source.result_tree, source.upstream_tree);
+
+        let artifact = EXPECTED_ARTIFACTS
+            .iter()
+            .find(|artifact| artifact.name == "minotari_node")
+            .unwrap();
+        assert_eq!(artifact.source_revision, source.upstream_revision);
+        assert_eq!(artifact.source_tree, source.upstream_tree);
     }
 
     #[test]
@@ -309,57 +407,48 @@ mod tests {
         assert!(serde_json::from_str::<BuildManifest>(json).is_err());
     }
 
+    #[test]
+    fn portable_manifest_rejects_non_lowercase_sha256() {
+        let mut manifest = portable_manifest_fixture();
+        manifest.artifacts.get_mut("minotari").unwrap().sha256 = "AA".repeat(32);
+        let error = verify_portable_manifest(&manifest).unwrap_err().to_string();
+        assert!(error.contains("lowercase 64-character hexadecimal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emitted_manifest_claims_match_embedded_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("build-manifest.json");
+        let zero_sha256 = "00".repeat(32);
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-provenance.sh");
+        let status = std::process::Command::new("bash")
+            .arg(script)
+            .arg("--emit-manifest")
+            .arg(&output)
+            .args([&zero_sha256, &zero_sha256, &zero_sha256, &zero_sha256])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let manifest: BuildManifest = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(manifest, portable_manifest_fixture());
+        verify_portable_manifest(&manifest).unwrap();
+    }
+
     fn manifest_fixture(root: &Path) -> (BuildManifest, BTreeMap<String, PathBuf>) {
-        let sources = EXPECTED_SOURCES
-            .iter()
-            .map(|source| {
-                (
-                    source.name.to_string(),
-                    SourceProvenance {
-                        repository: source.repository.to_string(),
-                        upstream: UpstreamSource {
-                            revision: source.upstream_revision.to_string(),
-                            commit: source.upstream_commit.to_string(),
-                            tree: source.upstream_tree.to_string(),
-                        },
-                        patches: source
-                            .patches
-                            .iter()
-                            .map(|patch| AppliedPatch {
-                                path: patch.path.to_string(),
-                                sha256: patch.sha256.to_string(),
-                                result_tree: patch.result_tree.to_string(),
-                            })
-                            .collect(),
-                        complete_diff_sha256: source.complete_diff_sha256.to_string(),
-                        result_tree: source.result_tree.to_string(),
-                    },
-                )
-            })
-            .collect();
-        let mut artifacts = BTreeMap::new();
+        let mut manifest = portable_manifest_fixture();
         let mut paths = BTreeMap::new();
         for expected in EXPECTED_ARTIFACTS {
             let path = root.join(expected.name);
             fs::write(&path, format!("test artifact {}", expected.name)).unwrap();
-            artifacts.insert(
-                expected.name.to_string(),
-                BuildArtifact {
-                    source: expected.source.to_string(),
-                    source_revision: expected.source_revision.to_string(),
-                    source_tree: expected.source_tree.to_string(),
-                    sha256: sha256_file(&path).unwrap(),
-                },
-            );
+            manifest
+                .artifacts
+                .get_mut(expected.name)
+                .expect("portable fixture has every expected artifact")
+                .sha256 = sha256_file(&path).unwrap();
             paths.insert(expected.name.to_string(), path);
         }
-        (
-            BuildManifest {
-                schema_version: BUILD_MANIFEST_SCHEMA_VERSION,
-                sources,
-                artifacts,
-            },
-            paths,
-        )
+        (manifest, paths)
     }
 }

@@ -21,10 +21,49 @@ pub struct S0FundingEvidence {
     pub status: String,
     pub addresses: std::collections::BTreeMap<String, String>,
     pub birthday: u16,
+    #[serde(default)]
+    pub birthday_height: Option<u64>,
+    #[serde(default)]
+    pub birthday_offset_days: Option<u16>,
     pub birthday_start_height: u64,
     #[serde(default)]
     pub submission: Option<crate::result_profile::S0FundingSubmissionEvidence>,
     pub transaction: Option<crate::result_profile::S0FundingTransactionEvidence>,
+}
+
+fn validate_s0_birthday_resolution(evidence: &S0FundingEvidence) -> anyhow::Result<()> {
+    if evidence.schema_version < 4 {
+        return Ok(());
+    }
+    let birthday_height = evidence
+        .birthday_height
+        .context("schema-v4 S0 evidence is missing birthday_height")?;
+    evidence
+        .birthday_offset_days
+        .context("schema-v4 S0 evidence is missing birthday_offset_days")?;
+    if evidence.birthday_start_height > birthday_height {
+        bail!("S0 birthday_start_height must not exceed birthday_height");
+    }
+    Ok(())
+}
+
+fn validate_s0_evidence_state(evidence: &S0FundingEvidence) -> anyhow::Result<()> {
+    let state_is_valid = match evidence.status.as_str() {
+        "initialized" => evidence.submission.is_none() && evidence.transaction.is_none(),
+        "broadcast" => evidence.submission.is_some() && evidence.transaction.is_none(),
+        "confirmed" => evidence.submission.is_some() && evidence.transaction.is_some(),
+        _ => false,
+    };
+    if !state_is_valid {
+        bail!("S0 evidence status/submission/transaction state is inconsistent");
+    }
+    if let (Some(submission), Some(transaction)) =
+        (evidence.submission.as_ref(), evidence.transaction.as_ref())
+        && submission.tx_id != transaction.tx_id
+    {
+        bail!("S0 evidence submission and transaction identities differ");
+    }
+    Ok(())
 }
 
 use crate::{
@@ -153,8 +192,6 @@ async fn preflight_for_live_run_inner(
     run_launch_checks: bool,
 ) -> anyhow::Result<()> {
     ensure_runtime_paths_are_absolute(config)?;
-    #[cfg(feature = "live-minotari")]
-    recover_prepared_transactions(config).await?;
     check_harness_worktree_clean()?;
     if run_launch_checks {
         check_disk_space(config)?;
@@ -167,7 +204,10 @@ async fn preflight_for_live_run_inner(
     let paths = live_wallet_paths(config, None, None, None);
     check_selected_chain_readiness(config, &paths)
         .await
-        .context("selected-chain live-run preflight")
+        .context("selected-chain live-run preflight")?;
+    #[cfg(feature = "live-minotari")]
+    recover_prepared_transactions(config).await?;
+    Ok(())
 }
 
 #[cfg(feature = "live-minotari")]
@@ -178,16 +218,16 @@ async fn recover_prepared_transactions(config: &Config) -> anyhow::Result<()> {
         &paths.new_wallet,
         &paths.payment_processor,
     ] {
-        let recoveries = crate::live_minotari::recover_prepared_transaction_checkpoints(
+        let recoveries = crate::live_minotari::reconcile_measured_prepared_transaction_checkpoints(
             path,
             &config.network.base_node_http_url,
             config.timeout(config.timeouts.startup_secs),
             config.benchmark.c_min,
         )
         .await?;
-        for recovery in recoveries {
-            println!(
-                "prepared transaction recovery for {}: {recovery:?}",
+        if !recoveries.is_empty() {
+            bail!(
+                "measured-wallet prepared transaction checkpoint(s) require explicit operator reconciliation; automatic resubmission is disabled: wallet_db={} recovery={recoveries:?}",
                 path.display()
             );
         }
@@ -272,6 +312,7 @@ async fn run_profile_inner(
         profile.base_node.authority_tip_start_height = Some(authority.height);
         profile.base_node.authority_tip_start_hash = Some(hex::encode(authority.hash));
         profile.base_node.pruning_horizon = Some(tip.pruning_horizon);
+        profile.base_node.pruned_height = Some(tip.pruned_height);
         profile.base_node.is_synced = Some(tip.is_synced);
     }
     for mode in ModeName::ALL {
@@ -335,8 +376,9 @@ async fn run_profile_inner(
         profile.base_node.authority_tip_end_height = Some(authority.height);
         profile.base_node.authority_tip_end_hash = Some(hex::encode(authority.hash));
         profile.base_node.pruning_horizon = Some(tip.pruning_horizon);
+        profile.base_node.pruned_height = Some(tip.pruned_height);
         profile.base_node.is_synced = Some(tip.is_synced);
-        profile.mark_final();
+        profile.mark_final_with_runtime_provenance(config)?;
     }
     profile.refresh_computed_deltas();
     profile.write_validated_atomic(profile_path, true)?;
@@ -387,6 +429,7 @@ async fn prepare_b0_profile_inner(
     profile.base_node.authority_tip_start_height = Some(authority.height);
     profile.base_node.authority_tip_start_hash = Some(hex::encode(authority.hash));
     profile.base_node.pruning_horizon = Some(tip.pruning_horizon);
+    profile.base_node.pruned_height = Some(tip.pruned_height);
     profile.base_node.is_synced = Some(tip.is_synced);
     for mode in ModeName::ALL {
         let address = match mode {
@@ -435,15 +478,8 @@ async fn fund_s0_from_checkpoint_inner(
 ) -> anyhow::Result<()> {
     config.validate_prefunding_b0()?;
     let _namespace_lock = RunNamespaceLock::acquire(&config.paths.data_dir)?;
-    let recovery = crate::live_minotari::recover_prepared_transaction_checkpoint(
-        source_db,
-        &config.network.base_node_http_url,
-        config.timeout(config.timeouts.startup_secs),
-        config.benchmark.c_min,
-    )
-    .await
-    .context("recovering prepared source-wallet transaction before S0 funding")?;
     check_harness_worktree_clean()?;
+    crate::live_minotari::require_dedicated_source_wallet(config, source_db)?;
     let checkpoint = profile_validation::validate_path(b0_profile_path, false)?;
     validate_prefunding_b0_metrics(&checkpoint)?;
     let book = AddressBook::load_required(config)?;
@@ -506,28 +542,37 @@ async fn fund_s0_from_checkpoint_inner(
     })
     .collect::<anyhow::Result<Vec<_>>>()?;
     let protocol_fingerprint = config.protocol_fingerprint()?;
-    let recovered_submission = recovered_s0_submission(&recovery)?;
+    let recovery_binding = crate::live_minotari::s0_prepared_transaction_binding(
+        &checkpoint.run_id,
+        &protocol_fingerprint,
+        &recipients,
+        config.a_fund()?.0,
+    );
     let mut evidence = if evidence_path.exists() {
         let existing: S0FundingEvidence = serde_json::from_slice(&fs::read(evidence_path)?)?;
-        if !matches!(existing.schema_version, 2 | 3)
+        if !matches!(existing.schema_version, 2..=4)
             || existing.b0_run_id != checkpoint.run_id
             || existing.protocol_fingerprint != protocol_fingerprint
             || existing.addresses != addresses
         {
             bail!("existing S0 evidence does not match this B0 continuation");
         }
+        validate_s0_birthday_resolution(&existing)?;
+        validate_s0_evidence_state(&existing)?;
         existing
     } else {
         crate::live_minotari::require_fresh_s0_wallet_paths(config)?;
-        let (birthday, birthday_start_height) =
+        let (birthday, birthday_height, birthday_start_height, birthday_offset_days) =
             crate::live_minotari::plan_s0_wallet_initialization(config).await?;
         let evidence = S0FundingEvidence {
-            schema_version: 3,
+            schema_version: 4,
             b0_run_id: checkpoint.run_id.clone(),
             protocol_fingerprint: protocol_fingerprint.clone(),
             status: "initialized".to_string(),
             addresses: addresses.clone(),
             birthday,
+            birthday_height: Some(birthday_height),
+            birthday_offset_days: Some(birthday_offset_days),
             birthday_start_height,
             submission: None,
             transaction: None,
@@ -551,6 +596,20 @@ async fn fund_s0_from_checkpoint_inner(
             check_minotari_wallet_identity(db_path, expected)?;
         }
     }
+    crate::live_minotari::require_dedicated_source_wallet_on_selected_chain(config, source_db)
+        .await
+        .context("proving the dedicated source wallet belongs to the selected Esmeralda chain")?;
+    let recovery = crate::live_minotari::recover_s0_source_prepared_transaction_checkpoint(
+        source_db,
+        &config.network.base_node_http_url,
+        config.timeout(config.timeouts.startup_secs),
+        config.benchmark.c_min,
+        &recovery_binding,
+        evidence.submission.as_ref(),
+    )
+    .await
+    .context("recovering prepared source-wallet transaction for the validated S0 funding plan")?;
+    let recovered_submission = recovered_s0_submission(&recovery)?;
     if evidence.submission.is_none() {
         if let Some(submission) = recovered_submission {
             evidence.status = "broadcast".to_string();
@@ -559,14 +618,20 @@ async fn fund_s0_from_checkpoint_inner(
         } else {
             let mut broadcast_evidence = None;
             let initialized = evidence.clone();
-            crate::live_minotari::submit_s0_outputs(config, source_db, &recipients, |submission| {
-                let mut evidence = initialized;
-                evidence.status = "broadcast".to_string();
-                evidence.submission = Some(submission.clone());
-                write_json_atomic(evidence_path, &evidence)?;
-                broadcast_evidence = Some(evidence);
-                Ok(())
-            })
+            crate::live_minotari::submit_s0_outputs(
+                config,
+                source_db,
+                &checkpoint.run_id,
+                &recipients,
+                |submission| {
+                    let mut evidence = initialized;
+                    evidence.status = "broadcast".to_string();
+                    evidence.submission = Some(submission.clone());
+                    write_json_atomic(evidence_path, &evidence)?;
+                    broadcast_evidence = Some(evidence);
+                    Ok(())
+                },
+            )
             .await?;
             evidence =
                 broadcast_evidence.context("S0 broadcast callback did not persist evidence")?;
@@ -636,6 +701,11 @@ fn recovered_s0_submission(
         | crate::live_minotari::PreparedTransactionRecovery::RecoveredAcceptedPendingConfirmation(
             submission,
         ) => Ok(Some(submission)),
+        crate::live_minotari::PreparedTransactionRecovery::MeasuredCheckpointUnresolved {
+            ..
+        } => {
+            bail!("measured-wallet checkpoint state is invalid in the S0 source-funding workflow")
+        }
     }
 }
 
@@ -734,8 +804,15 @@ fn import_prefunding_b0(
     }
     if checkpoint.config.get("harness_executable_sha256")
         != profile.config.get("harness_executable_sha256")
+        || checkpoint.config.get("export_harness_executable_sha256")
+            != profile.config.get("export_harness_executable_sha256")
     {
         bail!("B0 checkpoint harness executable does not match the funded continuation");
+    }
+    if !checkpoint.provenance.measurement_build_worktree_clean
+        || !checkpoint.provenance.export_build_worktree_clean
+    {
+        bail!("B0 checkpoint was not produced by a clean-worktree harness build");
     }
     if serde_json::to_value(&checkpoint.environment)? != serde_json::to_value(&profile.environment)?
     {
@@ -820,7 +897,9 @@ fn validate_s0_funding_evidence(
         .with_context(|| format!("reading S0 evidence {}", evidence_path.display()))?;
     let evidence: S0FundingEvidence = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing S0 evidence {}", evidence_path.display()))?;
-    if !matches!(evidence.schema_version, 2 | 3)
+    validate_s0_birthday_resolution(&evidence)?;
+    validate_s0_evidence_state(&evidence)?;
+    if !matches!(evidence.schema_version, 2..=4)
         || evidence.status != "confirmed"
         || profile.config.get("prefunding_b0_run_id")
             != Some(&serde_json::json!(evidence.b0_run_id))
@@ -850,6 +929,8 @@ fn validate_s0_funding_evidence(
         if funding.tx_id != transaction.tx_id
             || funding.height != transaction.mined_height
             || funding.birthday != Some(evidence.birthday)
+            || funding.birthday_height != evidence.birthday_height
+            || funding.birthday_offset_days != evidence.birthday_offset_days
             || funding.birthday_start_height != Some(evidence.birthday_start_height)
             || funding.construction_ms != Some(transaction.construction_ms)
             || funding.broadcast_to_mempool_ms != transaction.broadcast_to_mempool_ms
@@ -874,8 +955,10 @@ fn config_with_s0_evidence(config: &Config, evidence_path: &Path) -> anyhow::Res
         &fs::read(evidence_path)
             .with_context(|| format!("reading S0 evidence {}", evidence_path.display()))?,
     )?;
-    if !matches!(evidence.schema_version, 2 | 3) || evidence.status != "confirmed" {
-        bail!("S0 evidence must be a confirmed schema-v2/v3 record");
+    validate_s0_birthday_resolution(&evidence)?;
+    validate_s0_evidence_state(&evidence)?;
+    if !matches!(evidence.schema_version, 2..=4) || evidence.status != "confirmed" {
+        bail!("S0 evidence must be a confirmed schema-v2/v3/v4 record");
     }
     if evidence.protocol_fingerprint != config.protocol_fingerprint()? {
         bail!("S0 evidence protocol fingerprint does not match the run configuration");
@@ -889,6 +972,8 @@ fn config_with_s0_evidence(config: &Config, evidence_path: &Path) -> anyhow::Res
         tx_id: transaction.tx_id.clone(),
         height: transaction.mined_height,
         birthday: Some(evidence.birthday),
+        birthday_height: evidence.birthday_height,
+        birthday_offset_days: evidence.birthday_offset_days,
         birthday_start_height: Some(evidence.birthday_start_height),
         construction_ms: Some(transaction.construction_ms),
         broadcast_to_mempool_ms: transaction.broadcast_to_mempool_ms,
@@ -1254,6 +1339,7 @@ struct ChainTip {
     height: u64,
     hash: Vec<u8>,
     pruning_horizon: u64,
+    pruned_height: u64,
     is_synced: bool,
 }
 
@@ -1275,9 +1361,7 @@ async fn check_endpoint_authority(config: &Config) -> anyhow::Result<()> {
     if !selected.is_synced || !authority.is_synced {
         bail!("selected and authority endpoints must both report is_synced=true");
     }
-    if selected.pruning_horizon != 0 {
-        bail!("selected scan endpoint must be archival (pruning_horizon=0)");
-    }
+    require_archival_tip(&selected, "selected scan endpoint")?;
     if selected.height.abs_diff(authority.height) > config.benchmark.c_min {
         bail!("selected scan endpoint is stale relative to the authority endpoint");
     }
@@ -1347,12 +1431,7 @@ async fn check_selected_chain_readiness(
     if !tip.is_synced {
         bail!("selected base node reports is_synced=false");
     }
-    if tip.pruning_horizon != 0 {
-        bail!(
-            "selected base node is pruned (pruning_horizon={}); the submission run requires an archival endpoint",
-            tip.pruning_horizon
-        );
-    }
+    require_archival_tip(&tip, "selected base node")?;
     if tip.hash.len() != 32 {
         bail!(
             "selected base-node tip hash has {} bytes, expected 32",
@@ -1480,10 +1559,11 @@ async fn check_selected_chain_readiness(
         bail!("selected-chain preflight failed:\n{}", errors.join("\n"));
     }
     println!(
-        "selected-chain proof PASS: tip={} hash={} pruning_horizon={} authority_tip={} finalized_height={} finalized_hash={} is_synced=true",
+        "selected-chain proof PASS: tip={} hash={} pruning_horizon={} pruned_height={} authority_tip={} finalized_height={} finalized_hash={} is_synced=true",
         tip.height,
         hex::encode(tip.hash),
         tip.pruning_horizon,
+        tip.pruned_height,
         authority_tip.height,
         finalized_height,
         hex::encode(selected_finalized_hash)
@@ -1500,6 +1580,10 @@ async fn fetch_chain_tip(client: &reqwest::Client, base_url: &str) -> anyhow::Re
         .error_for_status()?
         .json()
         .await?;
+    parse_chain_tip(&value)
+}
+
+fn parse_chain_tip(value: &serde_json::Value) -> anyhow::Result<ChainTip> {
     Ok(ChainTip {
         height: value
             .pointer("/metadata/best_block_height")
@@ -1511,10 +1595,25 @@ async fn fetch_chain_tip(client: &reqwest::Client, base_url: &str) -> anyhow::Re
             .pointer("/metadata/pruning_horizon")
             .and_then(serde_json::Value::as_u64)
             .context("tip response is missing pruning_horizon")?,
+        pruned_height: value
+            .pointer("/metadata/pruned_height")
+            .and_then(serde_json::Value::as_u64)
+            .context("tip response is missing pruned_height")?,
         is_synced: value["is_synced"]
             .as_bool()
             .context("tip response is missing is_synced")?,
     })
+}
+
+fn require_archival_tip(tip: &ChainTip, endpoint_label: &str) -> anyhow::Result<()> {
+    if tip.pruning_horizon != 0 || tip.pruned_height != 0 {
+        bail!(
+            "{endpoint_label} must be archival (pruning_horizon=0 and pruned_height=0; observed pruning_horizon={}, pruned_height={})",
+            tip.pruning_horizon,
+            tip.pruned_height
+        );
+    }
+    Ok(())
 }
 
 async fn fetch_header_hash(
@@ -1874,15 +1973,7 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 }
 
 fn check_harness_worktree_clean() -> anyhow::Result<()> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .context("checking harness git worktree")?;
-    if !output.status.success() {
-        bail!("could not verify the harness git worktree state");
-    }
-    if !output.stdout.is_empty() {
+    if !crate::result_profile::harness_worktree_clean()? {
         bail!("canonical candidate commands require a clean git worktree");
     }
     Ok(())
@@ -1891,6 +1982,50 @@ fn check_harness_worktree_clean() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_tip_parser_records_effective_pruned_height() {
+        let mut document = serde_json::json!({
+            "metadata": {
+                "best_block_height": 42,
+                "best_block_hash": vec![7; 32],
+                "pruning_horizon": 0,
+                "pruned_height": 0
+            },
+            "is_synced": true
+        });
+
+        let tip = parse_chain_tip(&document).unwrap();
+        assert_eq!(tip.height, 42);
+        assert_eq!(tip.pruning_horizon, 0);
+        assert_eq!(tip.pruned_height, 0);
+
+        document["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pruned_height");
+        assert!(
+            parse_chain_tip(&document)
+                .unwrap_err()
+                .to_string()
+                .contains("pruned_height")
+        );
+    }
+
+    #[test]
+    fn archival_tip_requires_zero_configured_and_effective_pruning() {
+        let tip = |pruning_horizon, pruned_height| ChainTip {
+            height: 42,
+            hash: vec![7; 32],
+            pruning_horizon,
+            pruned_height,
+            is_synced: true,
+        };
+
+        require_archival_tip(&tip(0, 0), "selected endpoint").unwrap();
+        assert!(require_archival_tip(&tip(1, 0), "selected endpoint").is_err());
+        assert!(require_archival_tip(&tip(0, 1), "selected endpoint").is_err());
+    }
 
     #[cfg(feature = "live-minotari")]
     fn recovered_submission_fixture() -> crate::result_profile::S0FundingSubmissionEvidence {
@@ -1903,6 +2038,57 @@ mod tests {
             broadcast_to_mempool_unavailable_reason: None,
             tip_height_at_broadcast: Some(100),
         }
+    }
+
+    #[cfg(feature = "live-minotari")]
+    fn s0_evidence_fixture(status: &str) -> S0FundingEvidence {
+        let submission = recovered_submission_fixture();
+        let transaction = crate::result_profile::S0FundingTransactionEvidence {
+            tx_id: submission.tx_id.clone(),
+            fee_microtari: submission.fee_microtari,
+            construction_ms: submission.construction_ms,
+            broadcast_to_mempool_ms: submission.broadcast_to_mempool_ms,
+            broadcast_to_mempool_unavailable_reason: submission
+                .broadcast_to_mempool_unavailable_reason
+                .clone(),
+            broadcast_to_confirmed_at_c_min_ms: 30,
+            tip_height_at_broadcast: submission.tip_height_at_broadcast,
+            mined_height: 101,
+            tip_height_at_confirmation: 104,
+        };
+        S0FundingEvidence {
+            schema_version: 4,
+            b0_run_id: "b0".to_string(),
+            protocol_fingerprint: "a".repeat(64),
+            status: status.to_string(),
+            addresses: std::collections::BTreeMap::new(),
+            birthday: 0,
+            birthday_height: Some(0),
+            birthday_offset_days: Some(0),
+            birthday_start_height: 0,
+            submission: (status != "initialized").then_some(submission),
+            transaction: (status == "confirmed").then_some(transaction),
+        }
+    }
+
+    #[cfg(feature = "live-minotari")]
+    #[test]
+    fn s0_evidence_state_binds_status_and_transaction_identity() {
+        for status in ["initialized", "broadcast", "confirmed"] {
+            validate_s0_evidence_state(&s0_evidence_fixture(status)).unwrap();
+        }
+
+        let mut inconsistent = s0_evidence_fixture("confirmed");
+        inconsistent.transaction.as_mut().unwrap().tx_id = "different".to_string();
+        assert!(validate_s0_evidence_state(&inconsistent).is_err());
+
+        let mut missing_submission = s0_evidence_fixture("confirmed");
+        missing_submission.submission = None;
+        assert!(validate_s0_evidence_state(&missing_submission).is_err());
+
+        let mut unknown = s0_evidence_fixture("confirmed");
+        unknown.status = "unknown".to_string();
+        assert!(validate_s0_evidence_state(&unknown).is_err());
     }
 
     #[cfg(feature = "live-minotari")]
@@ -1933,6 +2119,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("operator replacement approval")
+        );
+        assert!(
+            recovered_s0_submission(&PreparedTransactionRecovery::MeasuredCheckpointUnresolved {
+                tx_id: "42".to_string(),
+                checkpoint_state: "prepared_before_network_submission".to_string(),
+                observed_location: "NotStored".to_string(),
+                submission_allowed: false,
+                reason: "measured-wallet reconciliation only".to_string(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("invalid in the S0 source-funding workflow")
         );
     }
 

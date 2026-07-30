@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use tari_common::configuration::Network;
 use tari_common_types::{
     seeds::{
@@ -19,11 +18,8 @@ use tari_common_types::{
         seed_words::SeedWords,
     },
     tari_address::{TariAddress, TariAddressFeatures},
-    types::CompressedPublicKey,
 };
-use tari_crypto::{
-    hash_domain, hashing::DomainSeparatedHasher, keys::SecretKey, ristretto::RistrettoSecretKey,
-};
+use tari_crypto::{hash_domain, hashing::DomainSeparatedHasher};
 use tari_transaction_components::key_manager::{
     KeyManager, TransactionKeyManagerInterface,
     wallet_types::{KeyDigest, SeedWordsWallet, WalletType},
@@ -42,6 +38,7 @@ pub enum WalletRole {
     OldWallet,
     NewWallet,
     PaymentProcessor,
+    RecipientSink,
 }
 
 impl WalletRole {
@@ -50,6 +47,7 @@ impl WalletRole {
             Self::OldWallet => "old_wallet",
             Self::NewWallet => "new_wallet",
             Self::PaymentProcessor => "payment_processor",
+            Self::RecipientSink => "recipient_sink",
         }
     }
 }
@@ -168,7 +166,7 @@ impl AddressBook {
     }
 }
 
-fn seed_envs(seeds: &SeedConfig) -> [(WalletRole, String); 3] {
+fn seed_envs(seeds: &SeedConfig) -> [(WalletRole, String); 4] {
     [
         (WalletRole::OldWallet, seeds.old_wallet_env.clone()),
         (WalletRole::NewWallet, seeds.new_wallet_env.clone()),
@@ -176,6 +174,7 @@ fn seed_envs(seeds: &SeedConfig) -> [(WalletRole, String); 3] {
             WalletRole::PaymentProcessor,
             seeds.payment_processor_env.clone(),
         ),
+        (WalletRole::RecipientSink, seeds.recipient_sink_env.clone()),
     ]
 }
 
@@ -250,56 +249,79 @@ pub fn material_from_seed(
 fn wallet_fingerprint_hex(wallet: &WalletType) -> String {
     let public_spend = wallet.get_public_spend_key();
     let public_view = wallet.get_public_view_key();
+    wallet_fingerprint_from_public_keys(public_spend.as_bytes(), public_view.as_bytes())
+}
+
+fn wallet_fingerprint_from_public_keys(public_spend: &[u8], public_view: &[u8]) -> String {
     let fingerprint = DomainSeparatedHasher::<KeyDigest, KeyManagerDomain>::new_with_label(
         WALLET_FINGERPRINT_LABEL,
     )
-    .chain(public_spend.as_bytes())
-    .chain(public_view.as_bytes())
+    .chain(public_spend)
+    .chain(public_view)
     .chain(0_u64.to_le_bytes())
     .finalize();
     hex::encode(fingerprint.as_ref())
 }
 
-pub fn derive_distinct_recipient_pool(count: u32) -> anyhow::Result<Vec<String>> {
-    (0..count).map(deterministic_recipient_address).collect()
-}
-
-fn deterministic_recipient_address(index: u32) -> anyhow::Result<String> {
-    let view_key = deterministic_public_key("wallet-bench-s5-view", index)?;
-    let spend_key = deterministic_public_key("wallet-bench-s5-spend", index)?;
-    Ok(TariAddress::new_dual_address(
-        view_key,
-        spend_key,
-        Network::Esmeralda,
-        TariAddressFeatures::create_one_sided_only(),
-        None,
-    )?
-    .to_base58())
-}
-
-fn deterministic_public_key(label: &str, index: u32) -> anyhow::Result<CompressedPublicKey> {
-    let mut wide = [0u8; 64];
-    let first = sha2::Sha512::digest(format!("{label}:{index}:0").as_bytes());
-    let second = sha2::Sha512::digest(format!("{label}:{index}:1").as_bytes());
-    wide[..32].copy_from_slice(&first[..32]);
-    wide[32..].copy_from_slice(&second[..32]);
-    let secret = RistrettoSecretKey::from_uniform_bytes(&wide)
-        .map_err(|error| anyhow::anyhow!("deterministic key derivation failed: {error}"))?;
-    if secret.as_bytes().iter().all(|byte| *byte == 0) {
-        bail!("deterministic key derivation produced zero key");
+pub fn address_wallet_fingerprint_hex(address: &str) -> anyhow::Result<String> {
+    let address = TariAddress::from_str(address).context("parsing source wallet address")?;
+    if address.network() != Network::Esmeralda {
+        bail!("source wallet address must use Esmeralda");
     }
-    Ok(CompressedPublicKey::from_secret_key(&secret))
+    let public_view = address
+        .public_view_key()
+        .context("source wallet address must be a dual address")?;
+    Ok(wallet_fingerprint_from_public_keys(
+        address.public_spend_key().as_bytes(),
+        public_view.as_bytes(),
+    ))
+}
+
+pub fn derive_distinct_recipient_pool(
+    base_address: &str,
+    count: u32,
+) -> anyhow::Result<Vec<String>> {
+    let base = TariAddress::from_str(base_address).context("parsing recipient base address")?;
+    if base.network() != Network::Esmeralda {
+        bail!("recipient base address must use Esmeralda");
+    }
+    if base.public_view_key().is_none() {
+        bail!("recipient base address must be a dual address");
+    }
+
+    (0..count)
+        .map(|index| {
+            base.with_memo_field_payment_id(index.to_be_bytes().to_vec())
+                .map(|address| address.to_base58())
+                .with_context(|| format!("embedding recipient payment id {index}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn esmeralda_address_fingerprint_matches_wallet_identity() {
+        let material = material_from_seed(
+            WalletRole::OldWallet,
+            "SOURCE_GUARD_TEST".to_string(),
+            CipherSeed::random(),
+        )
+        .unwrap();
+        assert_eq!(
+            address_wallet_fingerprint_hex(&material.address).unwrap(),
+            material.wallet_fingerprint_hex
+        );
+    }
+
     fn unique_seed_config(prefix: &str) -> Config {
         let mut config = Config::default();
         config.seeds.old_wallet_env = format!("{prefix}_OLD");
         config.seeds.new_wallet_env = format!("{prefix}_NEW");
         config.seeds.payment_processor_env = format!("{prefix}_PP");
+        config.seeds.recipient_sink_env = format!("{prefix}_RECIPIENT_SINK");
         config
     }
 
@@ -323,6 +345,17 @@ mod tests {
                 .values()
                 .all(|material| material.seed_words != exported)
         );
+    }
+
+    #[test]
+    fn generate_fresh_includes_dedicated_recipient_sink() {
+        let config = unique_seed_config("WALLET_BENCH_TEST_RECIPIENT_SINK");
+        let book = AddressBook::generate_fresh(&config).unwrap();
+        let sink = &book.addresses[WalletRole::RecipientSink.label()];
+
+        assert_eq!(book.addresses.len(), 4);
+        assert_eq!(sink.role, WalletRole::RecipientSink);
+        assert_eq!(sink.env_var, config.seeds.recipient_sink_env);
     }
 
     #[test]
@@ -401,15 +434,49 @@ mod tests {
     }
 
     #[test]
-    fn distinct_recipient_pool_is_deterministic_and_esmeralda() {
-        let first = derive_distinct_recipient_pool(4).unwrap();
-        let second = derive_distinct_recipient_pool(4).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 4);
-        assert_ne!(first[0], first[1]);
-        assert!(first.iter().all(|address| address.starts_with('f')));
-        for address in first {
-            TariAddress::from_str(&address).unwrap();
+    fn shared_recipient_pool_is_deterministic_and_distinct() {
+        let material = material_from_seed(
+            WalletRole::RecipientSink,
+            "HARNESS_SEED_RECIPIENT_SINK".to_string(),
+            CipherSeed::random(),
+        )
+        .unwrap();
+        let mode1 = derive_distinct_recipient_pool(&material.address, 4).unwrap();
+        let mode2 = derive_distinct_recipient_pool(&material.address, 4).unwrap();
+        let mode3 = derive_distinct_recipient_pool(&material.address, 4).unwrap();
+
+        assert_eq!(mode1, mode2);
+        assert_eq!(mode2, mode3);
+        assert_eq!(mode1.len(), 4);
+        assert_eq!(
+            mode1
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            mode1.len()
+        );
+    }
+
+    #[test]
+    fn distinct_recipient_pool_preserves_ownership_and_network() {
+        let material = material_from_seed(
+            WalletRole::RecipientSink,
+            "HARNESS_SEED_RECIPIENT_SINK".to_string(),
+            CipherSeed::random(),
+        )
+        .unwrap();
+        let base = TariAddress::from_str(&material.address).unwrap();
+        let recipients = derive_distinct_recipient_pool(&material.address, 4).unwrap();
+
+        for (index, recipient) in recipients.iter().enumerate() {
+            let recipient = TariAddress::from_str(recipient).unwrap();
+            assert_eq!(recipient.network(), Network::Esmeralda);
+            assert_eq!(recipient.public_view_key(), base.public_view_key());
+            assert_eq!(recipient.public_spend_key(), base.public_spend_key());
+            assert_eq!(
+                recipient.get_memo_field_payment_id_bytes(),
+                u32::try_from(index).unwrap().to_be_bytes()
+            );
         }
     }
 }

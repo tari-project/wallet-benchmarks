@@ -30,24 +30,32 @@ authority_http_url = "https://rpc.esmeralda.tari.com"
 mode1_base_node_service_peer = "PUBLIC_KEY::/ip4/127.0.0.1/tcp/18189"
 ```
 
-Strict checks require `pruning_horizon=0`, selected/authority tip distance at
-most `C_min`, matching finalized hashes, queryable funding headers, selected-
-chain unspent funding outputs, and current wallet scanner heights.
+Strict checks require both `pruning_horizon=0` and `pruned_height=0`,
+selected/authority tip distance at most `C_min`, matching finalized hashes,
+queryable funding headers, selected-chain unspent funding outputs, and current
+wallet scanner heights.
 
 ### Local Node Setup
 
-Initialize the pinned node in its own base path:
+Keep the node database on a native Linux filesystem, not a Windows-mounted WSL
+path such as `/mnt/c`. Set explicit absolute paths and initialize the pinned
+node:
 
 ```sh
-tools/minotari_node \
-  --base-path .bench-data/esmeralda-node \
+NODE_BIN="$(pwd)/tools/minotari_node"
+NODE_ROOT="/absolute/native-linux/path/wallet-bench-esmeralda-node"
+
+"$NODE_BIN" \
+  --base-path "$NODE_ROOT" \
   --network esmeralda \
+  --non-interactive-mode \
+  --disable-splash-screen \
   --init
 ```
 
 Stop it after it creates
-`.bench-data/esmeralda-node/esmeralda/config/config.toml`. In that file, set the
-following values in the existing sections:
+`$NODE_ROOT/esmeralda/config/config.toml`. In that file, set the following
+values in the existing sections:
 
 ```toml
 [base_node]
@@ -66,16 +74,41 @@ listen_ip = "127.0.0.1"
 external_address = "http://127.0.0.1:18142"
 ```
 
-Start it and leave it running:
+Before every start, fail closed if the persistent identity is missing or has
+the wrong permissions; non-interactive mode otherwise creates a new identity.
+Then start the node and leave it running:
 
 ```sh
-tools/minotari_node \
-  --base-path .bench-data/esmeralda-node \
-  --network esmeralda
+NODE_ID="$NODE_ROOT/esmeralda/config/base_node_id_esmeralda.json"
+test -s "$NODE_ID"
+NODE_ID_MODE="$(
+  stat -c '%a' "$NODE_ID" 2>/dev/null ||
+  stat -f '%Lp' "$NODE_ID"
+)"
+test "$NODE_ID_MODE" = 600
+
+"$NODE_BIN" \
+  --base-path "$NODE_ROOT" \
+  --network esmeralda \
+  --non-interactive-mode \
+  --disable-splash-screen
 ```
 
-At the node prompt, run `whoami` and copy the displayed public key into
-`network.mode1_base_node_service_peer`. Wait for the node to synchronize fully.
+Extract only the public key (never print the complete identity file) and place
+the resulting peer string in `network.mode1_base_node_service_peer`:
+
+```sh
+NODE_PUBLIC_KEY="$(
+  perl -0777 -ne \
+    'print "$1\n" if /"?public_key"?\s*:\s*"([0-9A-Fa-f]{64})"/' \
+    "$NODE_ID"
+)"
+test "${#NODE_PUBLIC_KEY}" -eq 64
+printf '%s::/ip4/127.0.0.1/tcp/18189\n' "$NODE_PUBLIC_KEY"
+```
+
+Wait for the node to synchronize fully. The readiness response must show
+`is_synced=true`, `pruning_horizon=0`, and `pruned_height=0`.
 Compare `http://127.0.0.1:18142/get_tip_info` with
 `https://rpc.esmeralda.tari.com/get_tip_info`; `baseline-workflow` then performs
 the authoritative archival, process-hash, tip-distance, and finalized-hash
@@ -89,10 +122,10 @@ Install the dependencies listed in `README.md`, then run:
 scripts/fetch-minotari-cli.sh .bench-cache tools
 scripts/fetch-payment-processor.sh .bench-cache tools
 cargo fmt --check
-cargo check --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo test --all-features
+cargo check --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo test --locked --all-features
 ast-grep scan
 ```
 
@@ -100,7 +133,7 @@ The fetch scripts pin upstream bases and verify their exact Git trees:
 
 - minotari CLI/scanner upstream base: `tari-project/minotari-cli@360c4848a54d65fd710266233cc9277b0f785e74`
 - console wallet: `tari-project/tari@9f5adb7183dc2ec285f5c8fae05f4be9735d9749`
-- node: `tari-project/tari@v5.4.0`
+- node: `tari-project/tari@v5.5.0`
 - payment processor: `tari-project/minotari_payment_processor@f0572c98cbfac7377412dc6d4094c7d7dfc5de2c`
 
 Cargo links the unmodified upstream Minotari library at that revision. Mode 2 S1
@@ -127,12 +160,21 @@ payment construction and self-spend consolidation. Upstream hard-codes `5`; the
 bounty requires the exposed `benchmark.fee_rate` to control every mode, so the
 patch makes both paths require the harness-provided `FEE_PER_GRAM`.
 
+The pinned processor's `.env.sample` maps its worker cadences to
+`15/15/10/15/60` seconds for batch creation, unsigned transaction creation,
+transaction signing, broadcasting, and confirmation checking respectively.
+The template, runtime environment, and result profile keep those fields
+separate; submission validation pins the exact values. The payment receiver
+wallet scan interval remains a separate `10s` setting.
+
 Both fetchers verify known patch hashes, every final tree, and the
 SHA-256 of the complete binary diff. Use `--verify-only` to perform those checks
 without compiling. A normal PP build emits schema-v2 `tools/build-manifest.json`
 with upstream bases, ordered patch hashes/result trees, and artifact hashes;
 runtime preflight compares it against provenance embedded by `build.rs` and fails
-closed on missing, extra, reordered, or changed claims.
+closed on missing, extra, reordered, or changed claims. Both fetchers source the
+same manifest-claim definitions, and CI exercises that emitter with placeholder
+artifact hashes to detect drift without building the four upstream binaries.
 
 ### Source Wallet
 
@@ -145,6 +187,9 @@ read -r -s HARNESS_WALLET_PW
 export HARNESS_WALLET_PW
 export MINOTARI_WALLET_PASSWORD="$HARNESS_WALLET_PW"
 export SOURCE_DB=/absolute/path/to/source-wallet.db
+umask 077
+mkdir -p "$(dirname "$SOURCE_DB")"
+chmod 700 "$(dirname "$SOURCE_DB")"
 tools/minotari --network esmeralda create \
   --database-path "$SOURCE_DB"
 ```
@@ -161,34 +206,71 @@ tools/minotari --network esmeralda daemon \
   --api-port 9147
 ```
 
-From the first terminal, read and fund the returned `address` from Tari Universe
-mining, a faucet, or another wallet. Wait until the balance endpoint reports at
-least `30000 T` plus fees, then stop the daemon cleanly with Ctrl+C before the
-workflow opens the DB:
+From the first terminal, read the returned address and fund it only with
+Esmeralda L1 tXTM from another Esmeralda L1 wallet/faucet, or by mining against a
+fully synchronized Esmeralda L1 node. Mainnet XTM held by Tari Universe and
+Ootle L2 tTARI are different networks/assets and must not be sent to this
+address. Wait until the balance endpoint reports at least `30000 T` plus fees,
+then stop the daemon cleanly with Ctrl+C before the workflow opens the DB:
 
 ```sh
 curl http://127.0.0.1:9147/accounts/default/address
 curl http://127.0.0.1:9147/accounts/default/balance
+sqlite3 "$SOURCE_DB" \
+  "SELECT lower(hex(fingerprint)) FROM accounts WHERE friendly_name = 'default';"
 ```
 
+Copy the returned Esmeralda address and hex fingerprint into the private,
+ignored `harness.toml`:
+
+```toml
+[source_wallet]
+database = "/absolute/path/to/source-wallet.db"
+address = "THE_ESMERALDA_SOURCE_ADDRESS"
+wallet_fingerprint_hex = "THE_HEX_DEFAULT_ACCOUNT_FINGERPRINT"
+```
+
+Funding commands canonicalize `--source-db` and require that exact configured
+path, verify the address-to-fingerprint binding, and compare the database's
+default-account fingerprint using a read-only SQLite connection. Before any
+spend or recovery submission, the latest persisted wallet scan hash must also
+match the selected node and independent Esmeralda authority at the same height.
+Never configure a Tari Universe or other mainnet wallet here.
+
 This is setup, not measurement. Do not send funds to the three generated mode
-addresses: `baseline-workflow` does that only after B0 succeeds.
+addresses: `baseline-workflow` does that only after B0 succeeds. The fourth
+generated `recipient_sink` identity starts unfunded and is never opened or
+scanned by the harness; every S4/S5 destination is recoverable from that seed.
 
 ## B0 and Funding
 
 Start from `harness-prefunding.toml`. Change the candidate `paths.data_dir` and
 the matching `modes.new_wallet_database`; set the local-node identity above. Do
-not add funding records.
+not add funding records. The Mode 2 database must be inside `paths.data_dir`, so
+one namespace lock and one recorded disk cover every measured wallet. For
+Ubuntu/WSL, use a native-ext4 candidate namespace such as:
+
+```toml
+[paths]
+data_dir = "/root/wallet-bench-state/candidates/candidate-YYYYMMDD-HHMMSS"
+
+[modes]
+new_wallet_database = "/root/wallet-bench-state/candidates/candidate-YYYYMMDD-HHMMSS/new-wallet/wallet.db"
+```
+
+Do not place the measured namespace under `/mnt/c`; keep only the source checkout
+and final copied profile/summary on the Windows filesystem.
 
 ```sh
 cp harness-prefunding.toml harness.toml
 mkdir -p .secrets candidates
-cargo run --release -- addresses --config harness.toml --out .secrets/candidate.env
+cargo run --release --locked -- addresses --config harness.toml --out .secrets/candidate.env
 set -a; . .secrets/candidate.env; set +a
 read -r -s HARNESS_WALLET_PW
 export HARNESS_WALLET_PW
 
-caffeinate -dimsu -- cargo run --release --features live-minotari -- baseline-workflow \
+systemd-inhibit --what=sleep --why="Tari wallet benchmark" \
+  cargo run --release --locked --features live-minotari -- baseline-workflow \
   --config harness.toml \
   --source-db /absolute/path/to/source-wallet.db \
   --b0-profile candidates/prefunding-b0.json \
@@ -209,27 +291,41 @@ anchor. `prepare-b0` therefore requires `scan_repetitions = 1` and fails before
 scanning otherwise. Every B0 scan must recover zero outputs, balance, and history
 there.
 
-`caffeinate` is the macOS sleep inhibitor used for the published run. On Linux,
-run the same `cargo` command under the host's equivalent inhibitor, such as
-`systemd-inhibit --what=sleep --why="Tari wallet benchmark"`.
+Canonical candidate commands require a clean harness worktree. The profile
+records runtime cleanliness independently at measurement and final export, plus
+whether the running executable itself was built from a clean worktree.
+Submission requires all four observations to be clean, the build/runtime commit
+to remain the same lowercase 40-hex Git commit, and the measurement/export
+executable and build-manifest hashes to remain identical.
+
+The command above is for Linux/WSL. On macOS, replace `systemd-inhibit ...` with
+`caffeinate -dimsu --`.
 
 If the process is interrupted after B0, resume the same funding transaction with
 the standalone stage command:
 
 ```sh
-cargo run --release --features live-minotari -- fund-s0 \
+cargo run --release --locked --features live-minotari -- fund-s0 \
   --config harness.toml \
   --source-db /absolute/path/to/source-wallet.db \
   --b0-profile candidates/prefunding-b0.json \
   --evidence-out candidates/s0-funding.json
 ```
 
-The funding stage creates fresh benchmark wallet DBs at one measured birthday and
-broadcasts one transaction with three recipients. It atomically records the tx ID and
-broadcast timing before confirmation polling. Repeating the command resumes that
-tx. Once confirmed, it synchronizes all three recipient DBs and requires the
-strict one-output/`A_fund` readiness gate before proceeding. Evidence records the
-mined height, `C_min` tip, signed-kernel fee, and birthday start height.
+The funding stage creates fresh benchmark wallet DBs at one measured birthday
+and broadcasts one transaction with three recipients. It atomically records the
+tx ID and broadcast timing before confirmation polling. Repeating the command
+resumes that tx. Once confirmed, it synchronizes all three recipient DBs and
+requires the strict one-output/`A_fund` readiness gate before proceeding.
+Evidence records the mined height, `C_min` tip, signed-kernel fee, encoded
+birthday day, unmodified `H_birth`, the stock two-day birthday offset, and the
+effective scanner start height.
+
+The pinned stock wallets scan from two days before their encoded birthday.
+Birthday scan cells therefore report both protocol `blocks_scanned =
+H_tip_end - H_birth` and `effective_blocks_scanned = H_tip_end -
+birthday_start_height`; the latter discloses the extra work performed by the
+wallet's unmodified safety window.
 
 ## Candidate Run
 
@@ -241,14 +337,15 @@ standalone `prepare-b0`, `fund-s0`, and `run` commands remain available for
 diagnosis and documented interrupted-funding recovery; each performs its own
 launch checks when invoked separately.
 
-Each non-B0 scan captures one immutable target height/hash. Library-backed scans
-continue toward that same target when the pinned scanner returns before queued
-blocks are persisted; they never replace it with a newer tip. Continuation is
-bounded by the original deadline and three consecutive no-progress returns.
-Overshoot, cursor-hash mismatch, target reorganization, or deadline expiry fails
-the cell. Completion tip/hash and scanner invocation count are recorded as drift
-and implementation evidence. Recovered transaction IDs, not only counts, are
-checked.
+Each non-B0 checkpoint pair (S2/S3 and S6/S7) captures one shared immutable
+target height/hash before either cell starts. Every repetition in both cells
+makes exactly one bounded invocation of the pinned scanner toward that same
+target. A return below the target is preserved as the measured wallet outcome
+and fails verification rather than triggering another invocation. Overshoot,
+cursor-hash mismatch, target reorganization, or deadline expiry also fails the
+cell. Completion tip/hash, scanner invocation count, progress, and `more_blocks`
+are recorded as drift and implementation evidence. Recovered transaction IDs,
+not only counts, are checked.
 
 S0 failure blocks S1. S1 halts at the first failed round. S4 emits one observation
 per requested call. S5 starts directly from disclosed post-S4 state. S6/S7 scan
@@ -259,17 +356,29 @@ reason; scenario wall time is never substituted.
 ## Publication
 
 ```sh
-cargo run --release -- validate-profile \
+cargo run --release --locked -- validate-profile \
   --profile candidates/esmeralda-baseline.json --submission
-cargo run --release -- summarize-profile \
+cargo run --release --locked -- summarize-profile \
   --profile candidates/esmeralda-baseline.json \
   --out candidates/esmeralda-baseline.md
 ```
 
 Submission validation requires successful B0 and S0, all cells present, no
 harness errors, exact canonical configuration, coherent blocked prerequisites,
-recomputed deltas, realistic transaction shapes, and complete provenance. Honest
-downstream wallet failure is valid evidence.
+recomputed deltas, realistic transaction shapes, complete provenance,
+`pruned_height=0`, the complete stock birthday resolution, and all four seed
+fingerprints including `recipient_sink`. Honest downstream wallet failure is
+valid evidence.
+
+New candidates use result schema v7. The committed historical schema-v6 baseline
+is non-submission evidence and cannot pass the command above. Validate or
+summarize that historical artifact only through the explicit legacy path:
+
+```sh
+cargo run --release --locked -- validate-profile \
+  --profile baselines/esmeralda_baseline.json \
+  --legacy-v6
+```
 
 Only after validation should the candidate JSON and summary replace the files in
 `baselines/`. Never promote partial checkpoints or combine modes from separate

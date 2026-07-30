@@ -36,6 +36,9 @@
         "observed_version": {
           "$ref": "#/$defs/nullable_string"
         },
+        "pruned_height": {
+          "$ref": "#/$defs/nullable_integer"
+        },
         "pruning_horizon": {
           "$ref": "#/$defs/nullable_integer"
         },
@@ -66,6 +69,7 @@
         "tip_end_height",
         "tip_end_hash",
         "pruning_horizon",
+        "pruned_height",
         "is_synced",
         "authority_tip_start_height",
         "authority_tip_start_hash",
@@ -75,19 +79,27 @@
       "type": "object"
     },
     "build_artifact": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "sha256": {
+          "$ref": "#/$defs/lowercase_sha256"
+        },
+        "source": {
           "minLength": 1,
           "type": "string"
         },
         "source_revision": {
           "minLength": 1,
           "type": "string"
+        },
+        "source_tree": {
+          "$ref": "#/$defs/git_object_id"
         }
       },
       "required": [
+        "source",
         "source_revision",
+        "source_tree",
         "sha256"
       ],
       "type": "object"
@@ -96,27 +108,164 @@
       "additionalProperties": false,
       "properties": {
         "artifacts": {
-          "additionalProperties": {
-            "$ref": "#/$defs/build_artifact"
+          "additionalProperties": false,
+          "properties": {
+            "minotari": {
+              "$ref": "#/$defs/build_artifact"
+            },
+            "minotari_console_wallet": {
+              "$ref": "#/$defs/build_artifact"
+            },
+            "minotari_node": {
+              "$ref": "#/$defs/build_artifact"
+            },
+            "minotari_payment_processor": {
+              "$ref": "#/$defs/build_artifact"
+            }
           },
-          "minProperties": 1,
+          "required": [
+            "minotari",
+            "minotari_console_wallet",
+            "minotari_node",
+            "minotari_payment_processor"
+          ],
           "type": "object"
         },
-        "payment_processor_patch_sha256": {
-          "minLength": 1,
-          "type": "string"
-        },
         "schema_version": {
-          "minimum": 1,
-          "type": "integer"
+          "const": 2
         },
         "sources": {
+          "additionalProperties": false,
+          "properties": {
+            "minotari_cli": {
+              "$ref": "#/$defs/build_source_one_patch"
+            },
+            "minotari_node": {
+              "$ref": "#/$defs/build_source_no_patches"
+            },
+            "payment_processor": {
+              "$ref": "#/$defs/build_source_one_patch"
+            },
+            "tari_console_wallet": {
+              "$ref": "#/$defs/build_source_no_patches"
+            }
+          },
+          "required": [
+            "minotari_cli",
+            "tari_console_wallet",
+            "minotari_node",
+            "payment_processor"
+          ],
           "type": "object"
         }
       },
       "required": [
         "schema_version",
+        "sources",
         "artifacts"
+      ],
+      "type": "object"
+    },
+    "build_patch": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_tree": {
+          "$ref": "#/$defs/git_object_id"
+        },
+        "sha256": {
+          "$ref": "#/$defs/lowercase_sha256"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "result_tree"
+      ],
+      "type": "object"
+    },
+    "build_source": {
+      "additionalProperties": false,
+      "properties": {
+        "complete_diff_sha256": {
+          "$ref": "#/$defs/lowercase_sha256"
+        },
+        "patches": {
+          "items": {
+            "$ref": "#/$defs/build_patch"
+          },
+          "type": "array"
+        },
+        "repository": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_tree": {
+          "$ref": "#/$defs/git_object_id"
+        },
+        "upstream": {
+          "$ref": "#/$defs/build_upstream"
+        }
+      },
+      "required": [
+        "repository",
+        "upstream",
+        "patches",
+        "complete_diff_sha256",
+        "result_tree"
+      ],
+      "type": "object"
+    },
+    "build_source_no_patches": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/build_source"
+        },
+        {
+          "properties": {
+            "patches": {
+              "maxItems": 0
+            }
+          }
+        }
+      ]
+    },
+    "build_source_one_patch": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/build_source"
+        },
+        {
+          "properties": {
+            "patches": {
+              "maxItems": 1,
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    },
+    "build_upstream": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "$ref": "#/$defs/git_object_id"
+        },
+        "revision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tree": {
+          "$ref": "#/$defs/git_object_id"
+        }
+      },
+      "required": [
+        "revision",
+        "commit",
+        "tree"
       ],
       "type": "object"
     },
@@ -212,6 +361,16 @@
           "minimum": 1,
           "type": "integer"
         },
+        "build_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/build_manifest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "concurrent_batches": {
           "items": {
             "minimum": 1,
@@ -225,12 +384,44 @@
           "minimum": 1,
           "type": "integer"
         },
+        "export_harness_executable_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
         "fanout_outputs_per_tx": {
           "minimum": 1,
           "type": "integer"
         },
         "fee_rate": {
           "type": "string"
+        },
+        "harness_executable_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "mode3_batch_creator_sleep_secs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode3_broadcaster_sleep_secs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode3_confirmation_checker_sleep_secs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode3_payment_receiver_scan_interval_secs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode3_transaction_signer_sleep_secs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode3_unsigned_tx_creator_sleep_secs": {
+          "minimum": 1,
+          "type": "integer"
         },
         "protocol_fingerprint": {
           "minLength": 64,
@@ -239,6 +430,9 @@
         "scan_repetitions": {
           "minimum": 1,
           "type": "integer"
+        },
+        "seed_fingerprints": {
+          "$ref": "#/$defs/seed_fingerprints"
         },
         "volume_target": {
           "minimum": 1,
@@ -257,7 +451,17 @@
         "S5_K",
         "fee_rate",
         "scan_repetitions",
-        "protocol_fingerprint"
+        "mode3_batch_creator_sleep_secs",
+        "mode3_unsigned_tx_creator_sleep_secs",
+        "mode3_transaction_signer_sleep_secs",
+        "mode3_broadcaster_sleep_secs",
+        "mode3_confirmation_checker_sleep_secs",
+        "mode3_payment_receiver_scan_interval_secs",
+        "protocol_fingerprint",
+        "seed_fingerprints",
+        "build_manifest",
+        "harness_executable_sha256",
+        "export_harness_executable_sha256"
       ],
       "type": "object"
     },
@@ -373,6 +577,12 @@
         "birthday": {
           "$ref": "#/$defs/nullable_integer"
         },
+        "birthday_height": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "birthday_offset_days": {
+          "$ref": "#/$defs/nullable_integer"
+        },
         "birthday_start_height": {
           "$ref": "#/$defs/nullable_integer"
         },
@@ -412,9 +622,21 @@
       "required": [
         "amount",
         "tx_id",
-        "height"
+        "height",
+        "birthday",
+        "birthday_height",
+        "birthday_offset_days",
+        "birthday_start_height"
       ],
       "type": "object"
+    },
+    "git_object_id": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "lowercase_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
     },
     "mode": {
       "additionalProperties": false,
@@ -560,9 +782,15 @@
             }
           ]
         },
+        "export_build_worktree_clean": {
+          "type": "boolean"
+        },
         "export_commit": {
           "minLength": 1,
           "type": "string"
+        },
+        "export_worktree_clean": {
+          "type": "boolean"
         },
         "measurement_build_manifest": {
           "anyOf": [
@@ -574,14 +802,24 @@
             }
           ]
         },
+        "measurement_build_worktree_clean": {
+          "type": "boolean"
+        },
         "measurement_commit": {
           "minLength": 1,
           "type": "string"
+        },
+        "measurement_worktree_clean": {
+          "type": "boolean"
         }
       },
       "required": [
         "measurement_commit",
         "export_commit",
+        "measurement_worktree_clean",
+        "export_worktree_clean",
+        "measurement_build_worktree_clean",
+        "export_build_worktree_clean",
         "measurement_build_manifest",
         "export_build_manifest"
       ],
@@ -860,6 +1098,34 @@
       ],
       "type": "object"
     },
+    "seed_fingerprints": {
+      "additionalProperties": false,
+      "properties": {
+        "new_wallet": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "old_wallet": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "payment_processor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "recipient_sink": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "old_wallet",
+        "new_wallet",
+        "payment_processor",
+        "recipient_sink"
+      ],
+      "type": "object"
+    },
     "transaction_observation": {
       "additionalProperties": false,
       "properties": {
@@ -916,6 +1182,9 @@
         },
         "construction_timing_reason": {
           "$ref": "#/$defs/nullable_string"
+        },
+        "deadline_expired": {
+          "type": "boolean"
         },
         "error": {
           "$ref": "#/$defs/nullable_string"
@@ -995,6 +1264,12 @@
         "submission_ms": {
           "$ref": "#/$defs/nullable_integer"
         },
+        "submission_started": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "submission_timing_origin": {
           "$ref": "#/$defs/nullable_string"
         },
@@ -1031,6 +1306,7 @@
         "construction_complete_offset_ms",
         "construction_ms",
         "submission_ms",
+        "submission_started",
         "mempool_available",
         "mempool_reason",
         "confirmation_ms",
@@ -1116,7 +1392,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/tzmWW/tari-wallet-benchmarks/blob/main/RESULT_PROFILE_SCHEMA.json",
+  "$id": "https://github.com/tari-project/wallet-benchmarks/blob/main/RESULT_PROFILE_SCHEMA.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -1180,7 +1456,7 @@
       "type": "string"
     },
     "schema_version": {
-      "const": 6
+      "const": 7
     },
     "versions": {
       "additionalProperties": {

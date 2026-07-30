@@ -12,6 +12,14 @@ use tari_transaction_components::MicroMinotari;
 
 use crate::versions::{MINOTARI_CLI_REV, PAYMENT_PROCESSOR_REV, TARI_CONSOLE_WALLET_REV};
 
+pub const MODE3_BATCH_CREATOR_SLEEP_SECS: u64 = 15;
+pub const MODE3_UNSIGNED_TX_CREATOR_SLEEP_SECS: u64 = 15;
+pub const MODE3_TRANSACTION_SIGNER_SLEEP_SECS: u64 = 10;
+pub const MODE3_BROADCASTER_SLEEP_SECS: u64 = 15;
+pub const MODE3_CONFIRMATION_CHECKER_SLEEP_SECS: u64 = 60;
+pub const MODE3_PAYMENT_RECEIVER_SCAN_INTERVAL_SECS: u64 = 10;
+const DEFAULT_PAYMENT_AMOUNT: &str = "1 T";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub network: NetworkConfig,
@@ -19,6 +27,8 @@ pub struct Config {
     pub paths: PathConfig,
     pub seeds: SeedConfig,
     pub modes: ModeConfig,
+    #[serde(default)]
+    pub source_wallet: Option<SourceWalletConfig>,
     pub versions: VersionConfig,
     #[serde(default)]
     pub funding: FundingConfig,
@@ -93,8 +103,21 @@ pub struct BenchmarkConfig {
     pub mode3_live_max_s4_batch: u32,
     #[serde(default)]
     pub mode3_live_max_s5_items: u32,
-    #[serde(default = "default_mode3_worker_sleep_secs")]
-    pub mode3_worker_sleep_secs: u64,
+    #[serde(default = "default_mode3_batch_creator_sleep_secs")]
+    pub mode3_batch_creator_sleep_secs: u64,
+    #[serde(default = "default_mode3_unsigned_tx_creator_sleep_secs")]
+    pub mode3_unsigned_tx_creator_sleep_secs: u64,
+    #[serde(default = "default_mode3_transaction_signer_sleep_secs")]
+    pub mode3_transaction_signer_sleep_secs: u64,
+    #[serde(default = "default_mode3_broadcaster_sleep_secs")]
+    pub mode3_broadcaster_sleep_secs: u64,
+    #[serde(default = "default_mode3_confirmation_checker_sleep_secs")]
+    pub mode3_confirmation_checker_sleep_secs: u64,
+    #[serde(
+        default = "default_mode3_payment_receiver_scan_interval_secs",
+        alias = "mode3_worker_sleep_secs"
+    )]
+    pub mode3_payment_receiver_scan_interval_secs: u64,
 }
 
 impl BenchmarkConfig {
@@ -128,6 +151,8 @@ pub struct SeedConfig {
     pub old_wallet_env: String,
     pub new_wallet_env: String,
     pub payment_processor_env: String,
+    #[serde(default = "default_recipient_sink_env")]
+    pub recipient_sink_env: String,
     pub wallet_password_env: String,
 }
 
@@ -137,6 +162,13 @@ pub struct ModeConfig {
     pub new_wallet_database: PathBuf,
     pub payment_processor_listen: String,
     pub payment_receiver_listen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceWalletConfig {
+    pub database: PathBuf,
+    pub address: String,
+    pub wallet_fingerprint_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +197,10 @@ pub struct FundingRecord {
     pub height: u64,
     #[serde(default)]
     pub birthday: Option<u16>,
+    #[serde(default)]
+    pub birthday_height: Option<u64>,
+    #[serde(default)]
+    pub birthday_offset_days: Option<u16>,
     #[serde(default)]
     pub birthday_start_height: Option<u64>,
     #[serde(default)]
@@ -218,6 +254,7 @@ impl Config {
             "paths": self.paths,
             "seeds": self.seeds,
             "modes": self.modes,
+            "source_wallet": self.source_wallet,
             "versions": self.versions,
             "timeouts": self.timeouts,
             "runtime_sha256": {
@@ -264,6 +301,34 @@ impl Config {
             .context("network.base_node_http_url")?;
         let authority_url = url::Url::parse(&self.network.authority_http_url)
             .context("network.authority_http_url")?;
+        let mode1_grpc_url = url::Url::parse(&self.modes.old_wallet_grpc_address)
+            .context("modes.old_wallet_grpc_address")?;
+        let mode1_grpc_is_loopback = match mode1_grpc_url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+            _ => false,
+        };
+        if !mode1_grpc_is_loopback {
+            bail!("modes.old_wallet_grpc_address must use a loopback host");
+        }
+        for (field, value) in [
+            (
+                "modes.payment_processor_listen",
+                self.modes.payment_processor_listen.as_str(),
+            ),
+            (
+                "modes.payment_receiver_listen",
+                self.modes.payment_receiver_listen.as_str(),
+            ),
+        ] {
+            let address = value
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("{field} must be an IP socket address"))?;
+            if !address.ip().is_loopback() {
+                bail!("{field} must use a loopback IP address");
+            }
+        }
         let canonical_live_shape = self.benchmark.mode1_live_topology
             && self.benchmark.mode2_live_scenarios
             && self.benchmark.mode3_live_topology
@@ -278,6 +343,19 @@ impl Config {
             ) || self.network.authority_http_url == self.network.base_node_http_url
             {
                 bail!("canonical live runs require a distinct remote authority_http_url");
+            }
+            let mode1_payment_amount = parse_amount(&self.benchmark.mode1_payment_amount)
+                .context("benchmark.mode1_payment_amount")?;
+            let mode2_payment_amount = parse_amount(&self.benchmark.mode2_payment_amount)
+                .context("benchmark.mode2_payment_amount")?;
+            let mode3_payment_amount = parse_amount(&self.benchmark.mode3_payment_amount)
+                .context("benchmark.mode3_payment_amount")?;
+            if mode1_payment_amount != mode2_payment_amount
+                || mode1_payment_amount != mode3_payment_amount
+            {
+                bail!(
+                    "canonical live runs require the same S5 per-recipient payment amount for every wallet mode"
+                );
             }
             if parse_amount(&self.benchmark.a_fund)?.0 != parse_amount("10000 T")?.0
                 || self.benchmark.c_min != 3
@@ -298,8 +376,29 @@ impl Config {
                 || self.benchmark.mode3_live_max_s1_batches != 0
                 || self.benchmark.mode3_live_max_s4_batch != 0
                 || self.benchmark.mode3_live_max_s5_items != 0
+                || self.benchmark.mode3_batch_creator_sleep_secs != MODE3_BATCH_CREATOR_SLEEP_SECS
+                || self.benchmark.mode3_unsigned_tx_creator_sleep_secs
+                    != MODE3_UNSIGNED_TX_CREATOR_SLEEP_SECS
+                || self.benchmark.mode3_transaction_signer_sleep_secs
+                    != MODE3_TRANSACTION_SIGNER_SLEEP_SECS
+                || self.benchmark.mode3_broadcaster_sleep_secs != MODE3_BROADCASTER_SLEEP_SECS
+                || self.benchmark.mode3_confirmation_checker_sleep_secs
+                    != MODE3_CONFIRMATION_CHECKER_SLEEP_SECS
+                || self.benchmark.mode3_payment_receiver_scan_interval_secs
+                    != MODE3_PAYMENT_RECEIVER_SCAN_INTERVAL_SECS
             {
-                bail!("canonical live runs require the uncapped reference benchmark parameters");
+                bail!(
+                    "canonical live runs require the uncapped reference benchmark parameters and pinned payment-processor cadences"
+                );
+            }
+            if !self
+                .modes
+                .new_wallet_database
+                .starts_with(&self.paths.data_dir)
+            {
+                bail!(
+                    "canonical live runs require modes.new_wallet_database inside paths.data_dir so the namespace lock and disk evidence cover Mode 2"
+                );
             }
         }
         if matches!(scan_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
@@ -325,8 +424,35 @@ impl Config {
             .context("benchmark.mode2_payment_amount")?;
         parse_amount(&self.benchmark.mode3_payment_amount)
             .context("benchmark.mode3_payment_amount")?;
-        if self.benchmark.mode3_worker_sleep_secs == 0 {
-            bail!("benchmark.mode3_worker_sleep_secs must be greater than 0");
+        for (name, value) in [
+            (
+                "mode3_batch_creator_sleep_secs",
+                self.benchmark.mode3_batch_creator_sleep_secs,
+            ),
+            (
+                "mode3_unsigned_tx_creator_sleep_secs",
+                self.benchmark.mode3_unsigned_tx_creator_sleep_secs,
+            ),
+            (
+                "mode3_transaction_signer_sleep_secs",
+                self.benchmark.mode3_transaction_signer_sleep_secs,
+            ),
+            (
+                "mode3_broadcaster_sleep_secs",
+                self.benchmark.mode3_broadcaster_sleep_secs,
+            ),
+            (
+                "mode3_confirmation_checker_sleep_secs",
+                self.benchmark.mode3_confirmation_checker_sleep_secs,
+            ),
+            (
+                "mode3_payment_receiver_scan_interval_secs",
+                self.benchmark.mode3_payment_receiver_scan_interval_secs,
+            ),
+        ] {
+            if value == 0 {
+                bail!("benchmark.{name} must be greater than 0");
+            }
         }
         if self.benchmark.s5_k == 0 || !self.benchmark.s5_m.is_multiple_of(self.benchmark.s5_k) {
             bail!("benchmark.s5_m must be a positive multiple of benchmark.s5_k");
@@ -367,6 +493,34 @@ impl Config {
         Ok(())
     }
 
+    pub fn require_source_wallet(&self, supplied_db: &Path) -> anyhow::Result<&SourceWalletConfig> {
+        let source = self
+            .source_wallet
+            .as_ref()
+            .context("source_wallet must configure the dedicated Esmeralda funding wallet")?;
+        if !source.database.is_absolute() {
+            bail!("source_wallet.database must resolve to an absolute path");
+        }
+        let configured = std::fs::canonicalize(&source.database).with_context(|| {
+            format!(
+                "canonicalizing configured source wallet {}",
+                source.database.display()
+            )
+        })?;
+        let supplied = std::fs::canonicalize(supplied_db)
+            .with_context(|| format!("canonicalizing source wallet {}", supplied_db.display()))?;
+        if configured != supplied {
+            bail!(
+                "source DB must exactly match the dedicated source_wallet.database configuration"
+            );
+        }
+        let address_fingerprint = crate::seeds::address_wallet_fingerprint_hex(&source.address)?;
+        if !address_fingerprint.eq_ignore_ascii_case(&source.wallet_fingerprint_hex) {
+            bail!("source_wallet address does not match source_wallet.wallet_fingerprint_hex");
+        }
+        Ok(source)
+    }
+
     /// Resolves runtime filesystem inputs once, without changing the persisted
     /// TOML representation. Existing paths are canonicalized; missing paths are
     /// still made absolute so subprocesses never inherit cwd-dependent values.
@@ -382,6 +536,9 @@ impl Config {
         self.paths.build_manifest = resolve_runtime_path(base, &self.paths.build_manifest)?;
         self.modes.new_wallet_database =
             resolve_runtime_path(base, &self.modes.new_wallet_database)?;
+        if let Some(source_wallet) = self.source_wallet.as_mut() {
+            source_wallet.database = resolve_runtime_path(base, &source_wallet.database)?;
+        }
         Ok(())
     }
 
@@ -515,8 +672,28 @@ impl Config {
                 serde_json::json!(self.benchmark.mode3_live_max_s5_items),
             ),
             (
-                "mode3_worker_sleep_secs".to_string(),
-                serde_json::json!(self.benchmark.mode3_worker_sleep_secs),
+                "mode3_batch_creator_sleep_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_batch_creator_sleep_secs),
+            ),
+            (
+                "mode3_unsigned_tx_creator_sleep_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_unsigned_tx_creator_sleep_secs),
+            ),
+            (
+                "mode3_transaction_signer_sleep_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_transaction_signer_sleep_secs),
+            ),
+            (
+                "mode3_broadcaster_sleep_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_broadcaster_sleep_secs),
+            ),
+            (
+                "mode3_confirmation_checker_sleep_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_confirmation_checker_sleep_secs),
+            ),
+            (
+                "mode3_payment_receiver_scan_interval_secs".to_string(),
+                serde_json::json!(self.benchmark.mode3_payment_receiver_scan_interval_secs),
             ),
             (
                 "funding".to_string(),
@@ -577,7 +754,15 @@ impl Default for Config {
                 mode3_live_max_s1_batches: 0,
                 mode3_live_max_s4_batch: 0,
                 mode3_live_max_s5_items: 0,
-                mode3_worker_sleep_secs: default_mode3_worker_sleep_secs(),
+                mode3_batch_creator_sleep_secs: default_mode3_batch_creator_sleep_secs(),
+                mode3_unsigned_tx_creator_sleep_secs: default_mode3_unsigned_tx_creator_sleep_secs(
+                ),
+                mode3_transaction_signer_sleep_secs: default_mode3_transaction_signer_sleep_secs(),
+                mode3_broadcaster_sleep_secs: default_mode3_broadcaster_sleep_secs(),
+                mode3_confirmation_checker_sleep_secs:
+                    default_mode3_confirmation_checker_sleep_secs(),
+                mode3_payment_receiver_scan_interval_secs:
+                    default_mode3_payment_receiver_scan_interval_secs(),
             },
             paths: PathConfig {
                 data_dir: PathBuf::from(".bench-data"),
@@ -592,6 +777,7 @@ impl Default for Config {
                 old_wallet_env: "HARNESS_SEED_OLD".to_string(),
                 new_wallet_env: "HARNESS_SEED_NEW".to_string(),
                 payment_processor_env: "HARNESS_SEED_PP".to_string(),
+                recipient_sink_env: default_recipient_sink_env(),
                 wallet_password_env: "HARNESS_WALLET_PW".to_string(),
             },
             modes: ModeConfig {
@@ -600,6 +786,7 @@ impl Default for Config {
                 payment_processor_listen: "127.0.0.1:9145".to_string(),
                 payment_receiver_listen: "127.0.0.1:9146".to_string(),
             },
+            source_wallet: None,
             versions: VersionConfig {
                 minotari_cli_rev: MINOTARI_CLI_REV.to_string(),
                 tari_console_wallet_rev: TARI_CONSOLE_WALLET_REV.to_string(),
@@ -621,23 +808,47 @@ fn default_scan_repetitions() -> u32 {
 }
 
 fn default_mode1_payment_amount() -> String {
-    "1 T".to_string()
+    DEFAULT_PAYMENT_AMOUNT.to_string()
 }
 
 fn default_mode2_payment_amount() -> String {
-    "1 T".to_string()
+    DEFAULT_PAYMENT_AMOUNT.to_string()
 }
 
 fn default_mode3_payment_amount() -> String {
-    "1 T".to_string()
+    DEFAULT_PAYMENT_AMOUNT.to_string()
 }
 
-fn default_mode3_worker_sleep_secs() -> u64 {
-    10
+fn default_mode3_batch_creator_sleep_secs() -> u64 {
+    MODE3_BATCH_CREATOR_SLEEP_SECS
+}
+
+fn default_mode3_unsigned_tx_creator_sleep_secs() -> u64 {
+    MODE3_UNSIGNED_TX_CREATOR_SLEEP_SECS
+}
+
+fn default_mode3_transaction_signer_sleep_secs() -> u64 {
+    MODE3_TRANSACTION_SIGNER_SLEEP_SECS
+}
+
+fn default_mode3_broadcaster_sleep_secs() -> u64 {
+    MODE3_BROADCASTER_SLEEP_SECS
+}
+
+fn default_mode3_confirmation_checker_sleep_secs() -> u64 {
+    MODE3_CONFIRMATION_CHECKER_SLEEP_SECS
+}
+
+fn default_mode3_payment_receiver_scan_interval_secs() -> u64 {
+    MODE3_PAYMENT_RECEIVER_SCAN_INTERVAL_SECS
+}
+
+fn default_recipient_sink_env() -> String {
+    "HARNESS_SEED_RECIPIENT_SINK".to_string()
 }
 
 fn default_base_node_rev() -> String {
-    "v5.4.0".to_string()
+    "v5.5.0".to_string()
 }
 
 fn default_authority_http_url() -> String {
@@ -679,6 +890,22 @@ impl FundingConfig {
                 && start_height > record.height
             {
                 bail!("funding.{role}.birthday_start_height must not exceed the funding height");
+            }
+            if let Some(birthday_height) = record.birthday_height
+                && birthday_height > record.height
+            {
+                bail!("funding.{role}.birthday_height must not exceed the funding height");
+            }
+            if let (Some(start_height), Some(birthday_height)) =
+                (record.birthday_start_height, record.birthday_height)
+                && start_height > birthday_height
+            {
+                bail!("funding.{role}.birthday_start_height must not exceed birthday_height");
+            }
+            if record.birthday_height.is_some() != record.birthday_offset_days.is_some() {
+                bail!(
+                    "funding.{role}.birthday_height and birthday_offset_days must be set together"
+                );
             }
         }
         Ok(())
@@ -751,6 +978,26 @@ mod tests {
     }
 
     #[test]
+    fn default_base_node_revision_is_v5_5_0() {
+        assert_eq!(Config::default().versions.base_node_rev, "v5.5.0");
+    }
+
+    #[test]
+    fn legacy_seed_config_defaults_recipient_sink_env() {
+        let seeds: SeedConfig = toml::from_str(
+            r#"
+old_wallet_env = "OLD"
+new_wallet_env = "NEW"
+payment_processor_env = "PP"
+wallet_password_env = "PASSWORD"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(seeds.recipient_sink_env, "HARNESS_SEED_RECIPIENT_SINK");
+    }
+
+    #[test]
     fn amount_parser_uses_tari_type() {
         assert_eq!(parse_amount("5 uT").unwrap(), MicroMinotari(5));
         assert_eq!(parse_amount("1 T").unwrap(), MicroMinotari(1_000_000));
@@ -772,6 +1019,8 @@ mod tests {
             tx_id: "synthetic-funding-tx".to_string(),
             height: 100,
             birthday: None,
+            birthday_height: None,
+            birthday_offset_days: None,
             birthday_start_height: None,
             ..FundingRecord::default()
         });
@@ -816,11 +1065,37 @@ mod tests {
     }
 
     #[test]
-    fn mode3_worker_sleep_must_be_positive() {
+    fn mode3_worker_cadences_match_pinned_upstream_mapping() {
+        let cfg = Config::default();
+        assert_eq!(cfg.benchmark.mode3_batch_creator_sleep_secs, 15);
+        assert_eq!(cfg.benchmark.mode3_unsigned_tx_creator_sleep_secs, 15);
+        assert_eq!(cfg.benchmark.mode3_transaction_signer_sleep_secs, 10);
+        assert_eq!(cfg.benchmark.mode3_broadcaster_sleep_secs, 15);
+        assert_eq!(cfg.benchmark.mode3_confirmation_checker_sleep_secs, 60);
+        assert_eq!(cfg.benchmark.mode3_payment_receiver_scan_interval_secs, 10);
+    }
+
+    #[test]
+    fn mode3_worker_cadences_must_be_positive() {
         let mut cfg = Config::default();
-        cfg.benchmark.mode3_worker_sleep_secs = 0;
+        cfg.benchmark.mode3_confirmation_checker_sleep_secs = 0;
         let error = cfg.validate().unwrap_err().to_string();
-        assert!(error.contains("mode3_worker_sleep_secs"));
+        assert!(error.contains("mode3_confirmation_checker_sleep_secs"));
+    }
+
+    #[test]
+    fn legacy_worker_sleep_name_only_controls_payment_receiver_scan() {
+        let legacy = toml::to_string(&Config::default()).unwrap().replace(
+            "mode3_payment_receiver_scan_interval_secs",
+            "mode3_worker_sleep_secs",
+        );
+        let parsed: Config = toml::from_str(&legacy).unwrap();
+        assert_eq!(
+            parsed.benchmark.mode3_payment_receiver_scan_interval_secs,
+            10
+        );
+        assert_eq!(parsed.benchmark.mode3_batch_creator_sleep_secs, 15);
+        assert_eq!(parsed.benchmark.mode3_confirmation_checker_sleep_secs, 60);
     }
 
     #[test]
@@ -853,6 +1128,8 @@ mod tests {
             tx_id: "123".to_string(),
             height: 700_000,
             birthday: None,
+            birthday_height: None,
+            birthday_offset_days: None,
             birthday_start_height: None,
             ..FundingRecord::default()
         });
@@ -863,6 +1140,44 @@ mod tests {
         let record = cfg.funding.new_wallet.as_mut().unwrap();
         record.birthday = Some(1_600);
         record.birthday_start_height = Some(690_000);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn extended_birthday_resolution_is_complete_and_ordered() {
+        let mut cfg = Config::default();
+        cfg.funding.new_wallet = Some(FundingRecord {
+            amount: "10000 T".to_string(),
+            tx_id: "123".to_string(),
+            height: 700_000,
+            birthday: Some(1_600),
+            birthday_height: Some(695_000),
+            birthday_offset_days: None,
+            birthday_start_height: Some(690_000),
+            ..FundingRecord::default()
+        });
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("birthday_height and birthday_offset_days"));
+
+        cfg.funding
+            .new_wallet
+            .as_mut()
+            .unwrap()
+            .birthday_offset_days = Some(2);
+        cfg.funding
+            .new_wallet
+            .as_mut()
+            .unwrap()
+            .birthday_start_height = Some(696_000);
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("birthday_start_height must not exceed birthday_height"));
+
+        cfg.funding
+            .new_wallet
+            .as_mut()
+            .unwrap()
+            .birthday_start_height = Some(690_000);
         cfg.validate().unwrap();
     }
 
@@ -879,6 +1194,57 @@ mod tests {
         );
         cfg.network.mode1_base_node_service_peer =
             Some("abc::/ip4/127.0.0.1/tcp/18189".to_string());
+        cfg.validate_prefunding_b0().unwrap();
+    }
+
+    #[test]
+    fn wallet_control_listeners_require_loopback_addresses() {
+        let mut cfg = Config::default();
+        cfg.modes.old_wallet_grpc_address = "http://0.0.0.0:18143".to_string();
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("old_wallet_grpc_address must use a loopback host")
+        );
+
+        let mut cfg = Config::default();
+        cfg.modes.payment_processor_listen = "0.0.0.0:9145".to_string();
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("payment_processor_listen must use a loopback IP address")
+        );
+
+        let mut cfg = Config::default();
+        cfg.modes.payment_receiver_listen = "[::]:9146".to_string();
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("payment_receiver_listen must use a loopback IP address")
+        );
+    }
+
+    #[test]
+    fn wallet_control_listeners_require_ip_socket_syntax_for_mode3() {
+        let mut cfg = Config::default();
+        cfg.modes.payment_processor_listen = "localhost:9145".to_string();
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("payment_processor_listen must be an IP socket address")
+        );
+    }
+
+    #[test]
+    fn wallet_control_listeners_accept_ipv6_loopback() {
+        let mut cfg = Config::default();
+        cfg.modes.old_wallet_grpc_address = "http://[::1]:18143".to_string();
+        cfg.modes.payment_processor_listen = "[::1]:9145".to_string();
+        cfg.modes.payment_receiver_listen = "[::1]:9146".to_string();
         cfg.validate_prefunding_b0().unwrap();
     }
 
@@ -919,6 +1285,66 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("uncapped reference benchmark parameters")
+        );
+    }
+
+    #[test]
+    fn canonical_live_shape_rejects_tuned_payment_processor_cadence() {
+        let mut cfg = Config::default();
+        cfg.benchmark.mode1_live_topology = true;
+        cfg.benchmark.mode2_live_scenarios = true;
+        cfg.benchmark.mode3_live_topology = true;
+        cfg.benchmark.live_fresh_scan_cells = true;
+        cfg.benchmark.mode3_batch_creator_sleep_secs = 10;
+        cfg.network.base_node_http_url = "http://127.0.0.1:18142".to_string();
+        cfg.network.mode1_base_node_service_peer =
+            Some("abc::/ip4/127.0.0.1/tcp/18189".to_string());
+
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("uncapped reference benchmark parameters")
+        );
+    }
+
+    #[test]
+    fn canonical_live_shape_requires_equal_s5_payment_amounts() {
+        let mut cfg = Config::default();
+        cfg.benchmark.mode1_live_topology = true;
+        cfg.benchmark.mode2_live_scenarios = true;
+        cfg.benchmark.mode3_live_topology = true;
+        cfg.benchmark.live_fresh_scan_cells = true;
+        cfg.benchmark.mode2_payment_amount = "2 T".to_string();
+        cfg.network.base_node_http_url = "http://127.0.0.1:18142".to_string();
+        cfg.network.mode1_base_node_service_peer =
+            Some("abc::/ip4/127.0.0.1/tcp/18189".to_string());
+
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("same S5 per-recipient payment amount")
+        );
+    }
+
+    #[test]
+    fn canonical_live_shape_requires_mode2_database_inside_the_candidate_namespace() {
+        let mut cfg = Config::default();
+        cfg.benchmark.mode1_live_topology = true;
+        cfg.benchmark.mode2_live_scenarios = true;
+        cfg.benchmark.mode3_live_topology = true;
+        cfg.benchmark.live_fresh_scan_cells = true;
+        cfg.network.base_node_http_url = "http://127.0.0.1:18142".to_string();
+        cfg.network.mode1_base_node_service_peer =
+            Some("abc::/ip4/127.0.0.1/tcp/18189".to_string());
+        cfg.modes.new_wallet_database = PathBuf::from("outside/wallet.db");
+
+        assert!(
+            cfg.validate_prefunding_b0()
+                .unwrap_err()
+                .to_string()
+                .contains("inside paths.data_dir")
         );
     }
 

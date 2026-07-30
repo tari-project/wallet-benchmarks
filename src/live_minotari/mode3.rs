@@ -71,6 +71,9 @@ pub(super) async fn annotate_mode3_payment_processor(
     let Some(pp_seed) = book.addresses.get(WalletRole::PaymentProcessor.label()) else {
         return Ok(());
     };
+    let Some(recipient_sink) = book.addresses.get(WalletRole::RecipientSink.label()) else {
+        return Ok(());
+    };
     let start = Instant::now();
     let topology = start_mode3_topology(config, pp_seed).await;
     match topology {
@@ -95,7 +98,8 @@ pub(super) async fn annotate_mode3_payment_processor(
                 context._payment_receiver.shutdown().await?;
                 return Ok(());
             }
-            run_mode3_send_cells(config, profile, pp_seed, &context).await?;
+            run_mode3_send_cells(config, profile, pp_seed, &recipient_sink.address, &context)
+                .await?;
             context._payment_processor.shutdown().await?;
             context._payment_receiver.shutdown().await?;
         }
@@ -137,7 +141,6 @@ async fn start_mode3_topology(
         )),
         receiver_balance,
         processor_version: version.version,
-        worker_sleep_secs: config.benchmark.mode3_worker_sleep_secs,
         receiver_birthday: mode3_receiver_birthday(pp_seed),
     })
 }
@@ -213,11 +216,16 @@ fn record_mode3_s0(
         metrics: Some(metrics),
     });
     cell.notes.push(format!(
-        "Mode 3 topology started real minotari payment receiver plus minotari_payment_processor version {}; receiver_balance={}; receiver_birthday={}; worker_sleep_secs={}",
+        "Mode 3 topology started real minotari payment receiver plus minotari_payment_processor version {}; receiver_balance={}; receiver_birthday={}; worker_cadences_secs=batch_creator:{},unsigned_tx_creator:{},transaction_signer:{},broadcaster:{},confirmation_checker:{}; payment_receiver_scan_interval_secs={}",
         context.processor_version,
         context.receiver_balance,
         context.receiver_birthday,
-        context.worker_sleep_secs
+        config.benchmark.mode3_batch_creator_sleep_secs,
+        config.benchmark.mode3_unsigned_tx_creator_sleep_secs,
+        config.benchmark.mode3_transaction_signer_sleep_secs,
+        config.benchmark.mode3_broadcaster_sleep_secs,
+        config.benchmark.mode3_confirmation_checker_sleep_secs,
+        config.benchmark.mode3_payment_receiver_scan_interval_secs
     ));
     cell.notes.push(
         "payment receiver, processor, and signer state use the fresh candidate namespace"
@@ -271,6 +279,7 @@ async fn run_mode3_send_cells(
     config: &Config,
     profile: &mut ResultProfile,
     pp_seed: &crate::seeds::SeedMaterial,
+    recipient_sink_address: &str,
     context: &Mode3TopologyContext,
 ) -> anyhow::Result<()> {
     let amount = parse_amount(&config.benchmark.mode3_payment_amount)?;
@@ -366,7 +375,7 @@ async fn run_mode3_send_cells(
     let s4_balance_before = account_snapshot(&pp_db_path)
         .ok()
         .map(|snapshot| snapshot.available_microtari);
-    let s4_recipients = derive_distinct_recipient_pool(128)?;
+    let s4_recipients = derive_distinct_recipient_pool(recipient_sink_address, 128)?;
     let mut s4 = run_pp_s4_batches(config, context, &s4_recipients, amount).await;
     s4.tip_end_height = base_node_tip_height(&config.network.base_node_http_url)
         .await
@@ -422,10 +431,11 @@ async fn run_mode3_send_cells(
         config.benchmark.s5_m,
         config.benchmark.mode3_live_max_s5_items,
     );
-    let s5_recipients = derive_distinct_recipient_pool(config.benchmark.s5_m)?
-        .into_iter()
-        .take(s5_items as usize)
-        .collect::<Vec<_>>();
+    let s5_recipients =
+        derive_distinct_recipient_pool(recipient_sink_address, config.benchmark.s5_m)?
+            .into_iter()
+            .take(s5_items as usize)
+            .collect::<Vec<_>>();
     let s5_recipient_set = s5_recipients.clone();
     let s5_components_before = account_balance(&pp_db_path).ok();
     let s5_balance_before = account_snapshot(&pp_db_path)
@@ -559,22 +569,38 @@ async fn run_pp_s1_rounds(
             Ok(amounts) => amounts,
             Err(error) => {
                 total.failed_batches = total.failed_batches.saturating_add(1);
-                total.errors.push(format!(
+                let message = format!(
                     "PP S1 round {} could not read spendable amounts: {error:#}",
                     round.round_index
-                ));
+                );
+                record_s1_preflight_failure(
+                    &mut total.extra_metrics,
+                    round.round_index,
+                    None,
+                    "read_spendable_inputs",
+                    &message,
+                );
+                total.errors.push(message);
                 break;
             }
         };
         spendable_amounts.sort_unstable_by(|a, b| b.cmp(a));
         if spendable_amounts.len() != round.tx_count as usize {
             total.failed_batches = total.failed_batches.saturating_add(1);
-            total.errors.push(format!(
+            let message = format!(
                 "PP S1 round {} expected {} spendable inputs before dispatch, observed {}; refusing noncanonical state",
                 round.round_index,
                 round.tx_count,
                 spendable_amounts.len()
-            ));
+            );
+            record_s1_preflight_failure(
+                &mut total.extra_metrics,
+                round.round_index,
+                None,
+                "validate_spendable_input_count",
+                &message,
+            );
+            total.errors.push(message);
             break;
         }
         let mut round_summary = PpScenarioSummary {
@@ -611,9 +637,6 @@ async fn run_pp_s1_rounds(
                 Err(error) => Err(error),
             };
             let completed_offset_ms = round_start.elapsed().as_millis();
-            round_summary
-                .construction_complete_ms
-                .push(completed_offset_ms);
             round_summary.record_batch(
                 tx_index,
                 submit_offset_ms,
@@ -770,6 +793,8 @@ async fn run_pp_s4_batches(
 ) -> PpScenarioSummary {
     let start = Instant::now();
     let mut total = PpScenarioSummary::default();
+    let mut deadline_measurements = Vec::new();
+    let mut cleanup_measurements = Vec::new();
     for configured_batch in &config.benchmark.concurrent_batches {
         let attempts = capped_attempts(*configured_batch, config.benchmark.mode3_live_max_s4_batch);
         let selected = recipients.iter().take(attempts as usize).cloned().collect();
@@ -782,9 +807,39 @@ async fn run_pp_s4_batches(
             amount,
         )
         .await;
+        if let Some(mut measurement) = batch.extra_metrics.get("s4_deadline_measurement").cloned() {
+            if let Some(map) = measurement.as_object_mut() {
+                map.insert(
+                    "configured_batch".to_string(),
+                    serde_json::json!(configured_batch),
+                );
+            }
+            deadline_measurements.push(measurement);
+        }
+        if let Some(mut cleanup) = batch.extra_metrics.get("s4_post_deadline_cleanup").cloned() {
+            if let Some(map) = cleanup.as_object_mut() {
+                map.insert(
+                    "configured_batch".to_string(),
+                    serde_json::json!(configured_batch),
+                );
+            }
+            cleanup_measurements.push(cleanup);
+        }
+        total.wall_ms = total.wall_ms.saturating_add(batch.wall_ms);
         total.add_batch(*configured_batch, batch);
     }
-    total.wall_ms = start.elapsed().as_millis();
+    total.extra_metrics.insert(
+        "s4_deadline_measurements".to_string(),
+        serde_json::Value::Array(deadline_measurements),
+    );
+    total.extra_metrics.insert(
+        "s4_post_deadline_cleanups".to_string(),
+        serde_json::Value::Array(cleanup_measurements),
+    );
+    total.extra_metrics.insert(
+        "s4_actual_return_wall_ms".to_string(),
+        serde_json::json!(start.elapsed().as_millis()),
+    );
     total
 }
 
@@ -824,7 +879,6 @@ async fn run_pp_recipient_batches_sequential(
         )
         .await;
         let completed_offset_ms = start.elapsed().as_millis();
-        summary.construction_complete_ms.push(completed_offset_ms);
         summary.record_batch(
             batch_index,
             submit_offset_ms,
@@ -863,6 +917,7 @@ async fn run_pp_batches_concurrent(
     let mut pending = BTreeMap::new();
     let budget = pp_observation_timeout(config, scenario);
     let deadline = time::Instant::now() + budget;
+    let mut deadline_expired = false;
     for (index, recipient) in recipients.into_iter().enumerate() {
         let batch_index = u32::try_from(index + 1).unwrap_or(u32::MAX);
         println!("{label} batch {batch_index}/{batch_count} dispatching");
@@ -890,14 +945,17 @@ async fn run_pp_batches_concurrent(
         });
     }
     while !join_set.is_empty() {
-        let Ok(Some(result)) = time::timeout_at(deadline, join_set.join_next()).await else {
-            join_set.abort_all();
-            break;
+        let result = match time::timeout_at(deadline, join_set.join_next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                deadline_expired = true;
+                break;
+            }
         };
         match result {
             Ok((batch_index, submit_offset_ms, completed_ms, recipient, send)) => {
                 pending.remove(&batch_index);
-                summary.construction_complete_ms.push(completed_ms);
                 summary.record_batch(
                     batch_index,
                     submit_offset_ms,
@@ -909,25 +967,101 @@ async fn run_pp_batches_concurrent(
             Err(error) => summary.errors.push(format!("task join error: {error}")),
         }
     }
-    let timed_out_at = start.elapsed().as_millis();
-    for (batch_index, (submit_offset_ms, recipient)) in pending {
-        summary.record_batch(
-            batch_index,
-            submit_offset_ms,
-            timed_out_at,
-            vec![recipient],
-            Err(anyhow::anyhow!(
-                "{label} absolute deadline expired before dispatch task completed"
-            )),
-        );
+    let pending_at_deadline = if deadline_expired { pending.len() } else { 0 };
+    if deadline_expired {
+        for (&batch_index, (submit_offset_ms, recipient)) in &pending {
+            summary.record_deadline_timeout(
+                batch_index,
+                *submit_offset_ms,
+                budget.as_millis(),
+                vec![recipient.clone()],
+                format!("{label} absolute deadline expired before dispatch task completed"),
+            );
+        }
     }
+
+    let cleanup_start = Instant::now();
+    let abort_requested_tasks = if deadline_expired { join_set.len() } else { 0 };
+    if deadline_expired {
+        join_set.abort_all();
+    }
+    let mut drained_tasks = 0usize;
+    let mut forced_shutdown_tasks = 0usize;
+    let mut completed_after_deadline_discarded_tasks = 0usize;
+    let mut post_deadline_join_errors = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(_) => {
+                drained_tasks = drained_tasks.saturating_add(1);
+                completed_after_deadline_discarded_tasks =
+                    completed_after_deadline_discarded_tasks.saturating_add(1);
+            }
+            Err(error) if error.is_cancelled() => {
+                forced_shutdown_tasks = forced_shutdown_tasks.saturating_add(1);
+            }
+            Err(error) => {
+                drained_tasks = drained_tasks.saturating_add(1);
+                post_deadline_join_errors.push(error.to_string());
+            }
+        }
+    }
+    let cleanup_drain_ms = cleanup_start.elapsed().as_millis();
+    let tasks_quiesced = join_set.is_empty();
+    debug_assert!(tasks_quiesced);
     summary
         .observe_db(
             config,
             deadline.saturating_duration_since(time::Instant::now()),
         )
         .await;
-    summary.wall_ms = start.elapsed().as_millis();
+    deadline_expired |= time::Instant::now() >= deadline;
+    summary.wall_ms = if deadline_expired {
+        budget.as_millis()
+    } else {
+        start.elapsed().as_millis().min(budget.as_millis())
+    };
+    let unmatched_pending_attempts_after_drain = if pending_at_deadline == 0 {
+        Vec::new()
+    } else {
+        pending
+            .into_iter()
+            .map(|(batch_index, (submit_offset_ms, recipient))| {
+                serde_json::json!({
+                    "batch_index": batch_index,
+                    "submit_offset_ms": submit_offset_ms,
+                    "recipient": recipient,
+                    "terminal_outcome": "timed_out",
+                    "submission_state": "ambiguous"
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    summary.extra_metrics.insert(
+        "s4_deadline_measurement".to_string(),
+        serde_json::json!({
+            "deadline_expired": deadline_expired,
+            "deadline_offset_ms": budget.as_millis(),
+            "pending_tasks_at_deadline": pending_at_deadline,
+            "measured_wall_ms": summary.wall_ms
+        }),
+    );
+    summary.extra_metrics.insert(
+        "s4_post_deadline_cleanup".to_string(),
+        serde_json::json!({
+            "drain_ms": cleanup_drain_ms,
+            "cleanup_grace_ms": 0,
+            "cleanup_deadline_exhausted": false,
+            "abort_requested_tasks": abort_requested_tasks,
+            "drained_tasks": drained_tasks,
+            "forced_shutdown_tasks": forced_shutdown_tasks,
+            "completed_after_deadline_discarded_tasks": completed_after_deadline_discarded_tasks,
+            "post_deadline_join_errors": post_deadline_join_errors,
+            "tasks_quiesced": tasks_quiesced,
+            "unmatched_pending_attempts_after_drain": unmatched_pending_attempts_after_drain,
+            "late_results_accepted": false,
+            "actual_return_offset_ms": start.elapsed().as_millis()
+        }),
+    );
     summary
 }
 
@@ -1077,7 +1211,10 @@ pub(super) fn record_pp_summary(
         summary.accepted_batches == 0 || confirmed_batch_count >= accepted_batch_count;
     let all_verified_ok = verified.iter().all(|tx| tx.confirmed);
     let confirmed_batches = u32::try_from(confirmed_batch_count).unwrap_or(u32::MAX);
-    let terminal_failures = summary.attempted_batches.saturating_sub(confirmed_batches);
+    let terminal_failures = summary
+        .attempted_batches
+        .saturating_sub(confirmed_batches)
+        .max(summary.failed_batches);
     profile
         .chain_verification
         .verified_transactions
@@ -1203,5 +1340,39 @@ mod tests {
         );
         assert_eq!(batches, vec!["missing"]);
         assert_eq!(payments, vec!["missing-payment"]);
+    }
+
+    #[test]
+    fn s4_concurrent_runner_aborts_at_deadline_without_late_acceptance_or_throttling() {
+        let source = include_str!("mode3.rs");
+        let start = source.find("async fn run_pp_batches_concurrent").unwrap();
+        let end = source[start..]
+            .find("pub(super) fn pp_observation_timeout")
+            .map(|offset| start + offset)
+            .unwrap();
+        let runner = &source[start..end];
+
+        assert!(!runner.contains("Semaphore"));
+        assert!(!runner.contains("sleep("));
+        assert!(!runner.contains("request_cleanup_deadline"));
+        assert!(!runner.contains("cleanup_join_deadline"));
+        assert!(!runner.contains("join_set.shutdown().await"));
+        assert!(!runner.contains("inspect_payment_processor_db"));
+        assert_eq!(runner.matches("join_set.join_next()").count(), 2);
+        let timeout = runner.find("record_deadline_timeout").unwrap();
+        let abort = runner.find("join_set.abort_all()").unwrap();
+        let reap = runner
+            .find("while let Some(result) = join_set.join_next().await")
+            .unwrap();
+        assert!(timeout < abort);
+        assert!(abort < reap);
+        assert!(!runner[abort..].contains("summary.record_batch("));
+        assert!(runner.contains("\"cleanup_grace_ms\": 0"));
+        assert!(runner.contains("\"late_results_accepted\": false"));
+        assert!(runner.contains("\"submission_state\": \"ambiguous\""));
+        assert!(runner.contains("debug_assert!(tasks_quiesced)"));
+        assert!(runner.contains("\"s4_deadline_measurement\""));
+        assert!(runner.contains("\"s4_post_deadline_cleanup\""));
+        assert!(runner.contains("budget.as_millis()"));
     }
 }

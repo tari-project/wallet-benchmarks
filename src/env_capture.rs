@@ -187,6 +187,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mount_selection_canonicalizes_symlinked_data_paths() {
         let root = tempfile::tempdir().unwrap();

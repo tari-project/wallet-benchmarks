@@ -8,8 +8,8 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 use super::{
-    CellStatus, OutcomeCounts, ProfileKind, REFERENCE_BASE_NODE_REVISION, RESULT_SCHEMA_VERSION,
-    ResultProfile,
+    CellStatus, LEGACY_RESULT_SCHEMA_VERSION, OutcomeCounts, ProfileKind,
+    REFERENCE_BASE_NODE_REVISION, RESULT_SCHEMA_VERSION, ResultProfile,
 };
 use crate::{
     modes::{ModeName, ScenarioName},
@@ -22,12 +22,21 @@ const REQUIRED_STAGES: [&str; 4] = [
     "payment_processor",
     "fresh_scans",
 ];
+const REFERENCE_S1_ROUNDS: [(u64, u64, u64, u64); 7] = [
+    (1, 1, 2, 2),
+    (2, 2, 2, 4),
+    (3, 4, 2, 8),
+    (4, 8, 2, 16),
+    (5, 16, 2, 32),
+    (6, 32, 2, 64),
+    (7, 64, 8, 512),
+];
 const REFERENCE_S4_RAMP: [u64; 5] = [8, 16, 32, 64, 128];
 
 pub fn schema_document() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://github.com/tzmWW/tari-wallet-benchmarks/blob/main/RESULT_PROFILE_SCHEMA.json",
+        "$id": "https://github.com/tari-project/wallet-benchmarks/blob/main/RESULT_PROFILE_SCHEMA.json",
         "title": "Tari wallet benchmark result profile",
         "type": "object",
         "additionalProperties": false,
@@ -66,10 +75,19 @@ pub fn schema_document() -> Value {
             "nullable_integer": {"type": ["integer", "null"], "minimum": 0},
             "provenance": {
                 "type": "object", "additionalProperties": false,
-                "required": ["measurement_commit", "export_commit", "measurement_build_manifest", "export_build_manifest"],
+                "required": [
+                    "measurement_commit", "export_commit",
+                    "measurement_worktree_clean", "export_worktree_clean",
+                    "measurement_build_worktree_clean", "export_build_worktree_clean",
+                    "measurement_build_manifest", "export_build_manifest"
+                ],
                 "properties": {
                     "measurement_commit": {"type": "string", "minLength": 1},
                     "export_commit": {"type": "string", "minLength": 1},
+                    "measurement_worktree_clean": {"type": "boolean"},
+                    "export_worktree_clean": {"type": "boolean"},
+                    "measurement_build_worktree_clean": {"type": "boolean"},
+                    "export_build_worktree_clean": {"type": "boolean"},
                     "measurement_build_manifest": {"anyOf": [{"$ref": "#/$defs/build_manifest"}, {"type": "null"}]},
                     "export_build_manifest": {"anyOf": [{"$ref": "#/$defs/build_manifest"}, {"type": "null"}]},
                     "correction": {"$ref": "#/$defs/profile_correction"}
@@ -99,27 +117,90 @@ pub fn schema_document() -> Value {
             },
             "build_manifest": {
                 "type": "object", "additionalProperties": false,
-                "required": ["schema_version", "artifacts"],
+                "required": ["schema_version", "sources", "artifacts"],
                 "properties": {
-                    "schema_version": {"type": "integer", "minimum": 1},
-                    "sources": {"type": "object"},
-                    "artifacts": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/build_artifact"}},
-                    "payment_processor_patch_sha256": {"type": "string", "minLength": 1}
+                    "schema_version": {"const": 2},
+                    "sources": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["minotari_cli", "tari_console_wallet", "minotari_node", "payment_processor"],
+                        "properties": {
+                            "minotari_cli": {"$ref": "#/$defs/build_source_one_patch"},
+                            "tari_console_wallet": {"$ref": "#/$defs/build_source_no_patches"},
+                            "minotari_node": {"$ref": "#/$defs/build_source_no_patches"},
+                            "payment_processor": {"$ref": "#/$defs/build_source_one_patch"}
+                        }
+                    },
+                    "artifacts": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["minotari", "minotari_console_wallet", "minotari_node", "minotari_payment_processor"],
+                        "properties": {
+                            "minotari": {"$ref": "#/$defs/build_artifact"},
+                            "minotari_console_wallet": {"$ref": "#/$defs/build_artifact"},
+                            "minotari_node": {"$ref": "#/$defs/build_artifact"},
+                            "minotari_payment_processor": {"$ref": "#/$defs/build_artifact"}
+                        }
+                    }
+                }
+            },
+            "build_source": {
+                "type": "object", "additionalProperties": false,
+                "required": ["repository", "upstream", "patches", "complete_diff_sha256", "result_tree"],
+                "properties": {
+                    "repository": {"type": "string", "minLength": 1},
+                    "upstream": {"$ref": "#/$defs/build_upstream"},
+                    "patches": {"type": "array", "items": {"$ref": "#/$defs/build_patch"}},
+                    "complete_diff_sha256": {"$ref": "#/$defs/lowercase_sha256"},
+                    "result_tree": {"$ref": "#/$defs/git_object_id"}
+                }
+            },
+            "build_source_one_patch": {
+                "allOf": [
+                    {"$ref": "#/$defs/build_source"},
+                    {"properties": {"patches": {"minItems": 1, "maxItems": 1}}}
+                ]
+            },
+            "build_source_no_patches": {
+                "allOf": [
+                    {"$ref": "#/$defs/build_source"},
+                    {"properties": {"patches": {"maxItems": 0}}}
+                ]
+            },
+            "build_upstream": {
+                "type": "object", "additionalProperties": false,
+                "required": ["revision", "commit", "tree"],
+                "properties": {
+                    "revision": {"type": "string", "minLength": 1},
+                    "commit": {"$ref": "#/$defs/git_object_id"},
+                    "tree": {"$ref": "#/$defs/git_object_id"}
+                }
+            },
+            "build_patch": {
+                "type": "object", "additionalProperties": false,
+                "required": ["path", "sha256", "result_tree"],
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "sha256": {"$ref": "#/$defs/lowercase_sha256"},
+                    "result_tree": {"$ref": "#/$defs/git_object_id"}
                 }
             },
             "build_artifact": {
-                "type": "object", "additionalProperties": true,
-                "required": ["source_revision", "sha256"],
+                "type": "object", "additionalProperties": false,
+                "required": ["source", "source_revision", "source_tree", "sha256"],
                 "properties": {
-                    "source_revision": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "minLength": 1}
+                    "source": {"type": "string", "minLength": 1},
+                    "source_revision": {"type": "string", "minLength": 1},
+                    "source_tree": {"$ref": "#/$defs/git_object_id"},
+                    "sha256": {"$ref": "#/$defs/lowercase_sha256"}
                 }
             },
+            "git_object_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "lowercase_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "base_node": {
                 "type": "object", "additionalProperties": false,
                 "required": [
                     "endpoint", "authority_endpoint", "configured_revision", "observed_version", "version_observable",
                     "tip_start_height", "tip_start_hash", "tip_end_height", "tip_end_hash",
-                    "pruning_horizon", "is_synced", "authority_tip_start_height",
+                    "pruning_horizon", "pruned_height", "is_synced", "authority_tip_start_height",
                     "authority_tip_start_hash", "authority_tip_end_height", "authority_tip_end_hash"
                 ],
                 "properties": {
@@ -133,6 +214,7 @@ pub fn schema_document() -> Value {
                     "tip_end_height": {"$ref": "#/$defs/nullable_integer"},
                     "tip_end_hash": {"$ref": "#/$defs/nullable_string"},
                     "pruning_horizon": {"$ref": "#/$defs/nullable_integer"},
+                    "pruned_height": {"$ref": "#/$defs/nullable_integer"},
                     "is_synced": {"type": ["boolean", "null"]},
                     "authority_tip_start_height": {"$ref": "#/$defs/nullable_integer"},
                     "authority_tip_start_hash": {"$ref": "#/$defs/nullable_string"},
@@ -163,7 +245,14 @@ pub fn schema_document() -> Value {
                     "A_fund", "C_min", "volume_target", "doubling_rounds",
                     "fanout_outputs_per_tx", "concurrent_batches", "S4_T_budget_secs",
                     "S5_M", "S5_K", "fee_rate", "scan_repetitions",
-                    "protocol_fingerprint"
+                    "mode3_batch_creator_sleep_secs",
+                    "mode3_unsigned_tx_creator_sleep_secs",
+                    "mode3_transaction_signer_sleep_secs",
+                    "mode3_broadcaster_sleep_secs",
+                    "mode3_confirmation_checker_sleep_secs",
+                    "mode3_payment_receiver_scan_interval_secs",
+                    "protocol_fingerprint", "seed_fingerprints", "build_manifest",
+                    "harness_executable_sha256", "export_harness_executable_sha256"
                 ],
                 "properties": {
                     "A_fund": {"type": "string"},
@@ -180,18 +269,43 @@ pub fn schema_document() -> Value {
                     "S5_K": {"type": "integer", "minimum": 1},
                     "fee_rate": {"type": "string"},
                     "scan_repetitions": {"type": "integer", "minimum": 1},
-                    "protocol_fingerprint": {"type": "string", "minLength": 64}
+                    "mode3_batch_creator_sleep_secs": {"type": "integer", "minimum": 1},
+                    "mode3_unsigned_tx_creator_sleep_secs": {"type": "integer", "minimum": 1},
+                    "mode3_transaction_signer_sleep_secs": {"type": "integer", "minimum": 1},
+                    "mode3_broadcaster_sleep_secs": {"type": "integer", "minimum": 1},
+                    "mode3_confirmation_checker_sleep_secs": {"type": "integer", "minimum": 1},
+                    "mode3_payment_receiver_scan_interval_secs": {"type": "integer", "minimum": 1},
+                    "protocol_fingerprint": {"type": "string", "minLength": 64},
+                    "seed_fingerprints": {"$ref": "#/$defs/seed_fingerprints"},
+                    "build_manifest": {"anyOf": [{"$ref": "#/$defs/build_manifest"}, {"type": "null"}]},
+                    "harness_executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "export_harness_executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
                 },
                 "additionalProperties": true
             },
+            "seed_fingerprints": {
+                "type": "object", "additionalProperties": false,
+                "required": ["old_wallet", "new_wallet", "payment_processor", "recipient_sink"],
+                "properties": {
+                    "old_wallet": {"type": "string", "minLength": 1},
+                    "new_wallet": {"type": "string", "minLength": 1},
+                    "payment_processor": {"type": "string", "minLength": 1},
+                    "recipient_sink": {"type": "string", "minLength": 1}
+                }
+            },
             "funding_record": {
                 "type": "object", "additionalProperties": false,
-                "required": ["amount", "tx_id", "height"],
+                "required": [
+                    "amount", "tx_id", "height", "birthday", "birthday_height",
+                    "birthday_offset_days", "birthday_start_height"
+                ],
                 "properties": {
                     "amount": {"type": "string"},
                     "tx_id": {"type": "string", "minLength": 1},
                     "height": {"type": "integer", "minimum": 0},
                     "birthday": {"$ref": "#/$defs/nullable_integer"},
+                    "birthday_height": {"$ref": "#/$defs/nullable_integer"},
+                    "birthday_offset_days": {"$ref": "#/$defs/nullable_integer"},
                     "birthday_start_height": {"$ref": "#/$defs/nullable_integer"},
                     "construction_ms": {"$ref": "#/$defs/nullable_integer"},
                     "broadcast_to_mempool_ms": {"$ref": "#/$defs/nullable_integer"},
@@ -250,7 +364,7 @@ pub fn schema_document() -> Value {
                 "required": [
                     "transaction_id", "attempt_index", "batch_index", "submit_offset_ms",
                     "construction_complete_offset_ms", "construction_ms", "submission_ms",
-                    "mempool_available", "mempool_reason", "confirmation_ms",
+                    "submission_started", "mempool_available", "mempool_reason", "confirmation_ms",
                     "confirmation_timing_reason", "fee_microtari", "terminal_outcome", "error",
                     "mined_height", "tip_start_height", "tip_end_height", "input_count",
                     "total_output_count", "payment_output_count", "change_output_count",
@@ -269,6 +383,7 @@ pub fn schema_document() -> Value {
                     "construction_timing_reason": {"$ref": "#/$defs/nullable_string"},
                     "submission_ms": {"$ref": "#/$defs/nullable_integer"},
                     "submission_timing_origin": {"$ref": "#/$defs/nullable_string"},
+                    "submission_started": {"type": ["boolean", "null"]},
                     "mempool_available": {"type": ["boolean", "null"]},
                     "mempool_reason": {"$ref": "#/$defs/nullable_string"},
                     "confirmation_ms": {"$ref": "#/$defs/nullable_integer"},
@@ -284,6 +399,7 @@ pub fn schema_document() -> Value {
                     "api_error": {"$ref": "#/$defs/nullable_string"},
                     "http_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599},
                     "failure_class": {"enum": ["http_response", "request_timeout", "arm_deadline", "transport", "response_decode", "response_shape", "database", "process", "chain_target", "wallet"]},
+                    "deadline_expired": {"type": "boolean"},
                     "terminal_outcome": {"enum": ["confirmed", "rejected", "stalled", "timed_out", "unavailable"]},
                     "error": {"$ref": "#/$defs/nullable_string"},
                     "mined_height": {"$ref": "#/$defs/nullable_integer"},
@@ -424,6 +540,114 @@ pub fn schema_document() -> Value {
     })
 }
 
+fn legacy_v6_schema_document() -> Value {
+    let mut schema = schema_document();
+    schema["properties"]["schema_version"]["const"] = json!(LEGACY_RESULT_SCHEMA_VERSION);
+
+    for (definition, fields) in [
+        (
+            "provenance",
+            &[
+                "measurement_worktree_clean",
+                "export_worktree_clean",
+                "measurement_build_worktree_clean",
+                "export_build_worktree_clean",
+            ][..],
+        ),
+        ("base_node", &["pruned_height"][..]),
+        (
+            "funding_record",
+            &[
+                "birthday",
+                "birthday_height",
+                "birthday_offset_days",
+                "birthday_start_height",
+            ][..],
+        ),
+        (
+            "config",
+            &[
+                "seed_fingerprints",
+                "mode3_batch_creator_sleep_secs",
+                "mode3_unsigned_tx_creator_sleep_secs",
+                "mode3_transaction_signer_sleep_secs",
+                "mode3_broadcaster_sleep_secs",
+                "mode3_confirmation_checker_sleep_secs",
+                "mode3_payment_receiver_scan_interval_secs",
+                "harness_executable_sha256",
+                "export_harness_executable_sha256",
+            ][..],
+        ),
+        ("transaction_observation", &["submission_started"][..]),
+    ] {
+        let required = schema["$defs"][definition]["required"]
+            .as_array_mut()
+            .expect("schema definition has a required array");
+        required.retain(|field| field.as_str().is_none_or(|field| !fields.contains(&field)));
+    }
+
+    schema["$defs"]["base_node"]["properties"]
+        .as_object_mut()
+        .expect("base_node schema properties")
+        .remove("pruned_height");
+    for field in [
+        "measurement_worktree_clean",
+        "export_worktree_clean",
+        "measurement_build_worktree_clean",
+        "export_build_worktree_clean",
+    ] {
+        schema["$defs"]["provenance"]["properties"]
+            .as_object_mut()
+            .expect("provenance schema properties")
+            .remove(field);
+    }
+    for field in ["birthday_height", "birthday_offset_days"] {
+        schema["$defs"]["funding_record"]["properties"]
+            .as_object_mut()
+            .expect("funding_record schema properties")
+            .remove(field);
+    }
+    schema["$defs"]["config"]["properties"]
+        .as_object_mut()
+        .expect("config schema properties")
+        .remove("seed_fingerprints");
+    for field in [
+        "harness_executable_sha256",
+        "export_harness_executable_sha256",
+    ] {
+        schema["$defs"]["config"]["properties"]
+            .as_object_mut()
+            .expect("config schema properties")
+            .remove(field);
+    }
+    schema["$defs"]
+        .as_object_mut()
+        .expect("schema definitions")
+        .remove("seed_fingerprints");
+    schema["$defs"]["build_manifest"] = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["schema_version", "artifacts"],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "sources": {"type": "object"},
+            "artifacts": {
+                "type": "object", "minProperties": 1,
+                "additionalProperties": {"$ref": "#/$defs/build_artifact"}
+            },
+            "payment_processor_patch_sha256": {"type": "string", "minLength": 1}
+        }
+    });
+    schema["$defs"]["build_artifact"] = json!({
+        "type": "object", "additionalProperties": true,
+        "required": ["source_revision", "sha256"],
+        "properties": {
+            "source_revision": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "minLength": 1}
+        }
+    });
+    schema
+}
+
 pub fn validate_path(path: &Path, submission: bool) -> anyhow::Result<ResultProfile> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let document: Value = serde_json::from_slice(&bytes)
@@ -436,6 +660,13 @@ pub fn validate_legacy_v5_path(path: &Path) -> anyhow::Result<()> {
     let document: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {} as JSON", path.display()))?;
     validate_legacy_v5_document(&document)
+}
+
+pub fn validate_legacy_v6_path(path: &Path) -> anyhow::Result<ResultProfile> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {} as JSON", path.display()))?;
+    validate_legacy_v6_document(&document)
 }
 
 fn validate_legacy_v5_document(document: &Value) -> anyhow::Result<()> {
@@ -485,10 +716,34 @@ fn validate_legacy_v5_document(document: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_legacy_v6_document(document: &Value) -> anyhow::Result<ResultProfile> {
+    let schema = legacy_v6_schema_document();
+    validate_schema_with(
+        document,
+        &schema,
+        &format!("legacy schema v{LEGACY_RESULT_SCHEMA_VERSION}"),
+    )?;
+    let profile: ResultProfile = serde_json::from_value(document.clone())
+        .context("deserializing legacy schema-v6 result profile")?;
+    validate_identity_for_version(&profile, LEGACY_RESULT_SCHEMA_VERSION)?;
+    validate_transactions(&profile)?;
+    validate_status_pairs(document)?;
+    if profile.computed_deltas != super::computed_deltas(&profile) {
+        bail!("computed_deltas do not match recomputed source scenario metrics");
+    }
+    if profile.profile_kind == ProfileKind::Checkpoint && profile.run_complete {
+        bail!("checkpoint profile must have run_complete=false");
+    }
+    if profile.profile_kind == ProfileKind::Final {
+        validate_final_document(&profile, document, false)?;
+    }
+    Ok(profile)
+}
+
 pub fn validate_document(document: &Value, submission: bool) -> anyhow::Result<ResultProfile> {
     validate_schema(document)?;
     let profile: ResultProfile = serde_json::from_value(document.clone())
-        .context("deserializing schema-v6 result profile")?;
+        .with_context(|| format!("deserializing schema-v{RESULT_SCHEMA_VERSION} result profile"))?;
     validate_profile(&profile, submission)?;
     if profile.profile_kind == ProfileKind::Final || submission {
         validate_final_document(&profile, document, submission)?;
@@ -518,23 +773,38 @@ pub fn validate_final(profile: &ResultProfile, submission: bool) -> anyhow::Resu
 
 fn validate_schema(document: &Value) -> anyhow::Result<()> {
     let schema = schema_document();
+    validate_schema_with(
+        document,
+        &schema,
+        &format!("schema v{RESULT_SCHEMA_VERSION}"),
+    )
+}
+
+fn validate_schema_with(document: &Value, schema: &Value, label: &str) -> anyhow::Result<()> {
     let validator = jsonschema::draft202012::options()
         .should_validate_formats(true)
-        .build(&schema)
+        .build(schema)
         .context("compiling result profile JSON Schema")?;
     let errors = validator
         .iter_errors(document)
         .map(|error| format!("{}: {error}", error.instance_path()))
         .collect::<Vec<_>>();
     if !errors.is_empty() {
-        bail!("profile does not match schema v6:\n{}", errors.join("\n"));
+        bail!("profile does not match {label}:\n{}", errors.join("\n"));
     }
     Ok(())
 }
 
 fn validate_identity(profile: &ResultProfile) -> anyhow::Result<()> {
-    if profile.schema_version != RESULT_SCHEMA_VERSION {
-        bail!("schema_version must be {RESULT_SCHEMA_VERSION}");
+    validate_identity_for_version(profile, RESULT_SCHEMA_VERSION)
+}
+
+fn validate_identity_for_version(
+    profile: &ResultProfile,
+    expected_version: u32,
+) -> anyhow::Result<()> {
+    if profile.schema_version != expected_version {
+        bail!("schema_version must be {expected_version}");
     }
     for mode in ModeName::ALL {
         let key = mode.as_str();
@@ -669,6 +939,7 @@ fn validate_reference_configuration(
     document: &Value,
 ) -> anyhow::Result<()> {
     let config = &document["config"];
+    reference_s5_per_recipient_amount(config)?;
     let exact = [
         ("A_fund", json!("10000 T")),
         ("C_min", json!(3)),
@@ -679,6 +950,30 @@ fn validate_reference_configuration(
         ("S5_M", json!(100)),
         ("S5_K", json!(10)),
         ("fee_rate", json!("5 uT")),
+        (
+            "mode3_batch_creator_sleep_secs",
+            json!(crate::config::MODE3_BATCH_CREATOR_SLEEP_SECS),
+        ),
+        (
+            "mode3_unsigned_tx_creator_sleep_secs",
+            json!(crate::config::MODE3_UNSIGNED_TX_CREATOR_SLEEP_SECS),
+        ),
+        (
+            "mode3_transaction_signer_sleep_secs",
+            json!(crate::config::MODE3_TRANSACTION_SIGNER_SLEEP_SECS),
+        ),
+        (
+            "mode3_broadcaster_sleep_secs",
+            json!(crate::config::MODE3_BROADCASTER_SLEEP_SECS),
+        ),
+        (
+            "mode3_confirmation_checker_sleep_secs",
+            json!(crate::config::MODE3_CONFIRMATION_CHECKER_SLEEP_SECS),
+        ),
+        (
+            "mode3_payment_receiver_scan_interval_secs",
+            json!(crate::config::MODE3_PAYMENT_RECEIVER_SCAN_INTERVAL_SECS),
+        ),
     ];
     for (key, expected) in exact {
         if config[key] != expected {
@@ -757,17 +1052,24 @@ fn validate_reference_configuration(
     {
         bail!("submission profile is missing one or more completed stages");
     }
-    if profile.provenance.measurement_commit == "unknown"
-        || profile.provenance.export_commit == "unknown"
-    {
-        bail!("submission profile must identify measurement and export commits");
-    }
-    if !is_complete_build_manifest(&profile.provenance.measurement_build_manifest)
-        || !is_complete_build_manifest(&profile.provenance.export_build_manifest)
-        || !is_complete_build_manifest(&profile.config["build_manifest"])
-        || !profile.config["seed_fingerprints"].is_object()
-    {
-        bail!("submission profile must record build-manifest and seed fingerprints");
+    validate_submission_harness_provenance(profile)?;
+    validate_submission_build_manifests(profile)?;
+    let seed_fingerprints = profile.config["seed_fingerprints"]
+        .as_object()
+        .context("submission profile must record seed fingerprints")?;
+    for role in [
+        "old_wallet",
+        "new_wallet",
+        "payment_processor",
+        "recipient_sink",
+    ] {
+        if seed_fingerprints
+            .get(role)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("submission profile is missing the {role} seed fingerprint");
+        }
     }
     if profile.environment.authority_network_path != "remote" {
         bail!("submission requires an independent remote Esmeralda authority endpoint");
@@ -776,6 +1078,19 @@ fn validate_reference_configuration(
         || profile.environment.mode1_base_node_service_peer.is_none()
     {
         bail!("submission requires an archival local scan endpoint and Mode 1 P2P service peer");
+    }
+    if profile
+        .environment
+        .disk_kind
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || profile
+            .environment
+            .disk_name
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        bail!("submission requires disk kind and device evidence for the candidate data namespace");
     }
     if profile.base_node.configured_revision != REFERENCE_BASE_NODE_REVISION {
         bail!(
@@ -810,10 +1125,15 @@ fn validate_reference_configuration(
             .as_deref()
             .is_none_or(str::is_empty)
     {
-        bail!("submission profile must include base-node tip height/hash start/end anchors");
+        bail!("submission requires complete selected-node and authority tip evidence");
     }
-    if profile.base_node.is_synced != Some(true) || profile.base_node.pruning_horizon.is_none() {
-        bail!("submission profile must record synchronized base-node and pruning state");
+    if profile.base_node.is_synced != Some(true)
+        || profile.base_node.pruning_horizon != Some(0)
+        || profile.base_node.pruned_height != Some(0)
+    {
+        bail!(
+            "submission profile must record is_synced=true, pruning_horizon=0, and pruned_height=0"
+        );
     }
     if profile
         .chain_verification
@@ -834,9 +1154,38 @@ fn validate_reference_configuration(
         let Some(funding) = profile.funding.get(mode.as_str()) else {
             bail!("submission funding is missing {}", mode.as_str());
         };
-        if funding.birthday.is_none() || funding.birthday_start_height.is_none() {
+        let birthday = funding.birthday.with_context(|| {
+            format!(
+                "submission funding for {} is missing birthday",
+                mode.as_str()
+            )
+        })?;
+        let birthday_height = funding.birthday_height.with_context(|| {
+            format!(
+                "submission funding for {} is missing birthday_height",
+                mode.as_str()
+            )
+        })?;
+        let birthday_start_height = funding.birthday_start_height.with_context(|| {
+            format!(
+                "submission funding for {} is missing birthday_start_height",
+                mode.as_str()
+            )
+        })?;
+        let birthday_offset_days = funding.birthday_offset_days.with_context(|| {
+            format!(
+                "submission funding for {} is missing birthday_offset_days",
+                mode.as_str()
+            )
+        })?;
+        if birthday == 0
+            || birthday_offset_days != 2
+            || birthday < birthday_offset_days
+            || birthday_start_height > birthday_height
+            || birthday_height > funding.height
+        {
             bail!(
-                "submission funding for {} is missing birthday resolution",
+                "submission funding for {} has an invalid stock-wallet birthday resolution",
                 mode.as_str()
             );
         }
@@ -922,6 +1271,20 @@ fn validate_reference_configuration(
                         mode.as_str()
                     );
                 }
+                if funding_observation["birthday"] != json!(funding.birthday)
+                    || funding_observation["H_birth"] != json!(funding.birthday_height)
+                    || funding_observation["birthday_height"] != json!(funding.birthday_height)
+                    || funding_observation["birthday_offset_days"]
+                        != json!(funding.birthday_offset_days)
+                    || funding_observation["birthday_start_height"]
+                        != json!(funding.birthday_start_height)
+                {
+                    bail!(
+                        "submission S0 repetition {} birthday observation does not match funding record for {}",
+                        repetition + 1,
+                        mode.as_str()
+                    );
+                }
             }
         }
         if profile.modes[mode.as_str()].scenarios["S1"].status == CellStatus::Ok
@@ -964,8 +1327,67 @@ fn validate_reference_configuration(
             || funding.broadcast_to_confirmed_at_c_min_ms
                 != first.broadcast_to_confirmed_at_c_min_ms
             || funding.tip_height_at_confirmation != first.tip_height_at_confirmation
+            || funding.birthday != first.birthday
+            || funding.birthday_height != first.birthday_height
+            || funding.birthday_offset_days != first.birthday_offset_days
+            || funding.birthday_start_height != first.birthday_start_height
     }) {
         bail!("submission funding records must describe one shared exact A_fund transaction");
+    }
+    Ok(())
+}
+
+fn reference_s5_per_recipient_amount(config: &Value) -> anyhow::Result<u64> {
+    let amounts = [
+        "mode1_payment_amount",
+        "mode2_payment_amount",
+        "mode3_payment_amount",
+    ]
+    .map(|key| {
+        let value = config[key]
+            .as_str()
+            .with_context(|| format!("submission config {key} must be an amount string"))?;
+        crate::config::parse_amount(value)
+            .map(|amount| amount.0)
+            .with_context(|| format!("submission config {key} is not a valid amount"))
+    });
+    let [mode1, mode2, mode3] = amounts;
+    let (mode1, mode2, mode3) = (mode1?, mode2?, mode3?);
+    if mode1 != mode2 || mode1 != mode3 {
+        bail!("submission S5 requires the same per-recipient payment amount for every wallet mode");
+    }
+    Ok(mode1)
+}
+
+fn validate_s5_observation_amounts(
+    document: &Value,
+    mode: &str,
+    metrics: &Value,
+) -> anyhow::Result<()> {
+    let per_recipient = reference_s5_per_recipient_amount(&document["config"])?;
+    let observations = metrics["transaction_observations"]
+        .as_array()
+        .with_context(|| format!("submission {mode}/S5 missing transaction observations"))?;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation["terminal_outcome"] == "confirmed")
+    {
+        let recipient_count = observation["recipients"]
+            .as_array()
+            .with_context(|| {
+                format!("submission {mode}/S5 confirmed observation lacks recipients")
+            })?
+            .len();
+        let recipient_count =
+            u64::try_from(recipient_count).context("submission S5 recipient count exceeds u64")?;
+        let expected = per_recipient
+            .checked_mul(recipient_count)
+            .context("submission S5 transaction amount overflows u64")?;
+        if observation["amount_microtari"].as_u64() != Some(expected) {
+            bail!(
+                "submission {mode}/S5 confirmed observation amount must equal the canonical per-recipient amount multiplied by its recipient count"
+            );
+        }
     }
     Ok(())
 }
@@ -1098,27 +1520,82 @@ fn validate_confirmed_observation_bindings(
     Ok(())
 }
 
-fn is_complete_build_manifest(value: &Value) -> bool {
-    value
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        .is_some_and(|version| version >= 1)
+fn validate_submission_build_manifests(profile: &ResultProfile) -> anyhow::Result<()> {
+    let configured = profile
+        .config
+        .get("build_manifest")
+        .context("submission profile must record the configured build manifest")?;
+    let values = [
+        (
+            "measurement",
+            &profile.provenance.measurement_build_manifest,
+        ),
+        ("export", &profile.provenance.export_build_manifest),
+        ("configured", configured),
+    ];
+    let manifests = values
+        .into_iter()
+        .map(|(label, value)| {
+            let manifest: crate::build_manifest::BuildManifest =
+                serde_json::from_value(value.clone()).with_context(|| {
+                    format!(
+                        "submission {label} build manifest must use the exact typed schema-v2 shape"
+                    )
+                })?;
+            crate::build_manifest::verify_portable_manifest(&manifest).with_context(|| {
+                format!(
+                    "submission {label} build manifest does not match embedded canonical provenance"
+                )
+            })?;
+            Ok(manifest)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if manifests[0] != manifests[1] || manifests[0] != manifests[2] {
+        bail!("submission measurement, export, and configured build manifests must be identical");
+    }
+    Ok(())
+}
+
+fn validate_submission_harness_provenance(profile: &ResultProfile) -> anyhow::Result<()> {
+    if !is_lowercase_git_commit(&profile.provenance.measurement_commit)
+        || !is_lowercase_git_commit(&profile.provenance.export_commit)
+    {
+        bail!(
+            "submission measurement and export commits must be lowercase 40-character hexadecimal"
+        );
+    }
+    if profile.provenance.measurement_commit != profile.provenance.export_commit {
+        bail!("submission measurement and export commits must be identical");
+    }
+    if !profile.provenance.measurement_worktree_clean || !profile.provenance.export_worktree_clean {
+        bail!("submission requires explicit clean-worktree evidence at measurement and export");
+    }
+    if !profile.provenance.measurement_build_worktree_clean
+        || !profile.provenance.export_build_worktree_clean
+    {
+        bail!("submission requires a harness executable built from a clean worktree");
+    }
+    let measurement_executable = profile
+        .config
+        .get("harness_executable_sha256")
+        .and_then(Value::as_str)
+        .context("submission is missing harness_executable_sha256")?;
+    let export_executable = profile
+        .config
+        .get("export_harness_executable_sha256")
+        .and_then(Value::as_str)
+        .context("submission is missing export_harness_executable_sha256")?;
+    if measurement_executable != export_executable {
+        bail!("submission measurement and export harness executable SHA-256 values must match");
+    }
+    Ok(())
+}
+
+fn is_lowercase_git_commit(value: &str) -> bool {
+    value.len() == 40
         && value
-            .get("artifacts")
-            .and_then(Value::as_object)
-            .is_some_and(|artifacts| {
-                !artifacts.is_empty()
-                    && artifacts.values().all(|artifact| {
-                        artifact
-                            .get("source_revision")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.is_empty())
-                            && artifact
-                                .get("sha256")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| !value.is_empty())
-                    })
-            })
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_cross_cutting_scenario_metrics(document: &Value) -> anyhow::Result<()> {
@@ -1143,6 +1620,35 @@ fn validate_cross_cutting_scenario_metrics(document: &Value) -> anyhow::Result<(
                 let Some(metrics) = run["metrics"].as_object() else {
                     bail!("submission {label} must record scenario metrics");
                 };
+                if let Some(observations) = metrics
+                    .get("transaction_observations")
+                    .and_then(Value::as_array)
+                {
+                    let counts = OutcomeCounts::from_json_observations(observations);
+                    if metrics.get("outcome_counts") != Some(&serde_json::to_value(&counts)?) {
+                        bail!("submission {label} outcome_counts do not match its observations");
+                    }
+                    let preflight_failures = validate_s1_preflight_failures(
+                        mode,
+                        scenario,
+                        &Value::Object(metrics.clone()),
+                    )?;
+                    let nonconfirmed = counts
+                        .attempted
+                        .saturating_sub(counts.confirmed)
+                        .saturating_add(u32::try_from(preflight_failures).unwrap_or(u32::MAX));
+                    if run["success_count"].as_u64() != Some(u64::from(counts.confirmed))
+                        || run["failure_count"]
+                            .as_u64()
+                            .is_none_or(|failures| failures < u64::from(nonconfirmed))
+                        || (run["outcome_status"] == "success"
+                            && (nonconfirmed != 0 || run["failure_count"] != 0))
+                    {
+                        bail!(
+                            "submission {label} success/failure aggregates do not match its observations and preflight failures"
+                        );
+                    }
+                }
                 let confirmed_fee_total = metrics
                     .get("transaction_observations")
                     .and_then(Value::as_array)
@@ -1213,12 +1719,8 @@ fn validate_cross_cutting_scenario_metrics(document: &Value) -> anyhow::Result<(
     Ok(())
 }
 
-fn reconciliation_outgoing_microtari(mode: &str, scenario: &str, confirmed_total: u64) -> u64 {
-    if scenario == "S1" && matches!(mode, "old_wallet" | "new_wallet") {
-        0
-    } else {
-        confirmed_total
-    }
+fn reconciliation_outgoing_microtari(_mode: &str, scenario: &str, confirmed_total: u64) -> u64 {
+    if scenario == "S1" { 0 } else { confirmed_total }
 }
 
 fn validate_balance_reconciliation(
@@ -1285,16 +1787,394 @@ fn validate_balance_reconciliation(
     Ok(())
 }
 
+fn validate_s4_deadline_accounting(
+    document: &Value,
+    mode: &str,
+    repetition: &Value,
+    metrics: &Value,
+    arms: &[Value],
+    batch_summaries: &[Value],
+) -> anyhow::Result<()> {
+    let budget_ms = document["config"]["S4_T_budget_secs"]
+        .as_u64()
+        .context("submission config lacks S4_T_budget_secs")?
+        .checked_mul(1_000)
+        .context("submission S4 budget overflows milliseconds")?;
+    let mut measured_total = 0u64;
+    for ((arm, summary), configured_batch) in
+        arms.iter().zip(batch_summaries).zip(REFERENCE_S4_RAMP)
+    {
+        let wall_ms = arm["wall_ms"]
+            .as_u64()
+            .with_context(|| format!("submission {mode}/S4 arm lacks wall_ms"))?;
+        if wall_ms > budget_ms || summary["wall_ms"].as_u64() != Some(wall_ms) {
+            bail!(
+                "submission {mode}/S4 arm {configured_batch} exceeds its budget or disagrees with its batch summary"
+            );
+        }
+        measured_total = measured_total
+            .checked_add(wall_ms)
+            .context("submission S4 measured wall total overflowed")?;
+    }
+    if repetition["wall_ms"].as_u64() != Some(measured_total) {
+        bail!("submission {mode}/S4 repetition wall does not equal the five measured arms");
+    }
+
+    if mode == "new_wallet" {
+        let quiescence = metrics["s4_deadline_quiescence"]
+            .as_array()
+            .context("submission new_wallet/S4 lacks deadline quiescence evidence")?;
+        if quiescence.len() != REFERENCE_S4_RAMP.len() {
+            bail!("submission new_wallet/S4 lacks one quiescence row per arm");
+        }
+        let mut actual_total = 0u64;
+        let mut cleanup_total = 0u64;
+        for ((row, arm), configured_batch) in quiescence.iter().zip(arms).zip(REFERENCE_S4_RAMP) {
+            let arm_wall_ms = arm["wall_ms"].as_u64().expect("checked above");
+            let actual_arm_wall_ms = row["actual_arm_wall_ms"]
+                .as_u64()
+                .context("submission new_wallet/S4 lacks actual arm wall")?;
+            let cleanup_overrun_ms = row["cleanup_overrun_ms"]
+                .as_u64()
+                .context("submission new_wallet/S4 lacks cleanup overrun")?;
+            if row["configured_batch"] != configured_batch
+                || row["arm_wall_ms"].as_u64() != Some(arm_wall_ms)
+                || arm_wall_ms.checked_add(cleanup_overrun_ms) != Some(actual_arm_wall_ms)
+                || row["cleanup_excluded_from_measured_wall"] != true
+                || row["tasks_quiesced_before_return"] != true
+                || row["worker_reaped"] != true
+                || row["unstructured_tasks_after_quiescence"] != 0
+                || row["pending_tasks_at_deadline"]
+                    .as_u64()
+                    .is_none_or(|pending| pending > configured_batch)
+                || row["post_deadline_drained_tasks"] != 0
+                || row["post_deadline_drain_ms"]
+                    .as_u64()
+                    .is_none_or(|drain| drain > cleanup_overrun_ms)
+                || row["quiesced_offset_ms"]
+                    .as_u64()
+                    .is_none_or(|offset| offset > actual_arm_wall_ms)
+            {
+                bail!(
+                    "submission new_wallet/S4 arm {configured_batch} has inconsistent deadline or worker-quiescence accounting"
+                );
+            }
+            actual_total = actual_total
+                .checked_add(actual_arm_wall_ms)
+                .context("submission new_wallet/S4 actual wall total overflowed")?;
+            cleanup_total = cleanup_total
+                .checked_add(cleanup_overrun_ms)
+                .context("submission new_wallet/S4 cleanup total overflowed")?;
+        }
+        let end_to_end = metrics["s4_end_to_end_wall_ms"]
+            .as_u64()
+            .context("submission new_wallet/S4 lacks end-to-end wall")?;
+        if metrics["s4_measured_wall_ms"].as_u64() != Some(measured_total)
+            || metrics["s4_actual_scenario_wall_ms"].as_u64() != Some(actual_total)
+            || metrics["s4_cleanup_overrun_ms"].as_u64() != Some(cleanup_total)
+            || end_to_end < actual_total
+            || metrics["s4_unattributed_orchestration_wall_ms"].as_u64()
+                != Some(end_to_end - actual_total)
+        {
+            bail!("submission new_wallet/S4 aggregate deadline accounting is inconsistent");
+        }
+    } else {
+        let measurements = metrics["s4_deadline_measurements"]
+            .as_array()
+            .with_context(|| format!("submission {mode}/S4 lacks deadline measurements"))?;
+        let cleanups = metrics["s4_post_deadline_cleanups"]
+            .as_array()
+            .with_context(|| format!("submission {mode}/S4 lacks cleanup measurements"))?;
+        if measurements.len() != REFERENCE_S4_RAMP.len()
+            || cleanups.len() != REFERENCE_S4_RAMP.len()
+        {
+            bail!("submission {mode}/S4 lacks one deadline and cleanup row per arm");
+        }
+        let mut actual_return_total = 0u64;
+        for (((measurement, cleanup), arm), configured_batch) in measurements
+            .iter()
+            .zip(cleanups)
+            .zip(arms)
+            .zip(REFERENCE_S4_RAMP)
+        {
+            let arm_wall_ms = arm["wall_ms"].as_u64().expect("checked above");
+            let pending = measurement["pending_tasks_at_deadline"]
+                .as_u64()
+                .context("submission S4 deadline measurement lacks pending task count")?;
+            let drained = cleanup["drained_tasks"]
+                .as_u64()
+                .context("submission S4 cleanup lacks drained task count")?;
+            let forced = cleanup["forced_shutdown_tasks"]
+                .as_u64()
+                .context("submission S4 cleanup lacks forced task count")?;
+            let abort_requested = cleanup["abort_requested_tasks"]
+                .as_u64()
+                .context("submission S4 cleanup lacks abort-request count")?;
+            let completed_discarded = cleanup["completed_after_deadline_discarded_tasks"]
+                .as_u64()
+                .context("submission S4 cleanup lacks discarded-completion count")?;
+            let unmatched = cleanup["unmatched_pending_attempts_after_drain"]
+                .as_array()
+                .context("submission S4 cleanup lacks unmatched attempt evidence")?;
+            let actual_return = cleanup["actual_return_offset_ms"]
+                .as_u64()
+                .context("submission S4 cleanup lacks actual return offset")?;
+            if measurement["configured_batch"] != configured_batch
+                || measurement["deadline_offset_ms"].as_u64() != Some(budget_ms)
+                || measurement["measured_wall_ms"].as_u64() != Some(arm_wall_ms)
+                || pending > configured_batch
+                || cleanup["configured_batch"] != configured_batch
+                || cleanup["tasks_quiesced"] != true
+                || cleanup["cleanup_grace_ms"] != 0
+                || cleanup["cleanup_deadline_exhausted"] != false
+                || cleanup["late_results_accepted"] != false
+                || cleanup["post_deadline_join_errors"].as_array().is_none()
+                || abort_requested != pending
+                || drained.checked_add(forced) != Some(abort_requested)
+                || completed_discarded > drained
+                || unmatched.len() as u64 != pending
+                || unmatched.iter().any(|attempt| {
+                    attempt["terminal_outcome"] != "timed_out"
+                        || attempt["submission_state"] != "ambiguous"
+                })
+                || actual_return < arm_wall_ms
+            {
+                bail!(
+                    "submission {mode}/S4 arm {configured_batch} has inconsistent deadline or cleanup accounting"
+                );
+            }
+            actual_return_total = actual_return_total
+                .checked_add(actual_return)
+                .context("submission S4 actual return total overflowed")?;
+        }
+        if metrics["s4_actual_return_wall_ms"]
+            .as_u64()
+            .is_none_or(|wall| wall < actual_return_total)
+        {
+            bail!("submission {mode}/S4 aggregate return wall is inconsistent");
+        }
+    }
+    Ok(())
+}
+
+fn validate_s1_round_bindings(mode: &str, metrics: &Value) -> anyhow::Result<()> {
+    let observations = metrics["transaction_observations"]
+        .as_array()
+        .with_context(|| format!("submission {mode}/S1 lacks transaction observations"))?;
+    let batch_summaries = metrics["batch_summaries"]
+        .as_array()
+        .with_context(|| format!("submission {mode}/S1 lacks batch summaries"))?;
+    if batch_summaries.len() != REFERENCE_S1_ROUNDS.len() {
+        bail!("submission {mode}/S1 must contain one batch summary for every exact round");
+    }
+
+    for ((round_index, tx_count, outputs_per_tx, target_utxos_after), summary) in
+        REFERENCE_S1_ROUNDS.into_iter().zip(batch_summaries)
+    {
+        let round_observations = observations
+            .iter()
+            .filter(|observation| observation["configured_batch"].as_u64() == Some(round_index))
+            .collect::<Vec<_>>();
+        if round_observations.len() as u64 != tx_count {
+            bail!(
+                "submission {mode}/S1 round {round_index} does not bind exactly {tx_count} observations"
+            );
+        }
+        if round_observations.iter().any(|observation| {
+            observation["terminal_outcome"] != "confirmed"
+                || observation["input_count"] != 1
+                || observation["payment_output_count"] != outputs_per_tx - 1
+                || observation["change_output_count"] != 1
+                || observation["total_output_count"] != outputs_per_tx
+        }) {
+            bail!(
+                "submission {mode}/S1 round {round_index} does not prove the exact one-input split shape"
+            );
+        }
+        let confirmed_fee = round_observations
+            .iter()
+            .map(|observation| {
+                observation["fee_microtari"].as_u64().with_context(|| {
+                    format!(
+                        "submission {mode}/S1 round {round_index} confirmed observation lacks fee"
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .try_fold(0u64, |total, fee| total.checked_add(fee))
+            .context("submission S1 round fee total overflows u64")?;
+
+        let key = format!("round_{round_index}");
+        let mut round_metrics = Vec::new();
+        if let Some(value) = metrics.get(&key).filter(|value| !value.is_null()) {
+            round_metrics.push(value);
+        }
+        if let Some(value) = metrics["extra"].get(&key).filter(|value| !value.is_null()) {
+            round_metrics.push(value);
+        }
+        for rounds in [
+            metrics["rounds"].as_array(),
+            metrics["extra"]["rounds"].as_array(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(value) = rounds
+                .iter()
+                .find(|round| round["round_index"] == round_index)
+            {
+                round_metrics.push(value);
+            }
+        }
+        if round_metrics.is_empty() {
+            bail!("submission {mode}/S1 lacks measured metrics for round {round_index}");
+        }
+        let attempted = summary
+            .get("attempted")
+            .or_else(|| summary.get("attempted_batches"))
+            .and_then(Value::as_u64);
+        if summary["configured_batch"] != round_index
+            || attempted != Some(tx_count)
+            || summary
+                .get("fee_microtari")
+                .is_some_and(|fee| fee.as_u64() != Some(confirmed_fee))
+        {
+            bail!(
+                "submission {mode}/S1 round {round_index} batch or fee accounting is inconsistent"
+            );
+        }
+        let summary_wall = summary["wall_ms"]
+            .as_u64()
+            .with_context(|| format!("submission {mode}/S1 round {round_index} lacks wall time"))?;
+        let mut found_fee = false;
+        for measured in round_metrics {
+            if measured
+                .get("round_index")
+                .is_some_and(|value| value.as_u64() != Some(round_index))
+                || measured
+                    .get("tx_count")
+                    .is_some_and(|value| value.as_u64() != Some(tx_count))
+                || measured
+                    .get("outputs_per_tx")
+                    .is_some_and(|value| value.as_u64() != Some(outputs_per_tx))
+                || measured
+                    .get("target_utxos_after")
+                    .is_some_and(|value| value.as_u64() != Some(target_utxos_after))
+                || measured
+                    .get("failure_count")
+                    .is_some_and(|value| value.as_u64() != Some(0))
+                || measured
+                    .get("wall_ms")
+                    .is_some_and(|value| value.as_u64() != Some(summary_wall))
+            {
+                bail!(
+                    "submission {mode}/S1 round {round_index} contains contradictory round metrics"
+                );
+            }
+            if let Some(fee) = measured
+                .get("total_fee_microtari")
+                .or_else(|| measured.get("observed_fee_microtari"))
+            {
+                found_fee = true;
+                if fee.as_u64() != Some(confirmed_fee) {
+                    bail!(
+                        "submission {mode}/S1 round {round_index} measured fee disagrees with confirmed observations"
+                    );
+                }
+            }
+        }
+        if !found_fee {
+            bail!("submission {mode}/S1 round {round_index} lacks a measured fee total");
+        }
+    }
+    Ok(())
+}
+
+fn validate_paired_scan_targets(
+    mode: &str,
+    scenarios: &serde_json::Map<String, Value>,
+    genesis_scenario: &str,
+    birthday_scenario: &str,
+    expected_checkpoint_prefix: &str,
+) -> anyhow::Result<()> {
+    let genesis = &scenarios[genesis_scenario];
+    let birthday = &scenarios[birthday_scenario];
+    if genesis["execution_status"] != birthday["execution_status"] {
+        bail!(
+            "submission {mode}/{genesis_scenario} and {birthday_scenario} must share one execution state"
+        );
+    }
+    if genesis["execution_status"] != "completed" {
+        return Ok(());
+    }
+    let genesis_runs = genesis["repetitions"].as_array().expect("schema checked");
+    let birthday_runs = birthday["repetitions"].as_array().expect("schema checked");
+    if genesis_runs.is_empty() || genesis_runs.len() != birthday_runs.len() {
+        bail!(
+            "submission {mode}/{genesis_scenario} and {birthday_scenario} must contain the same non-zero repetition count"
+        );
+    }
+    let reference = &genesis_runs[0]["metrics"];
+    let target_height = reference["H_tip_end"].as_u64().with_context(|| {
+        format!("submission {mode}/{genesis_scenario} lacks its shared target height")
+    })?;
+    let target_hash = reference["H_tip_target_hash"].as_str().with_context(|| {
+        format!("submission {mode}/{genesis_scenario} lacks its shared target hash")
+    })?;
+    let checkpoint = reference["scan_checkpoint"].as_str().with_context(|| {
+        format!("submission {mode}/{genesis_scenario} lacks its scan checkpoint")
+    })?;
+    if !checkpoint.starts_with(expected_checkpoint_prefix) {
+        bail!("submission {mode}/{genesis_scenario} has a checkpoint outside the expected pair");
+    }
+    for (scenario, runs) in [
+        (genesis_scenario, genesis_runs),
+        (birthday_scenario, birthday_runs),
+    ] {
+        for (index, run) in runs.iter().enumerate() {
+            let metrics = &run["metrics"];
+            if metrics["H_tip_end"].as_u64() != Some(target_height)
+                || metrics["H_tip_target_hash"].as_str() != Some(target_hash)
+                || metrics["scan_checkpoint"].as_str() != Some(checkpoint)
+            {
+                bail!(
+                    "submission {mode}/{scenario} repetition {} is not bound to the pair's immutable target and checkpoint",
+                    index + 1
+                );
+            }
+            for field in [
+                "expected_outputs",
+                "expected_available_microtari",
+                "expected_history_transactions",
+                "expected_history_tx_ids",
+                "expected_output_commitments",
+            ] {
+                if metrics[field] != reference[field] {
+                    bail!(
+                        "submission {mode}/{genesis_scenario} and {birthday_scenario} differ in {field}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_target_binding_valid(mode: &str, metrics: &Value) -> bool {
+    let exact_target = metrics["max_height"] == metrics["H_tip_end"]
+        && metrics["H_scan_cursor_hash"] == metrics["H_tip_target_hash"];
+    let anchored_mode1_overshoot = mode == "old_wallet"
+        && metrics["scan_target_overshoot_allowed"] == true
+        && metrics["max_height"]
+            .as_u64()
+            .zip(metrics["H_tip_end"].as_u64())
+            .is_some_and(|(cursor, target)| cursor >= target)
+        && metrics["H_scan_target_cursor_hash"] == metrics["H_tip_target_hash"];
+    exact_target || anchored_mode1_overshoot
+}
+
 fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
-    let expected_rounds = [
-        (1, 1, 2, 2),
-        (2, 2, 2, 4),
-        (3, 4, 2, 8),
-        (4, 8, 2, 16),
-        (5, 16, 2, 32),
-        (6, 32, 2, 64),
-        (7, 64, 8, 512),
-    ];
     let mut recipient_set: Option<Vec<Value>> = None;
     let mut b0_target: Option<(u64, &str)> = None;
     for (mode, scenarios) in mode_scenarios(document)? {
@@ -1394,7 +2274,7 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
 
         let s1_metrics = &scenarios["S1"]["repetitions"][0]["metrics"];
         if scenarios["S1"]["outcome_status"] == "success" {
-            for (round_index, tx_count, outputs_per_tx, target) in expected_rounds {
+            for (round_index, tx_count, outputs_per_tx, target) in REFERENCE_S1_ROUNDS {
                 let key = format!("round_{round_index}");
                 let direct = s1_metrics.get(&key).filter(|value| !value.is_null());
                 let nested = s1_metrics["extra"]
@@ -1457,12 +2337,14 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                     "submission {mode}/S1 does not prove 63 one-to-two and 64 one-to-eight transactions"
                 );
             }
+            validate_s1_round_bindings(mode, s1_metrics)?;
         } else {
             validate_transaction_observations(mode, "S1", s1_metrics)?;
         }
 
         if scenarios["S4"]["execution_status"] == "completed" {
-            let s4 = &scenarios["S4"]["repetitions"][0]["metrics"];
+            let s4_repetition = &scenarios["S4"]["repetitions"][0];
+            let s4 = &s4_repetition["metrics"];
             let batch_summaries = s4["batch_summaries"].as_array();
             let arms = s4["s4_arms"].as_array();
             if batch_summaries.is_none()
@@ -1544,25 +2426,58 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                 {
                     bail!("submission {mode}/S4 arm {configured_batch} has inconsistent rates");
                 }
-                if mode == "new_wallet"
-                    && accepted >= 2
-                    && arm["max_serialization_gap_ms"].as_u64().is_none()
-                {
-                    bail!(
-                        "submission new_wallet/S4 arm {configured_batch} lacks serialization evidence"
-                    );
-                }
-                if mode != "new_wallet"
-                    && arm["serialization_timing_reason"]
+                let mut genuine_offsets = observations
+                    .iter()
+                    .filter(|observation| {
+                        observation["configured_batch"].as_u64() == Some(configured_batch)
+                            && observation["construction_timing_origin"]
+                                .as_str()
+                                .is_some_and(|origin| match mode {
+                                    "new_wallet" => origin.starts_with("library_build_and_sign"),
+                                    "payment_processor" => {
+                                        origin
+                                            == "payment_processor_db_unsigned_tx_first_observation"
+                                    }
+                                    _ => false,
+                                })
+                    })
+                    .filter_map(|observation| {
+                        observation["construction_complete_offset_ms"].as_u64()
+                    })
+                    .collect::<Vec<_>>();
+                genuine_offsets.sort_unstable();
+                let expected_gap = (genuine_offsets.len() >= 2).then(|| {
+                    genuine_offsets
+                        .windows(2)
+                        .map(|pair| pair[1].saturating_sub(pair[0]))
+                        .max()
+                        .unwrap_or_default()
+                });
+                if let Some(expected_gap) = expected_gap {
+                    if arm["max_serialization_gap_ms"].as_u64() != Some(expected_gap) {
+                        bail!(
+                            "submission {mode}/S4 arm {configured_batch} has invalid serialization evidence"
+                        );
+                    }
+                } else if !arm["max_serialization_gap_ms"].is_null()
+                    || arm["serialization_timing_reason"]
                         .as_str()
                         .unwrap_or_default()
                         .is_empty()
                 {
                     bail!(
-                        "submission {mode}/S4 arm {configured_batch} lacks unavailable timing reason"
+                        "submission {mode}/S4 arm {configured_batch} lacks an honest unavailable timing reason"
                     );
                 }
             }
+            validate_s4_deadline_accounting(
+                document,
+                mode,
+                s4_repetition,
+                s4,
+                arms,
+                batch_summaries,
+            )?;
         }
 
         if scenarios["S5"]["execution_status"] == "completed" {
@@ -1599,6 +2514,7 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                 bail!("submission {mode}/S5 missing disclosed post-S4 starting state");
             }
             validate_transaction_observations(mode, "S5", s5)?;
+            validate_s5_observation_amounts(document, mode, s5)?;
             for (repetition, run) in scenarios["S5"]["repetitions"]
                 .as_array()
                 .expect("schema checked")
@@ -1704,11 +2620,16 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                     if metrics["H_tip_end"].as_u64().is_none()
                         || metrics["H_tip_target_hash"].as_str().is_none()
                         || metrics["max_height"].as_u64().is_none()
+                        || metrics["scan_invocations"].as_u64().is_none()
+                        || metrics["scan_timed_out"].as_bool().is_none()
                         || metrics["peak_rss_bytes"].as_u64().is_none()
                         || metrics["peak_cpu_percent"].as_f64().is_none()
+                        || (metrics["scan_timed_out"] == true
+                            && (metrics["scan_timeout_ms"].as_u64().is_none()
+                                || metrics["scan_error"].as_str().is_none()))
                     {
                         bail!(
-                            "submission {mode}/{scenario} failed scan is missing target, final progress, or resource evidence"
+                            "submission {mode}/{scenario} failed scan is missing target, final progress, invocation, timeout, or resource evidence"
                         );
                     }
                     continue;
@@ -1719,12 +2640,11 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                     } else {
                         profile_funding_birthday(document, mode)?
                     })
-                    || metrics["max_height"] != metrics["H_tip_end"]
+                    || !scan_target_binding_valid(mode, metrics)
                     || metrics["tip_lag_tolerance_blocks"] != 0
                     || metrics["history_matches_expected"] != true
                     || metrics["history_identities_match_expected"] != true
                     || metrics["H_tip_target_hash"].as_str().is_none()
-                    || metrics["H_scan_cursor_hash"] != metrics["H_tip_target_hash"]
                     || metrics["scan_invocations"].as_u64().is_none()
                     || metrics["H_tip_completion"].as_u64().is_none()
                     || metrics["H_tip_completion_hash"].as_str().is_none()
@@ -1736,6 +2656,39 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                     || metrics["resource_sampling_process"].as_str().is_none()
                 {
                     bail!("submission {mode}/{scenario} scan contract failed");
+                }
+                let (birthday_height, birthday_start_height, birthday_offset_days) =
+                    if matches!(scenario, "S2" | "S6") {
+                        (0, 0, 0)
+                    } else {
+                        (
+                            document["funding"][mode]["birthday_height"]
+                                .as_u64()
+                                .context("current funding birthday_height missing")?,
+                            document["funding"][mode]["birthday_start_height"]
+                                .as_u64()
+                                .context("current funding birthday_start_height missing")?,
+                            document["funding"][mode]["birthday_offset_days"]
+                                .as_u64()
+                                .context("current funding birthday_offset_days missing")?,
+                        )
+                    };
+                let max_height = metrics["max_height"]
+                    .as_u64()
+                    .context("successful scan max_height missing")?;
+                if metrics["H_birth"] != birthday_height
+                    || metrics["birthday_height"] != birthday_height
+                    || metrics["birthday_start_height"] != birthday_start_height
+                    || metrics["birthday_offset_days"] != birthday_offset_days
+                    || metrics["blocks_scanned"] != max_height.saturating_sub(birthday_height)
+                    || metrics["effective_blocks_scanned"]
+                        != max_height.saturating_sub(birthday_start_height)
+                    || metrics["blocks_per_sec"].as_f64().is_none()
+                    || metrics["effective_blocks_per_sec"].as_f64().is_none()
+                {
+                    bail!(
+                        "submission {mode}/{scenario} birthday scan accounting does not match H_tip_end and the stock offset"
+                    );
                 }
                 if (mode == "old_wallet"
                     && metrics["expected_history_tx_ids"]
@@ -1751,6 +2704,8 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                 validate_scan_history_evidence(document, mode, scenario, metrics)?;
             }
         }
+        validate_paired_scan_targets(mode, scenarios, "S2", "S3", "post_s1")?;
+        validate_paired_scan_targets(mode, scenarios, "S6", "S7", "post_s5")?;
     }
     Ok(())
 }
@@ -1874,6 +2829,219 @@ fn profile_funding_birthday(document: &Value, mode: &str) -> anyhow::Result<u64>
         .with_context(|| format!("funding birthday missing for {mode}"))
 }
 
+fn validate_s1_preflight_failures(
+    mode: &str,
+    scenario: &str,
+    metrics: &Value,
+) -> anyhow::Result<usize> {
+    let Some(value) = metrics
+        .get("preflight_failures")
+        .or_else(|| metrics["extra"].get("preflight_failures"))
+    else {
+        return Ok(0);
+    };
+    if scenario != "S1" {
+        bail!("submission {mode}/{scenario} contains an S1-only preflight failure");
+    }
+    let failures = value
+        .as_array()
+        .with_context(|| format!("submission {mode}/S1 preflight_failures must be an array"))?;
+    if failures.len() != 1 {
+        bail!("submission {mode}/S1 must stop after its first preflight failure");
+    }
+    let failure = &failures[0];
+    let round = failure["round_index"]
+        .as_u64()
+        .filter(|round| (1..=7).contains(round))
+        .with_context(|| format!("submission {mode}/S1 preflight failure has an invalid round"))?;
+    if failure["attempted_index"]
+        .as_u64()
+        .is_some_and(|attempt| attempt == 0)
+        || failure["submission_started"] != false
+        || !matches!(
+            failure["stage"].as_str(),
+            Some(
+                "read_spendable_inputs"
+                    | "validate_spendable_input_count"
+                    | "select_spendable_input_floor"
+                    | "plan_transaction"
+            )
+        )
+        || failure["error"].as_str().is_none_or(str::is_empty)
+    {
+        bail!("submission {mode}/S1 round {round} has malformed preflight failure evidence");
+    }
+    Ok(failures.len())
+}
+
+fn validate_s1_constructed_output_shapes(
+    mode: &str,
+    scenario: &str,
+    metrics: &Value,
+    observations: &[Value],
+) -> anyhow::Result<()> {
+    if scenario != "S1" || !matches!(mode, "old_wallet" | "new_wallet") {
+        return Ok(());
+    }
+    let transaction_ids = observations
+        .iter()
+        .filter_map(|observation| observation["transaction_id"].as_str())
+        .filter(|tx_id| !tx_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    if transaction_ids.is_empty() {
+        if metrics["constructed_output_shapes_by_tx_id"]
+            .as_object()
+            .is_some_and(|shapes| !shapes.is_empty())
+        {
+            bail!(
+                "submission {mode}/{scenario} contains constructed output shape evidence without a matching transaction observation"
+            );
+        }
+        return Ok(());
+    }
+    let constructed_shapes = metrics["constructed_output_shapes_by_tx_id"]
+        .as_object()
+        .with_context(|| {
+            format!("submission {mode}/{scenario} lacks constructed output shapes by transaction")
+        })?;
+    for tx_id in &transaction_ids {
+        let constructed = constructed_shapes.get(*tx_id).with_context(|| {
+            format!("submission {mode}/{scenario} lacks constructed output shape for {tx_id}")
+        })?;
+        let payment = constructed["payment_output_count"]
+            .as_u64()
+            .with_context(|| {
+                format!(
+                    "submission {mode}/{scenario} constructed output shape for {tx_id} lacks payment count"
+                )
+            })?;
+        let change = constructed["change_output_count"]
+            .as_u64()
+            .with_context(|| {
+                format!(
+                    "submission {mode}/{scenario} constructed output shape for {tx_id} lacks change count"
+                )
+            })?;
+        let total = constructed["total_output_count"]
+            .as_u64()
+            .with_context(|| {
+                format!(
+                    "submission {mode}/{scenario} constructed output shape for {tx_id} lacks total count"
+                )
+            })?;
+        if change != 1 || payment.checked_add(change) != Some(total) {
+            bail!(
+                "submission {mode}/{scenario} constructed output shape for {tx_id} is not N-1 payments plus one change"
+            );
+        }
+        for observation in observations
+            .iter()
+            .filter(|observation| observation["transaction_id"].as_str() == Some(*tx_id))
+        {
+            let observed_payment = observation["payment_output_count"].as_u64();
+            let observed_change = observation["change_output_count"].as_u64();
+            let observed_total = observation["total_output_count"].as_u64();
+            let has_observed_shape =
+                observed_payment.is_some() || observed_change.is_some() || observed_total.is_some();
+            if (observation["terminal_outcome"] == "confirmed" || has_observed_shape)
+                && (observed_payment, observed_change, observed_total)
+                    != (Some(payment), Some(change), Some(total))
+            {
+                bail!(
+                    "submission {mode}/{scenario} observation shape for {tx_id} does not match its constructed output roles"
+                );
+            }
+        }
+    }
+    if constructed_shapes
+        .keys()
+        .any(|tx_id| !transaction_ids.contains(tx_id.as_str()))
+    {
+        bail!(
+            "submission {mode}/{scenario} contains constructed output shape evidence without a matching transaction observation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_s1_constructed_amounts(
+    mode: &str,
+    scenario: &str,
+    metrics: &Value,
+    observations: &[Value],
+) -> anyhow::Result<()> {
+    if scenario != "S1" || mode != "new_wallet" {
+        return Ok(());
+    }
+    let transaction_ids = observations
+        .iter()
+        .filter_map(|observation| observation["transaction_id"].as_str())
+        .filter(|tx_id| !tx_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    if transaction_ids.is_empty() {
+        if metrics["constructed_amounts_microtari_by_tx_id"]
+            .as_object()
+            .is_some_and(|amounts| !amounts.is_empty())
+        {
+            bail!(
+                "submission new_wallet/S1 contains constructed amount evidence without a matching transaction observation"
+            );
+        }
+        return Ok(());
+    }
+    let constructed_amounts = metrics["constructed_amounts_microtari_by_tx_id"]
+        .as_object()
+        .context("submission new_wallet/S1 lacks constructed amounts by transaction")?;
+    for tx_id in &transaction_ids {
+        let amount = constructed_amounts
+            .get(*tx_id)
+            .and_then(Value::as_u64)
+            .filter(|amount| *amount > 0)
+            .with_context(|| {
+                format!("submission new_wallet/S1 lacks a positive constructed amount for {tx_id}")
+            })?;
+        for observation in observations
+            .iter()
+            .filter(|observation| observation["transaction_id"].as_str() == Some(*tx_id))
+        {
+            if observation["amount_microtari"].as_u64() != Some(amount) {
+                bail!(
+                    "submission new_wallet/S1 observation amount for {tx_id} does not match its constructed amount"
+                );
+            }
+        }
+    }
+    if constructed_amounts
+        .keys()
+        .any(|tx_id| !transaction_ids.contains(tx_id.as_str()))
+    {
+        bail!(
+            "submission new_wallet/S1 contains constructed amount evidence without a matching transaction observation"
+        );
+    }
+    if let Some(verified) = metrics["observed_transactions"].as_array() {
+        for transaction in verified {
+            let tx_id = transaction["tx_id"]
+                .as_str()
+                .context("submission new_wallet/S1 observed transaction lacks tx_id")?;
+            let amount = constructed_amounts
+                .get(tx_id)
+                .and_then(Value::as_u64)
+                .with_context(|| {
+                    format!(
+                        "submission new_wallet/S1 observed transaction {tx_id} lacks constructed amount evidence"
+                    )
+                })?;
+            if transaction["amount_microtari"].as_u64() != Some(amount) {
+                bail!(
+                    "submission new_wallet/S1 observed transaction amount for {tx_id} does not match its constructed amount"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_transaction_observations(
     mode: &str,
     scenario: &str,
@@ -1884,9 +3052,17 @@ fn validate_transaction_observations(
         .with_context(|| {
             format!("submission {mode}/{scenario} missing transaction observations")
         })?;
+    let preflight_failures = validate_s1_preflight_failures(mode, scenario, metrics)?;
     if observations.is_empty() {
-        bail!("submission {mode}/{scenario} has no transaction observations");
+        if preflight_failures == 0 {
+            bail!("submission {mode}/{scenario} has no transaction observations");
+        }
+        validate_s1_constructed_output_shapes(mode, scenario, metrics, observations)?;
+        validate_s1_constructed_amounts(mode, scenario, metrics, observations)?;
+        return Ok(());
     }
+    validate_s1_constructed_output_shapes(mode, scenario, metrics, observations)?;
+    validate_s1_constructed_amounts(mode, scenario, metrics, observations)?;
     if mode == "payment_processor" {
         let confirmed = observations
             .iter()
@@ -1923,6 +3099,7 @@ fn validate_transaction_observations(
             bail!("submission {mode}/{scenario} has an unknown terminal outcome");
         }
         let api_accepted = observation["api_accepted"].as_bool();
+        let submission_started = observation["submission_started"].as_bool();
         let has_identity = if mode == "payment_processor" {
             observation["batch_id"]
                 .as_str()
@@ -1932,6 +3109,118 @@ fn validate_transaction_observations(
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
         };
+        let has_attempt_identity = observation["attempt_index"].as_u64().is_some()
+            || observation["batch_index"].as_u64().is_some();
+        let has_recipients = observation["recipients"]
+            .as_array()
+            .is_some_and(|recipients| {
+                !recipients.is_empty()
+                    && recipients
+                        .iter()
+                        .all(|recipient| recipient.as_str().is_some_and(|value| !value.is_empty()))
+            });
+        let has_error = observation["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty());
+        let has_reason = |field: &str| {
+            observation[field]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        };
+        let has_explicit_timing_availability = (observation["construction_ms"].as_u64().is_some()
+            || has_reason("construction_timing_reason"))
+            && (observation["confirmation_ms"].as_u64().is_some()
+                || has_reason("confirmation_timing_reason"))
+            && (observation["mempool_available"].as_bool().is_some()
+                || has_reason("mempool_reason"));
+        let honest_arm_deadline = scenario == "S4"
+            && outcome == "timed_out"
+            && api_accepted.is_none()
+            && observation["failure_class"] == "arm_deadline"
+            && observation["deadline_expired"] == true
+            && observation["submit_offset_ms"].as_u64().is_some()
+            && has_attempt_identity
+            && has_recipients
+            && has_error
+            && has_explicit_timing_availability;
+        let honest_started_ambiguous_submission = matches!(outcome, "stalled" | "timed_out")
+            && api_accepted.is_none()
+            && submission_started == Some(true)
+            && has_identity
+            && observation["submission_ms"].as_u64().is_some()
+            && observation["submission_timing_origin"]
+                .as_str()
+                .is_some_and(|origin| origin.ends_with("_ambiguous"))
+            && matches!(
+                observation["failure_class"].as_str(),
+                Some("request_timeout" | "transport" | "response_decode" | "response_shape")
+            )
+            && has_error;
+        let honest_new_wallet_pre_submission_failure = mode == "new_wallet"
+            && outcome == "stalled"
+            && api_accepted.is_none()
+            && !has_identity
+            && observation["submission_started"] == false
+            && observation["deadline_expired"] == false
+            && matches!(
+                observation["failure_class"].as_str(),
+                Some("wallet" | "database" | "process")
+            )
+            && observation["submit_offset_ms"].as_u64().is_some()
+            && has_attempt_identity
+            && has_recipients
+            && has_error
+            && has_explicit_timing_availability;
+        let honest_payment_processor_pre_acceptance_failure = mode == "payment_processor"
+            && outcome == "stalled"
+            && api_accepted.is_none()
+            && !has_identity
+            && observation["deadline_expired"] == false
+            && observation["submit_offset_ms"].as_u64().is_some()
+            && has_attempt_identity
+            && has_recipients
+            && has_error
+            && has_explicit_timing_availability
+            && matches!(
+                (
+                    submission_started,
+                    observation["failure_class"].as_str(),
+                    observation["submission_timing_origin"].as_str(),
+                    observation["submission_ms"].as_u64(),
+                ),
+                (
+                    Some(false),
+                    Some("wallet"),
+                    Some("payment_processor_pre_api"),
+                    None
+                ) | (
+                    Some(true),
+                    Some("transport"),
+                    Some("payment_processor_api_request_ambiguous"),
+                    Some(_),
+                ) | (
+                    Some(true),
+                    Some("response_decode" | "response_shape"),
+                    Some("payment_processor_api_response_ambiguous"),
+                    Some(_),
+                )
+            );
+        let honest_old_wallet_ambiguous_submission = mode == "old_wallet"
+            && outcome == "stalled"
+            && api_accepted.is_none()
+            && !has_identity
+            && submission_started == Some(true)
+            && observation["deadline_expired"] == false
+            && observation["failure_class"] == "transport"
+            && observation["submit_offset_ms"].as_u64().is_some()
+            && observation["submission_ms"].as_u64().is_some()
+            && observation["submission_timing_origin"]
+                .as_str()
+                .is_some_and(|origin| origin.ends_with("_ambiguous"))
+            && has_attempt_identity
+            && has_recipients
+            && has_error
+            && has_explicit_timing_availability;
         let reconciled_mode1_not_found = mode == "old_wallet"
             && outcome == "confirmed"
             && observation["transaction_id"]
@@ -1946,7 +3235,12 @@ fn validate_transaction_observations(
             bail!("submission {mode}/{scenario} immediate API failure must be rejected");
         }
         if matches!(outcome, "stalled" | "timed_out")
-            && (api_accepted != Some(true) || !has_identity)
+            && !((api_accepted == Some(true) && has_identity)
+                || honest_arm_deadline
+                || honest_started_ambiguous_submission
+                || honest_new_wallet_pre_submission_failure
+                || honest_payment_processor_pre_acceptance_failure
+                || honest_old_wallet_ambiguous_submission)
         {
             bail!(
                 "submission {mode}/{scenario} stalled observation lacks accepted operation identity"
@@ -1960,36 +3254,44 @@ fn validate_transaction_observations(
                 "submission {mode}/{scenario} confirmed observation lacks accepted operation identity"
             );
         }
-        if mode == "new_wallet" && observation["transaction_id"].is_string() {
-            if observation["construction_ms"].as_u64().is_none()
-                || observation["construction_timing_origin"] != "library_build_and_sign"
-            {
-                bail!("submission {mode}/{scenario} transaction is missing real construction time");
+        let construction_ms = observation["construction_ms"].as_u64();
+        let construction_offset = observation["construction_complete_offset_ms"].as_u64();
+        let construction_origin = observation["construction_timing_origin"]
+            .as_str()
+            .unwrap_or_default();
+        match mode {
+            "new_wallet" => match (construction_ms, construction_offset) {
+                (Some(_), Some(_)) if construction_origin.starts_with("library_build_and_sign") => {
+                }
+                (None, None) if has_reason("construction_timing_reason") => {}
+                _ => bail!(
+                    "submission {mode}/{scenario} transaction is missing real construction timing or an explicit unavailable reason"
+                ),
+            },
+            "payment_processor" => match (construction_ms, construction_offset) {
+                (Some(_), Some(_))
+                    if construction_origin
+                        == "payment_processor_db_unsigned_tx_first_observation" => {}
+                (None, None) if has_reason("construction_timing_reason") => {}
+                _ => bail!(
+                    "submission {mode}/{scenario} has invalid persisted-worker construction timing"
+                ),
+            },
+            _ => {
+                if construction_ms.is_some()
+                    || construction_offset.is_some()
+                    || !has_reason("construction_timing_reason")
+                {
+                    bail!(
+                        "submission {mode}/{scenario} must disclose unavailable internal construction time"
+                    );
+                }
             }
-        } else if mode != "new_wallet"
-            && (!observation["construction_ms"].is_null()
-                || observation["construction_timing_reason"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .is_empty())
-        {
-            bail!(
-                "submission {mode}/{scenario} must disclose unavailable internal construction time"
-            );
         }
-        if scenario == "S4"
-            && (observation["submit_offset_ms"].as_u64().is_none()
-                || observation["construction_complete_offset_ms"]
-                    .as_u64()
-                    .is_none())
-        {
-            bail!("submission {mode}/{scenario} attempt is missing common-clock offsets");
+        if scenario == "S4" && observation["submit_offset_ms"].as_u64().is_none() {
+            bail!("submission {mode}/{scenario} attempt is missing a common-clock submit offset");
         }
-        if scenario == "S4"
-            && observation["recipients"]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-        {
+        if scenario == "S4" && !has_recipients {
             bail!("submission {mode}/{scenario} attempt is missing recipient identity");
         }
         if mode == "new_wallet" && outcome == "confirmed" {
@@ -2315,8 +3617,27 @@ pub fn write_legacy_v5_summary(profile_path: &Path, output_path: &Path) -> anyho
     Ok(())
 }
 
+pub fn write_legacy_v6_summary(profile_path: &Path, output_path: &Path) -> anyhow::Result<()> {
+    let bytes =
+        fs::read(profile_path).with_context(|| format!("reading {}", profile_path.display()))?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {} as JSON", profile_path.display()))?;
+    validate_legacy_v6_document(&document)?;
+    let markdown = render_summary_document(&document);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output_path, markdown)
+        .with_context(|| format!("writing {}", output_path.display()))?;
+    Ok(())
+}
+
 pub fn render_summary(document: &Value) -> anyhow::Result<String> {
     validate_document(document, false)?;
+    Ok(render_summary_document(document))
+}
+
+fn render_summary_document(document: &Value) -> String {
     let mut output = String::new();
     output.push_str("# Tari Wallet Benchmark Result\n\n");
     output.push_str(&format!(
@@ -2340,6 +3661,15 @@ pub fn render_summary(document: &Value) -> anyhow::Result<String> {
         "- Export commit: `{}`\n",
         markdown_text(&document["provenance"]["export_commit"])
     ));
+    if !document["provenance"]["measurement_worktree_clean"].is_null()
+        || !document["provenance"]["export_worktree_clean"].is_null()
+    {
+        output.push_str(&format!(
+            "- Harness worktree clean: measurement=`{}`, export=`{}`\n",
+            document["provenance"]["measurement_worktree_clean"],
+            document["provenance"]["export_worktree_clean"]
+        ));
+    }
     output.push_str(&format!(
         "- Selected scan node: `{}` (`{}`; `{}`)\n",
         markdown_text(&document["base_node"]["endpoint"]),
@@ -2388,7 +3718,7 @@ pub fn render_summary(document: &Value) -> anyhow::Result<String> {
             .map(Vec::len)
             .unwrap_or_default()
     ));
-    Ok(output)
+    output
 }
 
 fn markdown_text(value: &Value) -> String {
@@ -2427,25 +3757,22 @@ mod tests {
         }
         profile.refresh_computed_deltas();
         let mut document = serde_json::to_value(profile).unwrap();
-        let manifest = json!({
-            "schema_version": 2,
-            "sources": {"harness": {
-                "repository": "test",
-                "upstream": {"revision": "test", "commit": "test", "tree": "test"},
-                "patches": [], "complete_diff_sha256": "test", "result_tree": "test"
-            }},
-            "artifacts": {"harness": {
-                "source": "harness", "source_revision": "test", "source_tree": "test", "sha256": "test"
-            }}
-        });
+        let manifest =
+            serde_json::to_value(crate::build_manifest::portable_manifest_fixture()).unwrap();
         document["provenance"]["measurement_build_manifest"] = manifest.clone();
         document["provenance"]["export_build_manifest"] = manifest.clone();
         document["config"]["build_manifest"] = manifest;
+        document["config"]["seed_fingerprints"] = json!({
+            "old_wallet": "old",
+            "new_wallet": "new",
+            "payment_processor": "payment",
+            "recipient_sink": "sink"
+        });
         document
     }
 
     #[test]
-    fn valid_v5_checkpoint_round_trips() {
+    fn current_checkpoint_round_trips() {
         let document = profile_document();
         let profile = validate_document(&document, false).unwrap();
         assert_eq!(profile.schema_version, RESULT_SCHEMA_VERSION);
@@ -2461,8 +3788,91 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("provenance");
         validate_legacy_v5_document(&legacy).unwrap();
 
-        legacy["schema_version"] = json!(6);
+        legacy["schema_version"] = json!(LEGACY_RESULT_SCHEMA_VERSION);
         assert!(validate_legacy_v5_document(&legacy).is_err());
+    }
+
+    #[test]
+    fn schema_v6_profile_requires_explicit_legacy_path() {
+        let mut document = profile_document();
+        document["schema_version"] = json!(LEGACY_RESULT_SCHEMA_VERSION);
+        document["base_node"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pruned_height");
+        document["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("seed_fingerprints");
+        document["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("measurement_worktree_clean");
+        document["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_worktree_clean");
+        document["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("measurement_build_worktree_clean");
+        document["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_build_worktree_clean");
+        document["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_harness_executable_sha256");
+        assert!(document["base_node"].get("pruned_height").is_none());
+        assert!(validate_document(&document, false).is_err());
+        assert!(validate_document(&document, true).is_err());
+        validate_legacy_v6_document(&document).unwrap();
+    }
+
+    #[test]
+    fn current_schema_requires_exact_typed_build_manifest_sets() {
+        let canonical = profile_document();
+        let mut missing_source = canonical.clone();
+        missing_source["provenance"]["measurement_build_manifest"]["sources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("minotari_node");
+        let mut extra_artifact = canonical.clone();
+        extra_artifact["provenance"]["measurement_build_manifest"]["artifacts"]["miner"] =
+            extra_artifact["provenance"]["measurement_build_manifest"]["artifacts"]["minotari"]
+                .clone();
+        let mut wrong_patch_count = canonical;
+        wrong_patch_count["provenance"]["measurement_build_manifest"]["sources"]["tari_console_wallet"]
+            ["patches"] = json!([wrong_patch_count["provenance"]
+            ["measurement_build_manifest"]["sources"]["minotari_cli"]["patches"][0]
+            .clone()]);
+
+        for document in [missing_source, extra_artifact, wrong_patch_count] {
+            assert!(validate_document(&document, false).is_err());
+        }
+    }
+
+    #[test]
+    fn current_schema_requires_recipient_sink_fingerprint() {
+        let mut document = profile_document();
+        document["config"]["seed_fingerprints"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recipient_sink");
+        assert!(validate_document(&document, false).is_err());
+    }
+
+    #[test]
+    fn submission_rejects_tuned_payment_processor_worker_cadence() {
+        let mut document = profile_document();
+        let profile = validate_document(&document, false).unwrap();
+        document["config"]["mode3_batch_creator_sleep_secs"] = json!(10);
+
+        let error = validate_reference_configuration(&profile, &document)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mode3_batch_creator_sleep_secs"));
     }
 
     #[test]
@@ -2544,15 +3954,13 @@ mod tests {
         );
         let mut underflow = metrics.clone();
         underflow["balance_before_microtari"] = json!(50);
-        assert!(
-            validate_balance_reconciliation(
-                underflow.as_object().unwrap(),
-                "test",
-                Some(100),
-                600,
-            )
-                .is_err()
-        );
+        assert!(validate_balance_reconciliation(
+            underflow.as_object().unwrap(),
+            "test",
+            Some(100),
+            600,
+        )
+        .is_err());
         let mut missing_domain = metrics.clone();
         missing_domain["balance_reconciliation"]["balance_domain"] = Value::Null;
         assert!(
@@ -2584,7 +3992,7 @@ mod tests {
         );
         assert_eq!(
             reconciliation_outgoing_microtari("payment_processor", "S1", 10_000),
-            10_000
+            0
         );
         assert_eq!(
             reconciliation_outgoing_microtari("old_wallet", "S4", 10_000),
@@ -2598,7 +4006,7 @@ mod tests {
             "transaction_observations": [{
                 "transaction_id": "42",
                 "submit_offset_ms": 0,
-                "construction_complete_offset_ms": 10,
+                "construction_complete_offset_ms": null,
                 "recipients": ["recipient"],
                 "api_accepted": false,
                 "api_error": "status: NotFound, message: \"Transaction 42 not found within timeout\"",
@@ -2621,6 +4029,328 @@ mod tests {
         unrelated["transaction_observations"][0]["api_error"] =
             json!("status: NotFound, message: \"Transaction 43 not found within timeout\"");
         assert!(validate_transaction_observations("old_wallet", "S4", &unrelated).is_err());
+    }
+
+    #[test]
+    fn honest_s4_arm_deadline_partial_is_valid_but_tampering_is_rejected() {
+        let observation = json!({
+            "transaction_id": null,
+            "attempt_index": null,
+            "batch_index": 7,
+            "batch_id": null,
+            "submit_offset_ms": 21,
+            "construction_complete_offset_ms": null,
+            "construction_ms": null,
+            "construction_timing_reason": "construction completion was unavailable before the arm deadline",
+            "submission_ms": null,
+            "mempool_available": null,
+            "mempool_reason": "the request did not return an acceptance result before the arm deadline",
+            "confirmation_ms": null,
+            "confirmation_timing_reason": "C_min was not observed before the arm deadline",
+            "fee_microtari": null,
+            "fee_unavailable_reason": "no independently verified fee was available",
+            "fee_disposition": "unavailable",
+            "recipients": ["recipient"],
+            "api_accepted": null,
+            "failure_class": "arm_deadline",
+            "deadline_expired": true,
+            "terminal_outcome": "timed_out",
+            "error": "absolute arm deadline expired"
+        });
+        for mode in ["old_wallet", "new_wallet", "payment_processor"] {
+            let metrics = json!({"transaction_observations": [observation.clone()]});
+            validate_transaction_observations(mode, "S4", &metrics).unwrap();
+        }
+
+        for (field, tampered) in [
+            ("deadline_expired", json!(false)),
+            ("failure_class", json!("transport")),
+            ("error", Value::Null),
+            ("submit_offset_ms", Value::Null),
+            ("batch_index", Value::Null),
+            ("recipients", json!([])),
+            ("construction_timing_reason", Value::Null),
+        ] {
+            let mut metrics = json!({"transaction_observations": [observation.clone()]});
+            metrics["transaction_observations"][0][field] = tampered;
+            assert!(
+                validate_transaction_observations("old_wallet", "S4", &metrics).is_err(),
+                "tampered {field} unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_bearing_started_submission_may_remain_ambiguous() {
+        let observation = json!({
+            "transaction_id": "tx",
+            "attempt_index": 1,
+            "batch_index": null,
+            "submit_offset_ms": 5,
+            "construction_complete_offset_ms": 10,
+            "construction_ms": 5,
+            "construction_timing_origin": "library_build_and_sign_attempt",
+            "submission_ms": 30,
+            "submission_timing_origin": "base_node_submit_transaction_ambiguous",
+            "submission_started": true,
+            "mempool_available": null,
+            "mempool_reason": "submission result was ambiguous",
+            "confirmation_ms": null,
+            "confirmation_timing_reason": "C_min was not observed",
+            "fee_microtari": 700,
+            "fee_disposition": "proposed_unresolved",
+            "recipients": ["recipient"],
+            "api_accepted": null,
+            "failure_class": "request_timeout",
+            "deadline_expired": false,
+            "terminal_outcome": "timed_out",
+            "error": "request timed out after submission started"
+        });
+        let metrics = json!({"transaction_observations": [observation.clone()]});
+        validate_transaction_observations("new_wallet", "S4", &metrics).unwrap();
+
+        let mut tampered = metrics;
+        tampered["transaction_observations"][0]["submission_timing_origin"] =
+            json!("base_node_submit_transaction");
+        assert!(validate_transaction_observations("new_wallet", "S4", &tampered).is_err());
+    }
+
+    #[test]
+    fn new_wallet_pre_submission_failure_is_not_faked_as_api_rejection() {
+        let observation = json!({
+            "transaction_id": null,
+            "attempt_index": 1,
+            "batch_index": null,
+            "submit_offset_ms": 5,
+            "construction_complete_offset_ms": null,
+            "construction_ms": null,
+            "construction_timing_reason": "wallet construction failed before producing a transaction",
+            "submission_ms": null,
+            "submission_started": false,
+            "mempool_available": null,
+            "mempool_reason": "base-node submission did not start",
+            "confirmation_ms": null,
+            "confirmation_timing_reason": "no transaction existed to confirm",
+            "fee_microtari": null,
+            "fee_unavailable_reason": "construction did not produce a fee",
+            "fee_disposition": "unavailable",
+            "recipients": ["recipient"],
+            "api_accepted": null,
+            "failure_class": "wallet",
+            "deadline_expired": false,
+            "terminal_outcome": "stalled",
+            "error": "wallet input selection failed"
+        });
+        let metrics = json!({"transaction_observations": [observation.clone()]});
+        validate_transaction_observations("new_wallet", "S4", &metrics).unwrap();
+
+        for (field, tampered) in [
+            ("api_accepted", json!(false)),
+            ("submission_started", json!(true)),
+            ("failure_class", json!("transport")),
+            ("attempt_index", Value::Null),
+            ("recipients", json!([])),
+        ] {
+            let mut metrics = json!({"transaction_observations": [observation.clone()]});
+            metrics["transaction_observations"][0][field] = tampered;
+            assert!(
+                validate_transaction_observations("new_wallet", "S4", &metrics).is_err(),
+                "tampered {field} unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn pp_pre_acceptance_failures_require_truthful_started_state_and_origin() {
+        let cases = [
+            ("wallet", false, "payment_processor_pre_api", Value::Null),
+            (
+                "transport",
+                true,
+                "payment_processor_api_request_ambiguous",
+                json!(7),
+            ),
+            (
+                "response_decode",
+                true,
+                "payment_processor_api_response_ambiguous",
+                json!(7),
+            ),
+            (
+                "response_shape",
+                true,
+                "payment_processor_api_response_ambiguous",
+                json!(7),
+            ),
+        ];
+        for (failure_class, submission_started, submission_origin, submission_ms) in cases {
+            let observation = json!({
+                "transaction_id": null,
+                "attempt_index": null,
+                "batch_index": 1,
+                "batch_id": null,
+                "submit_offset_ms": 2,
+                "construction_complete_offset_ms": null,
+                "construction_ms": null,
+                "construction_timing_reason": "no persisted unsigned transaction was observed",
+                "submission_ms": submission_ms,
+                "submission_timing_origin": submission_origin,
+                "submission_started": submission_started,
+                "mempool_available": null,
+                "mempool_reason": "payment-processor acceptance was not established",
+                "confirmation_ms": null,
+                "confirmation_timing_reason": "no accepted batch existed to confirm",
+                "fee_microtari": null,
+                "fee_unavailable_reason": "no independently verified fee was available",
+                "fee_disposition": "unavailable",
+                "recipients": ["recipient"],
+                "api_accepted": null,
+                "failure_class": failure_class,
+                "deadline_expired": false,
+                "terminal_outcome": "stalled",
+                "error": "payment-processor batch failed before acceptance"
+            });
+            let metrics = json!({"transaction_observations": [observation.clone()]});
+            validate_transaction_observations("payment_processor", "S1", &metrics).unwrap();
+
+            let mut wrong_started = metrics.clone();
+            wrong_started["transaction_observations"][0]["submission_started"] =
+                json!(!submission_started);
+            assert!(
+                validate_transaction_observations("payment_processor", "S1", &wrong_started)
+                    .is_err(),
+                "tampered submission_started unexpectedly passed for {failure_class}"
+            );
+
+            let mut wrong_origin = metrics;
+            wrong_origin["transaction_observations"][0]["submission_timing_origin"] =
+                json!("payment_processor_api_acceptance");
+            assert!(
+                validate_transaction_observations("payment_processor", "S1", &wrong_origin)
+                    .is_err(),
+                "tampered submission origin unexpectedly passed for {failure_class}"
+            );
+        }
+    }
+
+    #[test]
+    fn s1_preflight_failure_is_reportable_without_a_fake_transaction() {
+        let row = json!({
+            "round_index": 1,
+            "attempted_index": null,
+            "stage": "read_spendable_inputs",
+            "submission_started": false,
+            "error": "wallet database could not enumerate spendable inputs"
+        });
+        for (mode, metrics) in [
+            (
+                "old_wallet",
+                json!({
+                    "preflight_failures": [row.clone()],
+                    "constructed_output_shapes_by_tx_id": {},
+                    "transaction_observations": []
+                }),
+            ),
+            (
+                "new_wallet",
+                json!({
+                    "preflight_failures": [row.clone()],
+                    "constructed_output_shapes_by_tx_id": {},
+                    "constructed_amounts_microtari_by_tx_id": {},
+                    "transaction_observations": []
+                }),
+            ),
+            (
+                "payment_processor",
+                json!({
+                    "extra": {"preflight_failures": [row.clone()]},
+                    "transaction_observations": []
+                }),
+            ),
+        ] {
+            validate_transaction_observations(mode, "S1", &metrics).unwrap();
+
+            let mut fake_submission = metrics;
+            if mode == "payment_processor" {
+                fake_submission["extra"]["preflight_failures"][0]["submission_started"] =
+                    json!(true);
+            } else {
+                fake_submission["preflight_failures"][0]["submission_started"] = json!(true);
+            }
+            assert!(validate_transaction_observations(mode, "S1", &fake_submission).is_err());
+        }
+    }
+
+    #[test]
+    fn old_wallet_ambiguous_grpc_failure_is_not_faked_as_rejection() {
+        let observation = json!({
+            "transaction_id": null,
+            "attempt_index": null,
+            "batch_index": 1,
+            "submit_offset_ms": 5,
+            "construction_complete_offset_ms": null,
+            "construction_ms": null,
+            "construction_timing_reason": "console wallet does not expose construction",
+            "submission_ms": 20,
+            "submission_timing_origin": "console_wallet_grpc_request_ambiguous",
+            "submission_started": true,
+            "mempool_available": null,
+            "mempool_reason": "gRPC response was ambiguous",
+            "confirmation_ms": null,
+            "confirmation_timing_reason": "no transaction identity was returned",
+            "fee_microtari": null,
+            "fee_unavailable_reason": "no verified transaction identity",
+            "fee_disposition": "unavailable",
+            "recipients": ["recipient"],
+            "api_accepted": null,
+            "failure_class": "transport",
+            "deadline_expired": false,
+            "terminal_outcome": "stalled",
+            "error": "connection lost after request dispatch"
+        });
+        let metrics = json!({"transaction_observations": [observation.clone()]});
+        validate_transaction_observations("old_wallet", "S4", &metrics).unwrap();
+
+        let mut fake_rejection = metrics;
+        fake_rejection["transaction_observations"][0]["api_accepted"] = json!(false);
+        assert!(validate_transaction_observations("old_wallet", "S4", &fake_rejection).is_err());
+    }
+
+    #[test]
+    fn pp_persisted_unsigned_transaction_is_valid_genuine_construction_evidence() {
+        let observation = json!({
+            "transaction_id": null,
+            "attempt_index": null,
+            "batch_index": 1,
+            "batch_id": "batch",
+            "submit_offset_ms": 20,
+            "construction_complete_offset_ms": 125,
+            "construction_ms": 105,
+            "construction_timing_origin": "payment_processor_db_unsigned_tx_first_observation",
+            "construction_timing_reason": "first polling observation of persisted unsigned_tx_json",
+            "submission_ms": 10,
+            "submission_timing_origin": "payment_processor_api_acceptance",
+            "submission_started": true,
+            "mempool_available": null,
+            "mempool_reason": "payment processor exposes no per-batch mempool timestamp",
+            "confirmation_ms": null,
+            "confirmation_timing_reason": "C_min was not observed",
+            "fee_microtari": null,
+            "fee_unavailable_reason": "no independently verified fee was available",
+            "fee_disposition": "unavailable",
+            "recipients": ["recipient"],
+            "api_accepted": true,
+            "deadline_expired": false,
+            "terminal_outcome": "stalled",
+            "error": "batch did not reach C_min"
+        });
+        let metrics = json!({"transaction_observations": [observation.clone()]});
+        validate_transaction_observations("payment_processor", "S4", &metrics).unwrap();
+
+        let mut tampered = metrics;
+        tampered["transaction_observations"][0]["construction_timing_origin"] =
+            json!("payment_processor_api_acceptance");
+        assert!(validate_transaction_observations("payment_processor", "S4", &tampered).is_err());
     }
 
     #[test]
@@ -2686,6 +4416,330 @@ mod tests {
     }
 
     #[test]
+    fn s1_wallet_observation_roles_must_match_tx_id_keyed_construction_evidence() {
+        let metrics = json!({
+            "constructed_output_shapes_by_tx_id": {
+                "tx-1": {
+                    "payment_output_count": 1,
+                    "change_output_count": 1,
+                    "total_output_count": 2
+                }
+            },
+            "transaction_observations": [{
+                "terminal_outcome": "confirmed",
+                "api_accepted": true,
+                "transaction_id": "tx-1",
+                "fee_microtari": 10,
+                "fee_disposition": "confirmed_paid",
+                "construction_timing_reason": "console wallet does not expose internal construction",
+                "construction_ms": null,
+                "construction_complete_offset_ms": null,
+                "confirmation_ms": 1,
+                "confirmation_timing_origin": "grpc_dispatch_to_independent_c_min",
+                "mined_height": 1,
+                "tip_end_height": 4,
+                "input_count": 1,
+                "payment_output_count": 1,
+                "change_output_count": 1,
+                "total_output_count": 2,
+                "output_commitments": ["payment", "change"]
+            }]
+        });
+        validate_transaction_observations("old_wallet", "S1", &metrics).unwrap();
+
+        let mut mislabeled_observation = metrics.clone();
+        mislabeled_observation["transaction_observations"][0]["payment_output_count"] = json!(2);
+        assert!(
+            validate_transaction_observations("old_wallet", "S1", &mislabeled_observation).is_err()
+        );
+
+        let mut mislabeled_construction = metrics.clone();
+        mislabeled_construction["constructed_output_shapes_by_tx_id"]["tx-1"]["change_output_count"] =
+            json!(0);
+        assert!(
+            validate_transaction_observations("old_wallet", "S1", &mislabeled_construction)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn new_wallet_s1_amounts_must_match_tx_id_keyed_construction_evidence() {
+        let metrics = json!({
+            "constructed_amounts_microtari_by_tx_id": {"tx-1": 1234},
+            "constructed_output_shapes_by_tx_id": {
+                "tx-1": {
+                    "payment_output_count": 1,
+                    "change_output_count": 1,
+                    "total_output_count": 2
+                }
+            },
+            "observed_transactions": [{
+                "tx_id": "tx-1",
+                "amount_microtari": 1234
+            }],
+            "transaction_observations": [{
+                "terminal_outcome": "confirmed",
+                "api_accepted": true,
+                "transaction_id": "tx-1",
+                "amount_microtari": 1234,
+                "fee_microtari": 10,
+                "fee_disposition": "confirmed_paid",
+                "construction_ms": 2,
+                "construction_complete_offset_ms": 2,
+                "construction_timing_origin": "library_build_and_sign",
+                "confirmation_ms": 1,
+                "confirmation_timing_origin": "wallet_broadcast_start_to_independent_c_min",
+                "broadcast_start_offset_ms": 2,
+                "mined_height": 1,
+                "tip_end_height": 4,
+                "input_count": 1,
+                "payment_output_count": 1,
+                "change_output_count": 1,
+                "total_output_count": 2,
+                "output_commitments": ["payment", "change"]
+            }]
+        });
+        validate_transaction_observations("new_wallet", "S1", &metrics).unwrap();
+
+        for path in ["observation", "verified", "map"] {
+            let mut tampered = metrics.clone();
+            match path {
+                "observation" => {
+                    tampered["transaction_observations"][0]["amount_microtari"] = json!(999)
+                }
+                "verified" => tampered["observed_transactions"][0]["amount_microtari"] = json!(999),
+                "map" => tampered["constructed_amounts_microtari_by_tx_id"]["tx-1"] = json!(999),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_transaction_observations("new_wallet", "S1", &tampered).is_err(),
+                "tampered {path} amount unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn s1_round_observations_and_fees_are_bound_to_the_exact_round() {
+        let mut observations = Vec::new();
+        let mut summaries = Vec::new();
+        let mut rounds = Vec::new();
+        for (round_index, tx_count, outputs_per_tx, target_utxos_after) in REFERENCE_S1_ROUNDS {
+            for _ in 0..tx_count {
+                observations.push(json!({
+                    "configured_batch": round_index,
+                    "terminal_outcome": "confirmed",
+                    "input_count": 1,
+                    "payment_output_count": outputs_per_tx - 1,
+                    "change_output_count": 1,
+                    "total_output_count": outputs_per_tx,
+                    "fee_microtari": 5
+                }));
+            }
+            summaries.push(json!({
+                "configured_batch": round_index,
+                "attempted": tx_count,
+                "wall_ms": 1
+            }));
+            rounds.push(json!({
+                "round_index": round_index,
+                "tx_count": tx_count,
+                "outputs_per_tx": outputs_per_tx,
+                "target_utxos_after": target_utxos_after,
+                "total_fee_microtari": tx_count * 5
+            }));
+        }
+        let metrics = json!({
+            "transaction_observations": observations,
+            "batch_summaries": summaries,
+            "rounds": rounds
+        });
+        validate_s1_round_bindings("new_wallet", &metrics).unwrap();
+
+        let mut moved_to_wrong_round = metrics.clone();
+        moved_to_wrong_round["transaction_observations"][0]["configured_batch"] = json!(2);
+        assert!(validate_s1_round_bindings("new_wallet", &moved_to_wrong_round).is_err());
+
+        let mut false_round_fee = metrics;
+        false_round_fee["rounds"][0]["total_fee_microtari"] = json!(0);
+        assert!(validate_s1_round_bindings("new_wallet", &false_round_fee).is_err());
+    }
+
+    #[test]
+    fn paired_scans_require_one_immutable_target_and_expected_state() {
+        let metrics = json!({
+            "H_tip_end": 100,
+            "H_tip_target_hash": "hash",
+            "scan_checkpoint": "post_s1",
+            "expected_outputs": 512,
+            "expected_available_microtari": 10,
+            "expected_history_transactions": 127,
+            "expected_history_tx_ids": ["tx"],
+            "expected_output_commitments": {"tx": ["commitment"]}
+        });
+        let scenarios = json!({
+            "S2": {
+                "execution_status": "completed",
+                "repetitions": [{"metrics": metrics.clone()}]
+            },
+            "S3": {
+                "execution_status": "completed",
+                "repetitions": [{"metrics": metrics}]
+            }
+        });
+        validate_paired_scan_targets(
+            "new_wallet",
+            scenarios.as_object().unwrap(),
+            "S2",
+            "S3",
+            "post_s1",
+        )
+        .unwrap();
+
+        let mut changed_target = scenarios.clone();
+        changed_target["S3"]["repetitions"][0]["metrics"]["H_tip_end"] = json!(101);
+        assert!(
+            validate_paired_scan_targets(
+                "new_wallet",
+                changed_target.as_object().unwrap(),
+                "S2",
+                "S3",
+                "post_s1"
+            )
+            .is_err()
+        );
+
+        let mut changed_expectation = scenarios;
+        changed_expectation["S3"]["repetitions"][0]["metrics"]["expected_outputs"] = json!(511);
+        assert!(
+            validate_paired_scan_targets(
+                "new_wallet",
+                changed_expectation.as_object().unwrap(),
+                "S2",
+                "S3",
+                "post_s1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mode1_scan_contract_accepts_only_anchored_overshoot() {
+        let mut metrics = json!({
+            "max_height": 101,
+            "H_tip_end": 100,
+            "H_scan_cursor_hash": "completion",
+            "H_scan_target_cursor_hash": "target",
+            "H_tip_target_hash": "target",
+            "scan_target_overshoot_allowed": true
+        });
+
+        assert!(scan_target_binding_valid("old_wallet", &metrics));
+        assert!(!scan_target_binding_valid("new_wallet", &metrics));
+
+        metrics["H_scan_target_cursor_hash"] = json!("wrong");
+        assert!(!scan_target_binding_valid("old_wallet", &metrics));
+
+        metrics["max_height"] = json!(100);
+        metrics["H_scan_cursor_hash"] = json!("target");
+        assert!(scan_target_binding_valid("new_wallet", &metrics));
+    }
+
+    #[test]
+    fn s4_deadline_cleanup_rejects_late_acceptance_or_unreaped_work() {
+        let document = json!({"config": {"S4_T_budget_secs": 900}});
+        let arms = REFERENCE_S4_RAMP
+            .into_iter()
+            .map(|configured_batch| {
+                json!({"configured_batch": configured_batch, "wall_ms": 900_000})
+            })
+            .collect::<Vec<_>>();
+        let summaries = REFERENCE_S4_RAMP
+            .into_iter()
+            .map(|configured_batch| {
+                json!({"configured_batch": configured_batch, "wall_ms": 900_000})
+            })
+            .collect::<Vec<_>>();
+        let measurements = REFERENCE_S4_RAMP
+            .into_iter()
+            .map(|configured_batch| {
+                json!({
+                    "configured_batch": configured_batch,
+                    "deadline_expired": true,
+                    "deadline_offset_ms": 900_000,
+                    "pending_tasks_at_deadline": 1,
+                    "measured_wall_ms": 900_000
+                })
+            })
+            .collect::<Vec<_>>();
+        let cleanups = REFERENCE_S4_RAMP
+            .into_iter()
+            .map(|configured_batch| {
+                json!({
+                    "configured_batch": configured_batch,
+                    "drain_ms": 1,
+                    "cleanup_grace_ms": 0,
+                    "cleanup_deadline_exhausted": false,
+                    "abort_requested_tasks": 1,
+                    "drained_tasks": 0,
+                    "forced_shutdown_tasks": 1,
+                    "completed_after_deadline_discarded_tasks": 0,
+                    "post_deadline_join_errors": [],
+                    "tasks_quiesced": true,
+                    "unmatched_pending_attempts_after_drain": [{
+                        "terminal_outcome": "timed_out",
+                        "submission_state": "ambiguous"
+                    }],
+                    "late_results_accepted": false,
+                    "actual_return_offset_ms": 900_001
+                })
+            })
+            .collect::<Vec<_>>();
+        let metrics = json!({
+            "s4_deadline_measurements": measurements,
+            "s4_post_deadline_cleanups": cleanups,
+            "s4_actual_return_wall_ms": 4_500_005
+        });
+        let repetition = json!({"wall_ms": 4_500_000});
+        validate_s4_deadline_accounting(
+            &document,
+            "old_wallet",
+            &repetition,
+            &metrics,
+            &arms,
+            &summaries,
+        )
+        .unwrap();
+
+        let mut late_acceptance = metrics.clone();
+        late_acceptance["s4_post_deadline_cleanups"][0]["late_results_accepted"] = json!(true);
+        assert!(
+            validate_s4_deadline_accounting(
+                &document,
+                "old_wallet",
+                &repetition,
+                &late_acceptance,
+                &arms,
+                &summaries,
+            )
+            .is_err()
+        );
+
+        let mut unreaped = metrics;
+        unreaped["s4_post_deadline_cleanups"][0]["tasks_quiesced"] = json!(false);
+        assert!(
+            validate_s4_deadline_accounting(
+                &document,
+                "old_wallet",
+                &repetition,
+                &unreaped,
+                &arms,
+                &summaries,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn fee_disposition_is_outcome_consistent() {
         let cases = [
             ("confirmed", true, "tx", "confirmed_paid", Some(10u64)),
@@ -2711,10 +4765,21 @@ mod tests {
                     "mined_height": (outcome == "confirmed").then_some(1),
                     "tip_end_height": (outcome == "confirmed").then_some(2),
                     "output_commitments": (outcome == "confirmed").then_some(vec!["commitment"]),
+                    "payment_output_count": (outcome == "confirmed" && identity.starts_with("tx")).then_some(1),
+                    "change_output_count": (outcome == "confirmed" && identity.starts_with("tx")).then_some(1),
+                    "total_output_count": (outcome == "confirmed" && identity.starts_with("tx")).then_some(2),
                     "recipients": ["recipient"]
                 }],
                 "batch_chain_identities": (identity.starts_with("batch") && outcome == "confirmed")
-                    .then_some(json!([{"batch_id": identity, "transaction_id": "tx-1"}]))
+                    .then_some(json!([{"batch_id": identity, "transaction_id": "tx-1"}])),
+                "constructed_output_shapes_by_tx_id":
+                    (outcome == "confirmed" && identity.starts_with("tx")).then_some(json!({
+                        "tx": {
+                            "payment_output_count": 1,
+                            "change_output_count": 1,
+                            "total_output_count": 2
+                        }
+                    }))
             });
             let mode = if identity.starts_with("batch") {
                 "payment_processor"
@@ -2806,6 +4871,143 @@ mod tests {
     }
 
     #[test]
+    fn submission_harness_provenance_requires_exact_commit_and_clean_evidence() {
+        let mut profile: ResultProfile = serde_json::from_value(profile_document()).unwrap();
+        profile.provenance.measurement_commit = "11".repeat(20);
+        profile.provenance.export_commit = "11".repeat(20);
+        profile.provenance.measurement_worktree_clean = true;
+        profile.provenance.export_worktree_clean = true;
+        profile.provenance.measurement_build_worktree_clean = true;
+        profile.provenance.export_build_worktree_clean = true;
+        validate_submission_harness_provenance(&profile).unwrap();
+
+        for invalid in ["not-a-commit".to_string(), "AA".repeat(20), "1".repeat(39)] {
+            let mut bad_commit = profile.clone();
+            bad_commit.provenance.measurement_commit = invalid.clone();
+            bad_commit.provenance.export_commit = invalid;
+            assert!(
+                validate_submission_harness_provenance(&bad_commit)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lowercase 40-character")
+            );
+        }
+
+        let mut mismatched = profile.clone();
+        mismatched.provenance.export_commit = "22".repeat(20);
+        assert!(
+            validate_submission_harness_provenance(&mismatched)
+                .unwrap_err()
+                .to_string()
+                .contains("must be identical")
+        );
+
+        for measurement in [true, false] {
+            let mut dirty = profile.clone();
+            if measurement {
+                dirty.provenance.measurement_worktree_clean = false;
+            } else {
+                dirty.provenance.export_worktree_clean = false;
+            }
+            assert!(
+                validate_submission_harness_provenance(&dirty)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("clean-worktree evidence")
+            );
+        }
+
+        let mut dirty_build = profile.clone();
+        dirty_build.provenance.measurement_build_worktree_clean = false;
+        assert!(
+            validate_submission_harness_provenance(&dirty_build)
+                .unwrap_err()
+                .to_string()
+                .contains("built from a clean worktree")
+        );
+
+        let mut replaced_executable = profile;
+        replaced_executable.config.insert(
+            "export_harness_executable_sha256".to_string(),
+            json!("22".repeat(32)),
+        );
+        assert!(
+            validate_submission_harness_provenance(&replaced_executable)
+                .unwrap_err()
+                .to_string()
+                .contains("executable SHA-256 values must match")
+        );
+    }
+
+    #[test]
+    fn submission_build_manifests_must_be_identical() {
+        let mut profile: ResultProfile = serde_json::from_value(profile_document()).unwrap();
+        profile.provenance.export_build_manifest["artifacts"]["minotari"]["sha256"] =
+            json!("11".repeat(32));
+        let error = validate_submission_build_manifests(&profile)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be identical"));
+    }
+
+    #[test]
+    fn submission_build_manifest_rejects_noncanonical_claims_and_sets() {
+        let canonical =
+            serde_json::to_value(crate::build_manifest::portable_manifest_fixture()).unwrap();
+        let mut tampered_claim = canonical.clone();
+        tampered_claim["sources"]["minotari_cli"]["patches"][0]["path"] =
+            json!("patches/not-the-pinned-patch.patch");
+        let mut extra_artifact = canonical.clone();
+        let artifact_claim = extra_artifact["artifacts"]["minotari"].clone();
+        extra_artifact["artifacts"]["unexpected"] = artifact_claim;
+        let mut extra_source = canonical;
+        let source_claim = extra_source["sources"]["minotari_cli"].clone();
+        extra_source["sources"]["unexpected"] = source_claim;
+
+        for tampered in [tampered_claim, extra_artifact, extra_source] {
+            let mut profile: ResultProfile = serde_json::from_value(profile_document()).unwrap();
+            profile.provenance.measurement_build_manifest = tampered.clone();
+            profile.provenance.export_build_manifest = tampered.clone();
+            profile
+                .config
+                .insert("build_manifest".to_string(), tampered);
+            let error = validate_submission_build_manifests(&profile)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("does not match embedded canonical provenance"));
+        }
+    }
+
+    #[test]
+    fn submission_build_manifest_rejects_unknown_fields_and_bad_sha256() {
+        let canonical =
+            serde_json::to_value(crate::build_manifest::portable_manifest_fixture()).unwrap();
+        let mut unknown_field = canonical.clone();
+        unknown_field["unexpected_claim"] = json!(true);
+        let mut uppercase_sha256 = canonical;
+        uppercase_sha256["artifacts"]["minotari"]["sha256"] = json!("AA".repeat(32));
+
+        for (tampered, expected) in [
+            (unknown_field, "exact typed schema-v2 shape"),
+            (
+                uppercase_sha256,
+                "does not match embedded canonical provenance",
+            ),
+        ] {
+            let mut profile: ResultProfile = serde_json::from_value(profile_document()).unwrap();
+            profile.provenance.measurement_build_manifest = tampered.clone();
+            profile.provenance.export_build_manifest = tampered.clone();
+            profile
+                .config
+                .insert("build_manifest".to_string(), tampered);
+            let error = validate_submission_build_manifests(&profile)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn scan_history_validation_recomputes_commitment_evidence() {
         let document = json!({
             "modes": {
@@ -2855,6 +5057,66 @@ mod tests {
     }
 
     #[test]
+    fn s5_requires_equal_configured_per_recipient_amounts() {
+        let mut config = json!({
+            "mode1_payment_amount": "1 T",
+            "mode2_payment_amount": "1 T",
+            "mode3_payment_amount": "1 T"
+        });
+        assert_eq!(
+            reference_s5_per_recipient_amount(&config).unwrap(),
+            1_000_000
+        );
+
+        config["mode3_payment_amount"] = json!("2 T");
+        assert!(reference_s5_per_recipient_amount(&config).is_err());
+    }
+
+    #[test]
+    fn s5_confirmed_amounts_use_per_recipient_and_batch_total_semantics() {
+        let document = json!({
+            "config": {
+                "mode1_payment_amount": "1 T",
+                "mode2_payment_amount": "1 T",
+                "mode3_payment_amount": "1 T"
+            }
+        });
+        let individual = json!({
+            "transaction_observations": [{
+                "terminal_outcome": "confirmed",
+                "recipients": ["recipient-1"],
+                "amount_microtari": 1_000_000
+            }]
+        });
+        validate_s5_observation_amounts(&document, "old_wallet", &individual).unwrap();
+        validate_s5_observation_amounts(&document, "new_wallet", &individual).unwrap();
+
+        let recipients = (1..=10)
+            .map(|index| format!("recipient-{index}"))
+            .collect::<Vec<_>>();
+        let batch = json!({
+            "transaction_observations": [{
+                "terminal_outcome": "confirmed",
+                "recipients": recipients,
+                "amount_microtari": 10_000_000
+            }]
+        });
+        validate_s5_observation_amounts(&document, "payment_processor", &batch).unwrap();
+
+        for (mode, mut tampered) in [
+            ("old_wallet", individual.clone()),
+            ("new_wallet", individual),
+            ("payment_processor", batch),
+        ] {
+            tampered["transaction_observations"][0]["amount_microtari"] = json!(999);
+            assert!(
+                validate_s5_observation_amounts(&document, mode, &tampered).is_err(),
+                "tampered {mode} S5 amount unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
     fn s5_self_send_arms_are_explicitly_unavailable() {
         let arms = json!({
             "old_wallet": {"self_send": {"complete": false, "unavailable_reason": "unsupported"}},
@@ -2896,6 +5158,7 @@ mod tests {
             "construction_complete_offset_ms": 7,
             "construction_ms": 5,
             "submission_ms": 3,
+            "submission_started": true,
             "mempool_available": true,
             "mempool_reason": null,
             "confirmation_ms": 40,
@@ -2932,6 +5195,21 @@ mod tests {
             }
         }
         validate_schema(&document).unwrap();
+
+        assert!(
+            schema_document()["$defs"]["transaction_observation"]["required"]
+                .as_array()
+                .expect("transaction observation required fields")
+                .iter()
+                .any(|field| field == "submission_started")
+        );
+        let mut missing_started = document;
+        missing_started["modes"]["old_wallet"]["scenarios"]["S1"]["repetitions"][0]["metrics"]
+            ["transaction_observations"][0]
+            .as_object_mut()
+            .expect("observation object")
+            .remove("submission_started");
+        assert!(validate_schema(&missing_started).is_err());
     }
 
     #[test]
@@ -2958,7 +5236,9 @@ mod tests {
             amount: "10000 T".to_string(),
             tx_id: "funding-tx".to_string(),
             height: 101,
-            birthday: Some(1),
+            birthday: Some(3),
+            birthday_height: Some(95),
+            birthday_offset_days: Some(2),
             birthday_start_height: Some(90),
             construction_ms: Some(1),
             broadcast_to_mempool_ms: Some(2),
@@ -2982,17 +5262,8 @@ mod tests {
                 config.network.mode1_base_node_service_peer.as_deref(),
             ),
         );
-        let manifest = json!({
-            "schema_version": 2,
-            "sources": {"harness": {
-                "repository": "test",
-                "upstream": {"revision": "test", "commit": "test", "tree": "test"},
-                "patches": [], "complete_diff_sha256": "test", "result_tree": "test"
-            }},
-            "artifacts": {"harness": {
-                "source": "harness", "source_revision": "test", "source_tree": "test", "sha256": "test"
-            }}
-        });
+        let manifest =
+            serde_json::to_value(crate::build_manifest::portable_manifest_fixture()).unwrap();
         profile
             .config
             .insert("build_manifest".to_string(), manifest.clone());
@@ -3000,7 +5271,12 @@ mod tests {
         profile.provenance.export_build_manifest = manifest;
         profile.config.insert(
             "seed_fingerprints".to_string(),
-            json!({"old_wallet": "a", "new_wallet": "b", "payment_processor": "c"}),
+            json!({
+                "old_wallet": "a",
+                "new_wallet": "b",
+                "payment_processor": "c",
+                "recipient_sink": "d"
+            }),
         );
         profile.completed_stages = REQUIRED_STAGES.iter().map(ToString::to_string).collect();
         profile.base_node.tip_start_height = Some(100);
@@ -3012,6 +5288,7 @@ mod tests {
         profile.base_node.authority_tip_end_height = Some(103);
         profile.base_node.authority_tip_end_hash = Some("bb".repeat(32));
         profile.base_node.pruning_horizon = Some(0);
+        profile.base_node.pruned_height = Some(0);
         profile.base_node.is_synced = Some(true);
 
         for mode in ModeName::ALL {
@@ -3072,6 +5349,11 @@ mod tests {
                         "funding_observation": {
                             "tx_id": "funding-tx",
                             "mined_height": 101,
+                            "birthday": 3,
+                            "H_birth": 95,
+                            "birthday_height": 95,
+                            "birthday_offset_days": 2,
+                            "birthday_start_height": 90,
                             "shared_funding_fee_microtari": 700
                         }
                     })),
@@ -3094,15 +5376,20 @@ mod tests {
                         "scenario_tip_end_height": 100,
                         "balance_before": {"total": 1, "available": 1, "locked": 0, "unconfirmed": 0, "immature": 0, "pending_incoming": 0, "pending_outgoing": 0, "timelocked": 0},
                         "balance_after": {"total": 1, "available": 1, "locked": 0, "unconfirmed": 0, "immature": 0, "pending_incoming": 0, "pending_outgoing": 0, "timelocked": 0},
+                        "outcome_counts": {
+                            "attempted": 1, "accepted": 0, "confirmed": 0,
+                            "rejected": 1, "stalled": 0, "timed_out": 0
+                        },
                         "transaction_observations": [{
                             "transaction_id": null, "attempt_index": 1, "batch_index": null,
                             "batch_id": null,
-                            "submit_offset_ms": 0, "construction_complete_offset_ms": 1,
+                            "submit_offset_ms": 0, "construction_complete_offset_ms": null,
                             "broadcast_start_offset_ms": null,
                             "construction_ms": null, "submission_ms": null,
                             "construction_timing_origin": null,
                             "construction_timing_reason": "construction failed",
                             "submission_timing_origin": null,
+                            "submission_started": true,
                             "mempool_available": null, "mempool_reason": "not submitted",
                             "confirmation_ms": null, "confirmation_timing_origin": null,
                             "confirmation_timing_reason": "not submitted",
@@ -3141,8 +5428,56 @@ mod tests {
                 .insert(mode.as_str().to_string(), mode_profile);
         }
         profile.mark_final();
+        profile.provenance.measurement_commit = "11".repeat(20);
+        profile.provenance.export_commit = "11".repeat(20);
+        profile.provenance.measurement_worktree_clean = true;
+        profile.provenance.export_worktree_clean = true;
+        profile.provenance.measurement_build_worktree_clean = true;
+        profile.provenance.export_build_worktree_clean = true;
         profile.refresh_computed_deltas();
         profile.validate_submission().unwrap();
+
+        let mut missing_disk = profile.clone();
+        missing_disk.environment.disk_kind = None;
+        assert!(
+            missing_disk
+                .validate_submission()
+                .unwrap_err()
+                .to_string()
+                .contains("disk kind and device")
+        );
+
+        for pruned_height in [None, Some(1)] {
+            let mut non_archival = profile.clone();
+            non_archival.base_node.pruned_height = pruned_height;
+            assert!(
+                non_archival
+                    .validate_submission()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pruned_height")
+            );
+        }
+
+        for field in [
+            "birthday",
+            "birthday_height",
+            "birthday_offset_days",
+            "birthday_start_height",
+        ] {
+            let mut missing_truth = serde_json::to_value(&profile).unwrap();
+            missing_truth["funding"]["old_wallet"][field] = Value::Null;
+            assert!(validate_document(&missing_truth, true).is_err(), "{field}");
+        }
+
+        let mut invalid_birthday_order = serde_json::to_value(&profile).unwrap();
+        invalid_birthday_order["funding"]["old_wallet"]["birthday_start_height"] = json!(96);
+        assert!(validate_document(&invalid_birthday_order, true).is_err());
+
+        let mut mismatched_h_birth = serde_json::to_value(&profile).unwrap();
+        mismatched_h_birth["modes"]["old_wallet"]["scenarios"]["S0"]["repetitions"][0]["metrics"]
+            ["funding_observation"]["H_birth"] = json!(94);
+        assert!(validate_document(&mismatched_h_birth, true).is_err());
 
         let mut repeated = serde_json::to_value(&profile).unwrap();
         let second_s0 =

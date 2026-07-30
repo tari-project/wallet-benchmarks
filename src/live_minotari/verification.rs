@@ -399,8 +399,12 @@ pub(super) async fn verify_mode2_transactions_with_client(
         let confirmations = mined_height
             .zip(tip_height)
             .map(|(mined, tip)| tip.saturating_sub(mined));
-        let amount_microtari = parse_amount(config.benchmark.mode2_scenario_amount())
-            .ok()
+        // S1 constructs a normal self-split from the selected input and does
+        // not spend the configured one-payment amount. The scenario summary
+        // binds the exact constructed recipient total to this tx_id.
+        let amount_microtari = (scenario != ScenarioName::S1)
+            .then(|| parse_amount(config.benchmark.mode2_scenario_amount()).ok())
+            .flatten()
             .map(|amount| amount.0);
         result.observed_transactions.push(VerifiedTransaction {
             tx_id: tx_id.clone(),

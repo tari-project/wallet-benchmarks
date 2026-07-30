@@ -1,4 +1,6 @@
 use std::{
+    collections::BTreeSet,
+    ffi::OsString,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -7,6 +9,45 @@ use std::{
 
 use anyhow::Context;
 use tokio::{process::Command, time};
+
+use crate::config::SeedConfig;
+
+const BENCHMARK_SEED_ENV_PREFIX: &str = "HARNESS_SEED_";
+
+pub(crate) fn remove_benchmark_seed_envs(command: &mut Command, seeds: &SeedConfig) {
+    remove_benchmark_seed_envs_from(command, seeds, std::env::vars_os().map(|(name, _)| name));
+}
+
+fn remove_benchmark_seed_envs_from(
+    command: &mut Command,
+    seeds: &SeedConfig,
+    inherited_names: impl IntoIterator<Item = OsString>,
+) {
+    let configured_names = [
+        &seeds.old_wallet_env,
+        &seeds.new_wallet_env,
+        &seeds.payment_processor_env,
+        &seeds.recipient_sink_env,
+    ]
+    .into_iter()
+    .map(OsString::from);
+    let inherited_seed_names = inherited_names
+        .into_iter()
+        .filter(|name| is_benchmark_seed_env_name(name));
+    let names = configured_names
+        .chain(inherited_seed_names)
+        .collect::<BTreeSet<_>>();
+    for name in names {
+        command.env_remove(name);
+    }
+}
+
+fn is_benchmark_seed_env_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.get(..BENCHMARK_SEED_ENV_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BENCHMARK_SEED_ENV_PREFIX))
+    })
+}
 
 pub struct ManagedProcess {
     label: String,
@@ -186,10 +227,56 @@ const fn force_signal() -> i32 {
     0
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn benchmark_seed_environment_is_removed_from_child_command() {
+        let mut seeds = crate::config::Config::default().seeds;
+        seeds.old_wallet_env = "CUSTOM_OLD_SEED".to_string();
+        let mut command = Command::new("unused-test-program");
+        command
+            .env("CUSTOM_OLD_SEED", "old-secret")
+            .env("HARNESS_SEED_UNRELATED", "unrelated-secret")
+            .env("SAFE_CHILD_VALUE", "safe");
+
+        remove_benchmark_seed_envs_from(
+            &mut command,
+            &seeds,
+            [
+                OsString::from("HARNESS_SEED_UNRELATED"),
+                OsString::from("SAFE_CHILD_VALUE"),
+            ],
+        );
+
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(env.get(&OsString::from("CUSTOM_OLD_SEED")), Some(&None));
+        assert_eq!(
+            env.get(&OsString::from("HARNESS_SEED_UNRELATED")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(&OsString::from("SAFE_CHILD_VALUE")),
+            Some(&Some(OsString::from("safe")))
+        );
+    }
+
+    #[test]
+    fn benchmark_seed_prefix_matching_is_case_insensitive() {
+        assert!(is_benchmark_seed_env_name(std::ffi::OsStr::new(
+            "harness_seed_extra"
+        )));
+        assert!(!is_benchmark_seed_env_name(std::ffi::OsStr::new(
+            "HARNESS_WALLET_PW"
+        )));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_reaps_the_managed_process_group() {
         let logs = tempfile::tempdir().unwrap();

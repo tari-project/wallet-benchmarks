@@ -3,7 +3,7 @@ name = "wallet-bench"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
-repository = "https://github.com/tzmWW/tari-wallet-benchmarks"
+repository = "https://github.com/tari-project/wallet-benchmarks"
 
 [features]
 default = []

@@ -136,11 +136,14 @@ pub enum Command {
     ValidateProfile {
         #[arg(long)]
         profile: PathBuf,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["legacy_v5", "legacy_v6"])]
         submission: bool,
         /// Validate a historical schema-v5 profile.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "legacy_v6")]
         legacy_v5: bool,
+        /// Validate a historical schema-v6 profile as non-submission evidence.
+        #[arg(long)]
+        legacy_v6: bool,
     },
     SummarizeProfile {
         #[arg(long)]
@@ -148,8 +151,18 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
         /// Summarize a historical schema-v5 profile.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "legacy_v6")]
         legacy_v5: bool,
+        /// Summarize a historical schema-v6 profile as non-submission evidence.
+        #[arg(long)]
+        legacy_v6: bool,
+    },
+    #[command(name = "__mode2-s4-worker", hide = true)]
+    Mode2S4Worker {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        events: PathBuf,
     },
 }
 
@@ -182,6 +195,30 @@ mod tests {
                 &"aa".repeat(32),
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn hidden_mode2_s4_worker_requires_request_and_event_paths() {
+        assert!(
+            Cli::try_parse_from([
+                "wallet-bench",
+                "__mode2-s4-worker",
+                "--request",
+                "request.json",
+                "--events",
+                "events.jsonl",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "wallet-bench",
+                "__mode2-s4-worker",
+                "--request",
+                "request.json"
+            ])
+            .is_err()
         );
     }
 }

@@ -17,9 +17,18 @@ use crate::{config::Config, seeds::SeedMaterial};
 
 pub use crate::managed_process::ManagedProcess;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct PaymentProcessorEnv {
     pub vars: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for PaymentProcessorEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaymentProcessorEnv")
+            .field("var_names", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 pub fn build_env(config: &Config, pp_seed: &SeedMaterial) -> PaymentProcessorEnv {
@@ -76,23 +85,32 @@ pub fn build_env(config: &Config, pp_seed: &SeedMaterial) -> PaymentProcessorEnv
     );
     vars.insert(
         "BATCH_CREATOR_SLEEP_SECS".to_string(),
-        config.benchmark.mode3_worker_sleep_secs.to_string(),
+        config.benchmark.mode3_batch_creator_sleep_secs.to_string(),
     );
     vars.insert(
         "UNSIGNED_TX_CREATOR_SLEEP_SECS".to_string(),
-        config.benchmark.mode3_worker_sleep_secs.to_string(),
+        config
+            .benchmark
+            .mode3_unsigned_tx_creator_sleep_secs
+            .to_string(),
     );
     vars.insert(
         "TRANSACTION_SIGNER_SLEEP_SECS".to_string(),
-        config.benchmark.mode3_worker_sleep_secs.to_string(),
+        config
+            .benchmark
+            .mode3_transaction_signer_sleep_secs
+            .to_string(),
     );
     vars.insert(
         "BROADCASTER_SLEEP_SECS".to_string(),
-        config.benchmark.mode3_worker_sleep_secs.to_string(),
+        config.benchmark.mode3_broadcaster_sleep_secs.to_string(),
     );
     vars.insert(
         "CONFIRMATION_CHECKER_SLEEP_SECS".to_string(),
-        config.benchmark.mode3_worker_sleep_secs.to_string(),
+        config
+            .benchmark
+            .mode3_confirmation_checker_sleep_secs
+            .to_string(),
     );
     vars.insert(
         "CONFIRMATION_CHECKER_REQUIRED_CONFIRMATIONS".to_string(),
@@ -147,6 +165,7 @@ pub async fn ensure_console_wallet_base(
     }
     fs::create_dir_all(&base_path)?;
     let mut command = Command::new(&config.paths.minotari_console_wallet);
+    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
     command
         .env("MINOTARI_WALLET_SEED_WORDS", &pp_seed.seed_words)
         .env("MINOTARI_WALLET_PASSWORD", password)
@@ -209,6 +228,7 @@ pub async fn start_payment_receiver(
 fn payment_receiver_command(config: &Config, password: &str, db_path: &Path) -> Command {
     let api_port = listen_port(&config.modes.payment_receiver_listen, 9146);
     let mut command = Command::new(&config.paths.minotari_binary);
+    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
     command
         .env("MINOTARI_WALLET_PASSWORD", password)
         .arg("--network")
@@ -224,7 +244,12 @@ fn payment_receiver_command(config: &Config, password: &str, db_path: &Path) -> 
         // The companion wallet must refresh after each confirmed PP batch so
         // the bounty's per-round UTXO and balance invariants observe current
         // state. This is wallet-state refresh, not transaction retry/backoff.
-        .arg(config.benchmark.mode3_worker_sleep_secs.to_string())
+        .arg(
+            config
+                .benchmark
+                .mode3_payment_receiver_scan_interval_secs
+                .to_string(),
+        )
         .arg("--api-port")
         .arg(api_port.to_string());
     command
@@ -244,6 +269,7 @@ pub async fn start_payment_processor(
         .open(&db_path)
         .with_context(|| format!("creating PP database file {}", db_path.display()))?;
     let mut command = Command::new(&config.paths.payment_processor_binary);
+    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
     command.envs(&env.vars);
     ManagedProcess::spawn(
         "mode3-payment-processor",
@@ -992,7 +1018,7 @@ pub fn build_fetch_command(cache_dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use crate::{
         config::Config,
@@ -1002,9 +1028,31 @@ mod tests {
     use tari_common_types::seeds::cipher_seed::CipherSeed;
 
     use super::{
-        build_env, inspect_payment_processor_db, payment_processor_db_path,
+        PaymentProcessorEnv, build_env, inspect_payment_processor_db, payment_processor_db_path,
         payment_receiver_command, payment_receiver_db_path,
     };
+
+    #[test]
+    fn pp_env_debug_redacts_values() {
+        let env = PaymentProcessorEnv {
+            vars: BTreeMap::from([
+                (
+                    "CONSOLE_WALLET_PASSWORD".to_string(),
+                    "test-secret-password".to_string(),
+                ),
+                (
+                    "ACCOUNTS__DEFAULT__VIEW_KEY".to_string(),
+                    "test-private-view-key".to_string(),
+                ),
+            ]),
+        };
+
+        let debug = format!("{env:?}");
+        assert!(debug.contains("CONSOLE_WALLET_PASSWORD"));
+        assert!(debug.contains("ACCOUNTS__DEFAULT__VIEW_KEY"));
+        assert!(!debug.contains("test-secret-password"));
+        assert!(!debug.contains("test-private-view-key"));
+    }
 
     #[test]
     fn pp_env_uses_private_view_key() {
@@ -1022,6 +1070,32 @@ mod tests {
         );
         assert!(env.vars.contains_key("CONSOLE_WALLET_PASSWORD"));
         assert_eq!(env.vars.get("FEE_PER_GRAM").map(String::as_str), Some("5"));
+        assert_eq!(
+            env.vars.get("BATCH_CREATOR_SLEEP_SECS").map(String::as_str),
+            Some("15")
+        );
+        assert_eq!(
+            env.vars
+                .get("UNSIGNED_TX_CREATOR_SLEEP_SECS")
+                .map(String::as_str),
+            Some("15")
+        );
+        assert_eq!(
+            env.vars
+                .get("TRANSACTION_SIGNER_SLEEP_SECS")
+                .map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            env.vars.get("BROADCASTER_SLEEP_SECS").map(String::as_str),
+            Some("15")
+        );
+        assert_eq!(
+            env.vars
+                .get("CONFIRMATION_CHECKER_SLEEP_SECS")
+                .map(String::as_str),
+            Some("60")
+        );
     }
 
     #[test]
@@ -1040,6 +1114,35 @@ mod tests {
             name == "MINOTARI_WALLET_PASSWORD"
                 && value.is_some_and(|value| value == "test-secret-password")
         }));
+        for seed_env in [
+            &cfg.seeds.old_wallet_env,
+            &cfg.seeds.new_wallet_env,
+            &cfg.seeds.payment_processor_env,
+            &cfg.seeds.recipient_sink_env,
+        ] {
+            assert!(command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new(seed_env) && value.is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn payment_receiver_scan_interval_is_not_a_processor_worker_cadence() {
+        let mut cfg = Config::default();
+        cfg.benchmark.mode3_batch_creator_sleep_secs = 99;
+        cfg.benchmark.mode3_payment_receiver_scan_interval_secs = 11;
+        let db_path = payment_receiver_db_path(&cfg);
+        let command = payment_receiver_command(&cfg, "test-secret-password", &db_path);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let scan_interval = args
+            .windows(2)
+            .find(|pair| pair[0] == "--scan-interval-secs")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(scan_interval, Some("11"));
     }
 
     #[test]

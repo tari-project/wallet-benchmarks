@@ -3,8 +3,9 @@
 ## Verdict
 
 The uncapped `baseline-20260727T110514Z` run was promoted with explicit,
-hash-bound reporting reconciliation. The promoted schema-v6 profile is
-`baselines/esmeralda_baseline.json` and passes strict submission validation.
+hash-bound reporting reconciliation. The historical schema-v6 profile is
+`baselines/esmeralda_baseline.json`; it passed its then-current validation but
+does not pass the current schema-v7 submission gate.
 It used the former Minotari scanner and exact-output behavioral patches and is
 therefore preserved as historical patched-wallet evidence, not the canonical
 upstream-wallet comparison after the 2026-07-30 protocol correction.

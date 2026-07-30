@@ -1,0 +1,2 @@
+[env]
+TARI_TARGET_NETWORK = { value = "testnet", force = true }

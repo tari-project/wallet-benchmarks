@@ -42,12 +42,12 @@ pub(crate) const EXPECTED_SOURCES: &[ExpectedSource] = &[
     ExpectedSource {
         name: "minotari_node",
         repository: "https://github.com/tari-project/tari.git",
-        upstream_revision: "v5.4.0",
-        upstream_commit: "03e7ccd3257d669f8d73662bb214602fe0987c17",
-        upstream_tree: "cd365137e77901f5ddcc484ef0d2faf3c042c8bf",
+        upstream_revision: "v5.5.0",
+        upstream_commit: "b32dba96aa0d4ffdd715a0bb724f69c567d47d9f",
+        upstream_tree: "449b76bc4121400265927561a661c5c381d55bcd",
         patches: &[],
         complete_diff_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        result_tree: "cd365137e77901f5ddcc484ef0d2faf3c042c8bf",
+        result_tree: "449b76bc4121400265927561a661c5c381d55bcd",
     },
     ExpectedSource {
         name: "payment_processor",
@@ -81,8 +81,8 @@ pub(crate) const EXPECTED_ARTIFACTS: &[ExpectedArtifact] = &[
     ExpectedArtifact {
         name: "minotari_node",
         source: "minotari_node",
-        source_revision: "v5.4.0",
-        source_tree: "cd365137e77901f5ddcc484ef0d2faf3c042c8bf",
+        source_revision: "v5.5.0",
+        source_tree: "449b76bc4121400265927561a661c5c381d55bcd",
     },
     ExpectedArtifact {
         name: "minotari_payment_processor",
@@ -94,12 +94,8 @@ pub(crate) const EXPECTED_ARTIFACTS: &[ExpectedArtifact] = &[
 "#;
 
 fn main() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = fs::read_to_string(".git/HEAD")
-        && let Some(reference) = head.trim().strip_prefix("ref: ")
-    {
-        println!("cargo:rerun-if-changed=.git/{reference}");
-    }
+    track_git_revision_inputs();
+    println!("cargo:rerun-if-env-changed=GIT_COMMIT");
 
     for (path, expected) in PATCHES {
         println!("cargo:rerun-if-changed={path}");
@@ -112,21 +108,10 @@ fn main() {
     )
     .expect("writing embedded build provenance");
 
-    let commit = std::env::var("GIT_COMMIT").ok().or_else(|| {
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|commit| commit.trim().to_string())
-    });
+    println!("cargo:rustc-env=GIT_COMMIT={}", resolve_git_commit());
     println!(
-        "cargo:rustc-env=GIT_COMMIT={}",
-        commit
-            .filter(|commit| !commit.is_empty())
-            .as_deref()
-            .unwrap_or("unknown")
+        "cargo:rustc-env=GIT_WORKTREE_CLEAN_AT_BUILD={}",
+        resolve_git_worktree_clean()
     );
 }
 
@@ -140,4 +125,107 @@ fn verify_patch_hash(path: &Path, expected: &str) {
         "tracked patch {} does not match its immutable expected SHA-256",
         path.display()
     );
+}
+
+fn track_git_revision_inputs() {
+    for pathspec in ["HEAD", "packed-refs", "index"] {
+        if let Some(path) = git_output(&["rev-parse", "--git-path", pathspec]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git_output(&["rev-parse", "--git-path", &reference])
+    {
+        println!("cargo:rerun-if-changed={path}");
+    }
+
+    // Once a build script emits any rerun-if-changed directive, Cargo stops
+    // using its default package-wide change detection. Track every versioned
+    // file so an unstaged source edit cannot reuse a prior clean-at-build
+    // attestation.
+    let Some(paths) = git_output_bytes(&["ls-files", "-z"]) else {
+        // A non-Git source archive can still build, but
+        // resolve_git_worktree_clean() will make its attestation fail closed.
+        return;
+    };
+    for path in paths.split(|byte| *byte == b'\0') {
+        if path.is_empty() {
+            continue;
+        }
+        let path = std::str::from_utf8(path).expect("tracked build provenance paths must be UTF-8");
+        assert!(
+            !path.contains('\r') && !path.contains('\n'),
+            "tracked build provenance paths must not contain newlines"
+        );
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+fn resolve_git_worktree_clean() -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+        )
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| output.stdout.is_empty())
+}
+
+fn resolve_git_commit() -> String {
+    let supplied = std::env::var("GIT_COMMIT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if let Some(actual) = git_output(&["rev-parse", "--verify", "HEAD"]) {
+        assert!(
+            is_lowercase_sha1(&actual),
+            "git rev-parse HEAD did not return a lowercase 40-character object ID"
+        );
+        if let Some(supplied) = supplied {
+            assert!(
+                is_lowercase_sha1(&supplied),
+                "GIT_COMMIT must be lowercase 40-character hexadecimal"
+            );
+            assert_eq!(
+                supplied, actual,
+                "GIT_COMMIT does not match the checked-out git HEAD"
+            );
+        }
+        return actual;
+    }
+    match supplied {
+        Some(supplied) => {
+            assert!(
+                is_lowercase_sha1(&supplied),
+                "GIT_COMMIT must be lowercase 40-character hexadecimal"
+            );
+            supplied
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    String::from_utf8(git_output_bytes(args)?)
+        .ok()
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+}
+
+fn git_output_bytes(args: &[&str]) -> Option<Vec<u8>> {
+    Command::new("git")
+        .args(args)
+        .current_dir(std::env::var_os("CARGO_MANIFEST_DIR")?)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+}
+
+fn is_lowercase_sha1(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

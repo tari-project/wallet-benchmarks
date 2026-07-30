@@ -33,7 +33,12 @@ mode3_payment_amount = "1 T"
 mode3_live_max_s1_batches = 0
 mode3_live_max_s4_batch = 0
 mode3_live_max_s5_items = 0
-mode3_worker_sleep_secs = 10
+mode3_batch_creator_sleep_secs = 15
+mode3_unsigned_tx_creator_sleep_secs = 15
+mode3_transaction_signer_sleep_secs = 10
+mode3_broadcaster_sleep_secs = 15
+mode3_confirmation_checker_sleep_secs = 60
+mode3_payment_receiver_scan_interval_secs = 10
 
 [paths]
 data_dir = ".bench-data/candidate"
@@ -48,6 +53,7 @@ build_manifest = "tools/build-manifest.json"
 old_wallet_env = "HARNESS_SEED_OLD"
 new_wallet_env = "HARNESS_SEED_NEW"
 payment_processor_env = "HARNESS_SEED_PP"
+recipient_sink_env = "HARNESS_SEED_RECIPIENT_SINK"
 wallet_password_env = "HARNESS_WALLET_PW"
 
 [modes]
@@ -60,7 +66,7 @@ payment_receiver_listen = "127.0.0.1:9146"
 minotari_cli_rev = "360c4848a54d65fd710266233cc9277b0f785e74"
 tari_console_wallet_rev = "9f5adb7183dc2ec285f5c8fae05f4be9735d9749"
 payment_processor_rev = "f0572c98cbfac7377412dc6d4094c7d7dfc5de2c"
-base_node_rev = "v5.4.0"
+base_node_rev = "v5.5.0"
 
 [timeouts]
 startup_secs = 21600

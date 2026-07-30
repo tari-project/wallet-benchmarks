@@ -18,20 +18,22 @@ jobs:
         run: |
           scripts/fetch-minotari-cli.sh --verify-only .bench-cache tools
           scripts/fetch-payment-processor.sh --verify-only .bench-cache tools
+      - name: Verify emitted build-manifest claims
+        run: cargo test --locked build_manifest::tests::emitted_manifest_claims_match_embedded_provenance -- --exact
       - name: Format
         run: cargo fmt --check
       - name: Check
-        run: cargo check --all-features
+        run: cargo check --locked --all-features
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test default features
-        run: cargo test
+        run: cargo test --locked
       - name: Test all features
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - name: ast-grep
         run: ast-grep scan
       - name: Generated schema is current
-        run: cargo run -- schema --out RESULT_PROFILE_SCHEMA.json && git diff --exit-code -- RESULT_PROFILE_SCHEMA.json
+        run: cargo run --locked -- schema --out RESULT_PROFILE_SCHEMA.json && git diff --exit-code -- RESULT_PROFILE_SCHEMA.json
       - name: Verify committed baseline integrity
         run: |
           scripts/correct-profile.py \
@@ -39,13 +41,16 @@ jobs:
             --manifest analysis/reconciliation/esmeralda_baseline.correction.json \
             --out /tmp/esmeralda_baseline.verified.json
           cmp baselines/esmeralda_baseline.json /tmp/esmeralda_baseline.verified.json
-      - name: Validate committed baseline
-        run: cargo run -- validate-profile --profile baselines/esmeralda_baseline.json --submission
-      - name: Verify committed summary
+      - name: Validate committed historical baseline
+        run: cargo run --locked -- validate-profile --profile baselines/esmeralda_baseline.json --legacy-v6
+      - name: Verify committed historical summary
         run: |
-          cargo run -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.md
+          cargo run --locked -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.md --legacy-v6
           cmp baselines/esmeralda_baseline.summary.md /tmp/esmeralda_baseline.summary.md
       - name: Reject tracked secret artifacts
-        run: test -z "$(git ls-files '*.env' '*.db' '*.sqlite' '.secrets/**')"
+        run: |
+          test -z "$(git ls-files \
+            '*.env' '*.db' '*.sqlite' '*.sqlite3' '*.pem' '*.key' \
+            '*.prepared-transaction.json' '.secrets/**' 'harness.toml')"
       - name: Diff hygiene
         run: git diff --check

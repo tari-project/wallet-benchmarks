@@ -18,21 +18,9 @@ CACHE_DIR="${POSITIONAL[0]:-.bench-cache}"
 TOOLS_DIR="${POSITIONAL[1]:-tools}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${SCRIPT_DIR}/../patches"
-
-MINOTARI_REPO="https://github.com/tari-project/minotari-cli.git"
-MINOTARI_BASE_REV="360c4848a54d65fd710266233cc9277b0f785e74"
-MINOTARI_BASE_TREE="e9bbd1fb7b538e213e17c2986b85940435adce26"
-MINOTARI_FINAL_TREE="cf6acf000f787817a795668c93470b139970feb6"
-MINOTARI_COMPLETE_DIFF_SHA256="118dbe659efed99528159e56f509a01f5a9b789ea57a9ea3267e2b60fbf0d144"
+source "${SCRIPT_DIR}/build-provenance.sh"
 MINOTARI_DIR="${CACHE_DIR}/minotari-cli"
 
-TARI_REPO="https://github.com/tari-project/tari.git"
-TARI_CONSOLE_WALLET_REV="9f5adb7183dc2ec285f5c8fae05f4be9735d9749"
-TARI_CONSOLE_WALLET_COMMIT="9f5adb7183dc2ec285f5c8fae05f4be9735d9749"
-TARI_CONSOLE_WALLET_TREE="be2020d2eb904507fa20442448ef76b6e8f0d502"
-TARI_NODE_REV="v5.4.0"
-TARI_NODE_COMMIT="03e7ccd3257d669f8d73662bb214602fe0987c17"
-TARI_NODE_TREE="cd365137e77901f5ddcc484ef0d2faf3c042c8bf"
 TARI_DIR="${CACHE_DIR}/tari"
 
 sha256_file() {
@@ -122,8 +110,8 @@ trap cleanup_minotari EXIT
 
 apply_minotari_patch \
   "minotari-wallet-password-env.patch" \
-  "fa49b2d0fa25ae31e2fdc9e17f85ca67a9a0206b9a62192d1b632d14b67888a6" \
-  "${MINOTARI_FINAL_TREE}"
+  "${MINOTARI_PASSWORD_PATCH_SHA256}" \
+  "${MINOTARI_RESULT_TREE}"
 
 git -C "${MINOTARI_DIR}" diff --cached --check
 if ! git -C "${MINOTARI_DIR}" diff --quiet; then
@@ -154,24 +142,24 @@ verify_checkout \
 if [ "${VERIFY_ONLY}" = true ]; then
   verify_checkout "${TARI_DIR}" "${TARI_NODE_REV}" "${TARI_NODE_COMMIT}" "${TARI_NODE_TREE}" "Tari node"
   printf 'source provenance PASS: minotari base %s + runtime-only password patch -> %s; console %s; node %s\n' \
-    "${MINOTARI_BASE_REV}" "${MINOTARI_FINAL_TREE}" "${TARI_CONSOLE_WALLET_REV}" "${TARI_NODE_REV}"
+    "${MINOTARI_BASE_REV}" "${MINOTARI_RESULT_TREE}" "${TARI_CONSOLE_WALLET_REV}" "${TARI_NODE_REV}"
   exit 0
 fi
 
 (
   cd "${MINOTARI_DIR}"
-  cargo build --release --bin minotari
+  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari
 )
 
 (
   cd "${TARI_DIR}"
-  cargo build --release --bin minotari_console_wallet
+  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_console_wallet
 )
 
 verify_checkout "${TARI_DIR}" "${TARI_NODE_REV}" "${TARI_NODE_COMMIT}" "${TARI_NODE_TREE}" "Tari node"
 (
   cd "${TARI_DIR}"
-  cargo build --release --bin minotari_node
+  env TARI_TARGET_NETWORK=testnet cargo +"${RUST_TOOLCHAIN}" build --release --locked --bin minotari_node
 )
 
 mkdir -p "${TOOLS_DIR}"

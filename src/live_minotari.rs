@@ -22,9 +22,9 @@ use minotari::{
     utils::init_wallet::{init_with_seed_words, init_with_view_key},
 };
 use minotari_wallet_grpc_client::{WalletGrpcClient, grpc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use tari_common::configuration::Network;
-use tari_common_types::seeds::cipher_seed::CipherSeed;
+use tari_common_types::seeds::cipher_seed::{BIRTHDAY_GENESIS_FROM_UNIX_EPOCH, CipherSeed};
 use tari_common_types::tari_address::TariAddress;
 use tari_transaction_components::{
     MicroMinotari,
@@ -39,12 +39,15 @@ use tokio::{process::Command, task::JoinSet, time};
 mod mode1;
 mod mode2;
 mod mode3;
+mod s4_worker;
 mod scan;
 mod verification;
 
+const S0_SOURCE_FUNDING_PURPOSE: &str = "s0_source_funding";
+
 use mode1::{
-    annotate_mode1_console_wallet, exact_pp_split_with_change, grpc_bind_multiaddr,
-    mode1_scan_grpc_address, mode1_unspent_count, old_wallet_base_path,
+    Mode1ScanTimeout, annotate_mode1_console_wallet, exact_pp_split_with_change,
+    grpc_bind_multiaddr, mode1_scan_grpc_address, mode1_unspent_count, old_wallet_base_path,
     send_mode1_operator_one_sided, start_mode1_console_wallet_with_recovery,
     wait_for_mode1_grpc_address, wait_for_mode1_scan_to_tip, write_mode1_runtime_config,
 };
@@ -97,6 +100,12 @@ use crate::{
     versions::TX_MINED_CONFIRMED_STATUS,
 };
 
+pub(super) const STOCK_BIRTHDAY_OFFSET_DAYS: u16 = 2;
+
+pub async fn run_mode2_s4_worker(request_path: &Path, events_path: &Path) -> anyhow::Result<()> {
+    s4_worker::run_worker(request_path, events_path).await
+}
+
 pub async fn scan_wallet_db(
     config: &Config,
     db_path: &Path,
@@ -125,8 +134,7 @@ pub async fn scan_wallet_db(
             if hex::decode(hash).is_err() || hash.len() != 64 {
                 bail!("--target-hash must be a 32-byte hexadecimal block hash");
             }
-            let mut progress = ScanProgress::default();
-            scan_to_fixed_tip(
+            refresh_wallet_to_fixed_tip(
                 db_path,
                 &password,
                 &config.network.base_node_http_url,
@@ -137,13 +145,11 @@ pub async fn scan_wallet_db(
                     height,
                     hash: hash.to_lowercase(),
                 },
-                &mut progress,
-                true,
             )
             .await?
         }
         (None, None) => {
-            scan_to_tip(
+            refresh_wallet_to_tip(
                 db_path,
                 &password,
                 &config.network.base_node_http_url,
@@ -300,7 +306,7 @@ async fn annotate_mode2_s0(
     ensure_signing_wallet(db_path, &seed.seed_words, &config.seeds.wallet_password_env)?;
 
     let s0_start = Instant::now();
-    let scan = scan_to_tip(
+    let scan = refresh_wallet_to_tip(
         db_path,
         &wallet_password(&config.seeds.wallet_password_env)?,
         &config.network.base_node_http_url,
@@ -554,7 +560,7 @@ pub fn ensure_signing_wallet(
     .context("initializing minotari signing wallet")
 }
 
-pub async fn scan_to_tip(
+pub async fn refresh_wallet_to_tip(
     db_path: &Path,
     password: &str,
     base_url: &str,
@@ -563,8 +569,30 @@ pub async fn scan_to_tip(
     scan_timeout: Duration,
 ) -> anyhow::Result<ScanToTipReport> {
     let target = base_node_tip_snapshot(base_url).await?;
+    refresh_wallet_to_fixed_tip(
+        db_path,
+        password,
+        base_url,
+        batch_size,
+        required_confirmations,
+        scan_timeout,
+        target,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_wallet_to_fixed_tip(
+    db_path: &Path,
+    password: &str,
+    base_url: &str,
+    batch_size: u64,
+    required_confirmations: u64,
+    scan_timeout: Duration,
+    target: ChainTipSnapshot,
+) -> anyhow::Result<ScanToTipReport> {
     let mut progress = ScanProgress::default();
-    scan_to_fixed_tip(
+    let report = scan_to_fixed_tip(
         db_path,
         password,
         base_url,
@@ -575,7 +603,9 @@ pub async fn scan_to_tip(
         &mut progress,
         true,
     )
-    .await
+    .await?;
+    require_complete_operational_refresh(&report)?;
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,52 +648,43 @@ async fn scan_to_fixed_tip(
         });
     }
 
-    let deadline = time::Instant::now() + scan_timeout;
-    let mut consecutive_no_progress = 0;
-    let mut last_more_blocks = None;
-    while cursor.max_height < target_tip {
-        let remaining = deadline
-            .checked_duration_since(time::Instant::now())
-            .context("wallet scan exceeded its total deadline")?;
-        let previous_height = cursor.max_height;
-        let max_blocks = target_tip - previous_height;
-        let scan = Scanner::new(
-            password,
-            base_url,
-            db_path.to_path_buf(),
-            batch_size,
-            required_confirmations,
-        )
-        .account("default")
-        .mode(ScanMode::Partial { max_blocks })
-        .run();
-        let (_, more_blocks) = time::timeout(remaining, scan)
-            .await
-            .context("wallet scan exceeded its total deadline")?
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        progress.invocations += 1;
-        last_more_blocks = Some(more_blocks);
-        cursor = account_snapshot(db_path)?;
-        if cursor.max_height > target_tip {
-            bail!(
-                "wallet scan overshot fixed target {target_tip}: persisted cursor {}",
-                cursor.max_height
-            );
-        }
-        if cursor.max_height == previous_height {
-            progress.no_progress_attempts += 1;
-            consecutive_no_progress += 1;
-            if consecutive_no_progress >= 3 {
-                bail!(
-                    "wallet scanner returned three times without progress below fixed target {target_tip} (cursor {})",
-                    cursor.max_height
-                );
+    let previous_height = cursor.max_height;
+    let max_blocks = target_tip - previous_height;
+    let scan = Scanner::new(
+        password,
+        base_url,
+        db_path.to_path_buf(),
+        batch_size,
+        required_confirmations,
+    )
+    .account("default")
+    .mode(ScanMode::Partial { max_blocks })
+    .run();
+    progress.invocations += 1;
+    let (_, more_blocks) = match time::timeout(scan_timeout, scan).await {
+        Ok(result) => result.map_err(|error| anyhow::anyhow!("{error}"))?,
+        Err(_) => {
+            return Err(ScanDeadlineExceeded {
+                timeout: scan_timeout,
+                wall_ms: start.elapsed().as_millis(),
+                target_tip,
+                initial_height: previous_height,
             }
-        } else {
-            consecutive_no_progress = 0;
+            .into());
         }
+    };
+    cursor = account_snapshot(db_path)?;
+    if cursor.max_height > target_tip {
+        bail!(
+            "wallet scan overshot fixed target {target_tip}: persisted cursor {}",
+            cursor.max_height
+        );
     }
-    if require_matching_cursor_hash {
+    let stopped_without_progress = cursor.max_height == previous_height;
+    if stopped_without_progress {
+        progress.no_progress_attempts += 1;
+    }
+    if require_matching_cursor_hash && cursor.max_height == target_tip {
         require_cursor_hash(&cursor, &target)?;
     }
     let canonical_hash = base_node_header_hash(base_url, target_tip).await?;
@@ -685,8 +706,8 @@ async fn scan_to_fixed_tip(
         cursor_hash: cursor.hash,
         scan_invocations: progress.invocations,
         no_progress_attempts: progress.no_progress_attempts,
-        stopped_without_progress: false,
-        last_more_blocks,
+        stopped_without_progress,
+        last_more_blocks: Some(more_blocks),
     })
 }
 
@@ -697,6 +718,26 @@ fn require_cursor_hash(cursor: &AccountSnapshot, target: &ChainTipSnapshot) -> a
             target.height,
             target.hash,
             cursor.hash.as_deref().unwrap_or("missing")
+        );
+    }
+    Ok(())
+}
+
+fn require_complete_operational_refresh(report: &ScanToTipReport) -> anyhow::Result<()> {
+    if report.max_height != report.target_tip {
+        bail!(
+            "operational wallet refresh returned below fixed target {}: persisted cursor {}; scanner was invoked {} time(s) and will not be retried",
+            report.target_tip,
+            report.max_height,
+            report.scan_invocations
+        );
+    }
+    if report.cursor_hash.as_deref() != Some(report.target_hash.as_str()) {
+        bail!(
+            "operational wallet refresh cursor hash mismatch at fixed target {}: expected {}, observed {}",
+            report.target_tip,
+            report.target_hash,
+            report.cursor_hash.as_deref().unwrap_or("missing")
         );
     }
     Ok(())
@@ -1029,7 +1070,9 @@ fn add_s0_funding_observation(
             "tx_id": funding.map(|record| record.tx_id.as_str()),
             "mined_height": funding.map(|record| record.height),
             "birthday": funding.and_then(|record| record.birthday).or(wallet_birthday),
-            "H_birth": funding.and_then(|record| record.birthday_start_height),
+            "H_birth": funding.and_then(|record| record.birthday_height),
+            "birthday_height": funding.and_then(|record| record.birthday_height),
+            "birthday_offset_days": funding.and_then(|record| record.birthday_offset_days),
             "birthday_start_height": funding.and_then(|record| record.birthday_start_height),
             "construction_ms": funding.and_then(|record| record.construction_ms),
             "broadcast_to_mempool_ms": funding.and_then(|record| record.broadcast_to_mempool_ms),
@@ -1181,6 +1224,7 @@ pub struct OneSidedSendRequest<'a> {
     pub confirmation_window: u64,
     pub request_timeout: Duration,
     pub tip_height_at_broadcast: Option<u64>,
+    pub(crate) prepared_transaction_binding: Option<&'a PreparedTransactionBinding>,
 }
 
 #[derive(Clone)]
@@ -1195,6 +1239,7 @@ struct OwnedOneSidedSendRequest {
     confirmation_window: u64,
     request_timeout: Duration,
     tip_height_at_broadcast: Option<u64>,
+    prepared_transaction_binding: Option<PreparedTransactionBinding>,
 }
 
 impl OwnedOneSidedSendRequest {
@@ -1210,6 +1255,7 @@ impl OwnedOneSidedSendRequest {
             confirmation_window: self.confirmation_window,
             request_timeout: self.request_timeout,
             tip_height_at_broadcast: self.tip_height_at_broadcast,
+            prepared_transaction_binding: self.prepared_transaction_binding.as_ref(),
         }
     }
 }
@@ -1227,6 +1273,64 @@ pub struct OneSidedSendOutcome {
     pub recipient: String,
 }
 
+#[derive(Debug, Clone)]
+struct OneSidedSubmissionIdentity {
+    tx_id: String,
+    fee_microtari: u64,
+    construction_ms: u128,
+    broadcast_start_offset_ms: u128,
+}
+
+#[derive(Clone, Copy)]
+enum OneSidedSubmissionProgress {
+    Prepared,
+    SubmissionStarted,
+}
+
+type OneSidedSubmissionObserver = dyn Fn(OneSidedSubmissionProgress, &OneSidedSubmissionIdentity) -> anyhow::Result<()>
+    + Send
+    + Sync;
+
+#[derive(Debug)]
+struct OneSidedSubmissionFailure {
+    identity: Option<OneSidedSubmissionIdentity>,
+    submission_started: bool,
+    submission_elapsed_ms: Option<u128>,
+    failure_class: ObservationFailureClass,
+    message: String,
+}
+
+impl OneSidedSubmissionFailure {
+    fn arm_deadline(
+        identity: Option<OneSidedSubmissionIdentity>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            identity,
+            submission_started: false,
+            submission_elapsed_ms: None,
+            failure_class: ObservationFailureClass::ArmDeadline,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for OneSidedSubmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(identity) = &self.identity {
+            write!(
+                formatter,
+                "{} (tx_id={}, submission_started={})",
+                self.message, identity.tx_id, self.submission_started
+            )
+        } else {
+            formatter.write_str(&self.message)
+        }
+    }
+}
+
+impl std::error::Error for OneSidedSubmissionFailure {}
+
 #[derive(Default)]
 struct ScenarioSendSummary {
     attempted: u32,
@@ -1240,6 +1344,8 @@ struct ScenarioSendSummary {
     construction_complete_ms: Vec<u128>,
     tx_timings: Vec<serde_json::Value>,
     tx_infos: Vec<VerifiedTransaction>,
+    constructed_amounts_microtari: BTreeMap<String, u64>,
+    constructed_output_shapes: BTreeMap<String, ConstructedOutputShape>,
     confirmation_observed_offsets_ms: BTreeMap<String, u128>,
     tip_start_height: Option<u64>,
     tip_end_height: Option<u64>,
@@ -1310,6 +1416,7 @@ struct Mode1TransferSummary {
     tip_start_height: Option<u64>,
     tip_end_height: Option<u64>,
     transaction_shapes: BTreeMap<String, TransactionShape>,
+    constructed_output_shapes: BTreeMap<String, ConstructedOutputShape>,
 }
 
 #[derive(Default)]
@@ -1345,7 +1452,6 @@ struct Mode3TopologyContext {
     client: PaymentProcessorClient,
     receiver_balance: serde_json::Value,
     processor_version: String,
-    worker_sleep_secs: u64,
     receiver_birthday: u16,
 }
 
@@ -1404,6 +1510,13 @@ struct TransactionShape {
     input_count: u32,
     total_output_count: u32,
     output_commitments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct ConstructedOutputShape {
+    payment_output_count: u32,
+    change_output_count: u32,
+    total_output_count: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -1472,6 +1585,28 @@ fn s1_round_plan(config: &Config, cap: u32) -> Vec<S1RoundPlan> {
     plans
 }
 
+fn record_s1_preflight_failure(
+    metrics: &mut serde_json::Map<String, serde_json::Value>,
+    round_index: u32,
+    attempted_index: Option<u32>,
+    stage: &str,
+    error: &str,
+) {
+    let failures = metrics
+        .entry("preflight_failures".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    failures
+        .as_array_mut()
+        .expect("preflight_failures is owned by the harness")
+        .push(serde_json::json!({
+            "round_index": round_index,
+            "attempted_index": attempted_index,
+            "stage": stage,
+            "submission_started": false,
+            "error": error
+        }));
+}
+
 fn max_serialization_gap_ms(mut completions: Vec<u128>) -> Option<u128> {
     if completions.len() < 2 {
         return None;
@@ -1527,15 +1662,41 @@ fn s4_arms_metrics(
             })
             .collect::<Vec<_>>();
         let distinct_recipients = recipients.iter().collect::<BTreeSet<_>>().len();
-        let serialization_offsets = if mode == "new_wallet" {
-            arm_observations
-                .iter()
-                .filter_map(|observation| observation["broadcast_start_offset_ms"].as_u64())
-                .map(u128::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let serialization_offsets = arm_observations
+            .iter()
+            .filter(|observation| {
+                observation["construction_timing_origin"]
+                    .as_str()
+                    .is_some_and(|origin| match mode {
+                        "new_wallet" => origin.starts_with("library_build_and_sign"),
+                        "payment_processor" => {
+                            origin == "payment_processor_db_unsigned_tx_first_observation"
+                        }
+                        _ => false,
+                    })
+            })
+            .filter_map(|observation| observation["construction_complete_offset_ms"].as_u64())
+            .map(u128::from)
+            .collect::<Vec<_>>();
+        let max_serialization_gap_ms = max_serialization_gap_ms(serialization_offsets.clone());
+        let serialization_timing_reason = max_serialization_gap_ms.is_none().then_some({
+            if serialization_offsets.len() == 1 {
+                "only one genuine construction-complete observation was available; at least two are required to calculate a serialization gap"
+            } else {
+                match mode {
+                    "old_wallet" => {
+                        "console-wallet gRPC does not expose a genuine construction-complete event"
+                    }
+                    "payment_processor" => {
+                        "no persisted payment-processor unsigned_tx_json transition was observed during the measured arm"
+                    }
+                    "new_wallet" => {
+                        "no genuine library build-and-sign construction-complete event was observed"
+                    }
+                    _ => "no genuine construction-complete event was observed",
+                }
+            }
+        });
         arms.push(serde_json::json!({
             "configured_batch": configured_batch,
             "wall_ms": summary["wall_ms"],
@@ -1547,8 +1708,8 @@ fn s4_arms_metrics(
             "timed_out": terminal("timed_out"),
             "confirmed_success_rate": (attempted > 0).then(|| f64::from(confirmed) / f64::from(attempted)),
             "api_acceptance_rate": (attempted > 0).then(|| f64::from(accepted) / f64::from(attempted)),
-            "max_serialization_gap_ms": (mode == "new_wallet").then(|| max_serialization_gap_ms(serialization_offsets)).flatten(),
-            "serialization_timing_reason": (mode != "new_wallet").then_some("wallet surface does not expose internal construction-complete events"),
+            "max_serialization_gap_ms": max_serialization_gap_ms,
+            "serialization_timing_reason": serialization_timing_reason,
             "recipients": recipients,
             "distinct_recipient_count": distinct_recipients,
             "recipients_are_distinct": distinct_recipients == attempted as usize,
@@ -1716,7 +1877,7 @@ impl PpScenarioSummary {
         &mut self,
         batch_index: u32,
         submit_offset_ms: u128,
-        construction_complete_offset_ms: u128,
+        api_response_offset_ms: u128,
         recipients: Vec<String>,
         result: anyhow::Result<PpBatchSubmission>,
     ) {
@@ -1736,11 +1897,15 @@ impl PpScenarioSummary {
                     "batch_index": batch_index,
                     "batch_id": batch_id,
                     "submit_offset_ms": submit_offset_ms,
-                    "construction_complete_offset_ms": construction_complete_offset_ms,
+                    "construction_complete_offset_ms": null,
+                    "construction_ms": null,
                     "payment_count": submission.payment_ids.len(),
                     "api_accept_ms": submission.api_accept_ms,
-                    "construction_timing_reason": "payment-processor API acceptance precedes worker construction",
+                    "api_response_offset_ms": api_response_offset_ms,
+                    "construction_timing_origin": null,
+                    "construction_timing_reason": "persisted payment-processor unsigned_tx_json transition was not observed during measurement",
                     "submission_timing_origin": "payment_processor_api_acceptance",
+                    "submission_started": true,
                     "api_accepted": true,
                     "recipients": recipients,
                     "broadcast_to_mempool_ms": null,
@@ -1753,27 +1918,153 @@ impl PpScenarioSummary {
             Err(error) => {
                 println!("mode3 PP batch {batch_index} failed: {error:#}");
                 let typed_error = error.downcast_ref::<payment_processor::PaymentProcessorError>();
+                let explicitly_rejected = typed_error.is_some_and(|error| {
+                    matches!(error, payment_processor::PaymentProcessorError::Http { .. })
+                });
+                let response_shape_failure = typed_error.is_none()
+                    && error.chain().any(|cause| {
+                        matches!(
+                            cause.to_string().as_str(),
+                            "PP batch response missing batch_id"
+                                | "PP batch response missing payments"
+                        )
+                    });
+                let (submission_started, submission_timing_origin, failure_class) =
+                    match typed_error {
+                        Some(payment_processor::PaymentProcessorError::Transport { .. }) => (
+                            Some(true),
+                            Some("payment_processor_api_request_ambiguous"),
+                            ObservationFailureClass::Transport,
+                        ),
+                        Some(payment_processor::PaymentProcessorError::Http { .. }) => (
+                            Some(true),
+                            Some("payment_processor_api_rejection"),
+                            ObservationFailureClass::HttpResponse,
+                        ),
+                        Some(payment_processor::PaymentProcessorError::Decode { .. }) => (
+                            Some(true),
+                            Some("payment_processor_api_response_ambiguous"),
+                            ObservationFailureClass::ResponseDecode,
+                        ),
+                        None if response_shape_failure => (
+                            Some(true),
+                            Some("payment_processor_api_response_ambiguous"),
+                            ObservationFailureClass::ResponseShape,
+                        ),
+                        None => (
+                            Some(false),
+                            Some("payment_processor_pre_api"),
+                            ObservationFailureClass::Wallet,
+                        ),
+                    };
+                let submission_attempt_ms = submission_started
+                    .is_some_and(|started| started)
+                    .then(|| api_response_offset_ms.saturating_sub(submit_offset_ms));
                 self.tx_timings.push(serde_json::json!({
                     "batch_index": batch_index,
                     "batch_id": typed_error.and_then(payment_processor::PaymentProcessorError::batch_id),
                     "submit_offset_ms": submit_offset_ms,
-                    "construction_complete_offset_ms": construction_complete_offset_ms,
-                    "api_accept_ms": construction_complete_offset_ms.saturating_sub(submit_offset_ms),
-                    "construction_timing_reason": "payment-processor API call failed before worker construction was observable",
-                    "submission_timing_origin": "payment_processor_api_acceptance",
-                    "api_accepted": false,
+                    "construction_complete_offset_ms": null,
+                    "construction_ms": null,
+                    "api_accept_ms": null,
+                    "api_response_offset_ms": api_response_offset_ms,
+                    "construction_timing_origin": null,
+                    "construction_timing_reason": "persisted payment-processor unsigned_tx_json transition was not observed during measurement",
+                    "submission_attempt_ms": submission_attempt_ms,
+                    "submission_timing_origin": submission_timing_origin,
+                    "submission_started": submission_started,
+                    "api_accepted": explicitly_rejected.then_some(false),
                     "recipients": recipients,
                     "error": format!("{error:#}"),
                     "http_status": typed_error.and_then(payment_processor::PaymentProcessorError::http_status),
                     "sqlite_code": typed_error.and_then(payment_processor::PaymentProcessorError::sqlite_code),
                     "request_id": typed_error.and_then(payment_processor::PaymentProcessorError::request_id),
-                    "failure_class": typed_error.map(payment_processor::PaymentProcessorError::failure_class),
+                    "failure_class": failure_class,
                     "error_body": typed_error.and_then(payment_processor::PaymentProcessorError::response_body)
                 }));
                 self.failed_batches += 1;
                 self.errors.push(format!("{error:#}"));
             }
         }
+    }
+
+    fn record_deadline_timeout(
+        &mut self,
+        batch_index: u32,
+        submit_offset_ms: u128,
+        deadline_offset_ms: u128,
+        recipients: Vec<String>,
+        error: String,
+    ) {
+        self.tx_timings.push(serde_json::json!({
+            "batch_index": batch_index,
+            "batch_id": null,
+            "submit_offset_ms": submit_offset_ms,
+            "construction_complete_offset_ms": null,
+            "construction_ms": null,
+            "api_accept_ms": null,
+            "api_response_offset_ms": null,
+            "construction_timing_origin": null,
+            "construction_timing_reason": "persisted payment-processor unsigned_tx_json transition was not observed before the arm deadline",
+            "submission_timing_origin": "payment_processor_api_acceptance",
+            "api_accepted": null,
+            "deadline_expired": true,
+            "deadline_offset_ms": deadline_offset_ms,
+            "recipients": recipients,
+            "error": error,
+            "failure_class": "arm_deadline"
+        }));
+        self.failed_batches = self.failed_batches.saturating_add(1);
+        self.errors.push(error);
+    }
+
+    fn record_construction_observations(
+        &mut self,
+        snapshot: &PaymentProcessorDbSnapshot,
+        observed_at_ms: u128,
+    ) {
+        let mut newly_observed = Vec::new();
+        for timing in &mut self.tx_timings {
+            if timing
+                .get("construction_complete_offset_ms")
+                .is_some_and(|value| !value.is_null())
+            {
+                continue;
+            }
+            let Some(batch_id) = timing.get("batch_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !snapshot
+                .batches
+                .iter()
+                .any(|batch| batch.id == batch_id && batch.has_unsigned_tx)
+            {
+                continue;
+            }
+            let submit_offset_ms = timing_u128(timing, "submit_offset_ms").unwrap_or_default();
+            if let Some(map) = timing.as_object_mut() {
+                map.insert(
+                    "construction_complete_offset_ms".to_string(),
+                    serde_json::json!(observed_at_ms),
+                );
+                map.insert(
+                    "construction_ms".to_string(),
+                    serde_json::json!(observed_at_ms.saturating_sub(submit_offset_ms)),
+                );
+                map.insert(
+                    "construction_timing_origin".to_string(),
+                    serde_json::json!("payment_processor_db_unsigned_tx_first_observation"),
+                );
+                map.insert(
+                    "construction_timing_reason".to_string(),
+                    serde_json::json!(
+                        "first polling observation of persisted unsigned_tx_json; the transition may have occurred earlier"
+                    ),
+                );
+            }
+            newly_observed.push(observed_at_ms);
+        }
+        self.construction_complete_ms.extend(newly_observed);
     }
 
     fn add_batch(&mut self, configured_batch: u32, mut batch: Self) {
@@ -1838,9 +2129,9 @@ impl PpScenarioSummary {
         let mut attempts = 0u64;
         let mut timed_out = false;
         let observation_start_offset_ms = self
-            .construction_complete_ms
+            .tx_timings
             .iter()
-            .copied()
+            .filter_map(|timing| timing_u128(timing, "api_response_offset_ms"))
             .max()
             .unwrap_or_default();
         let mut confirmed_at_ms = BTreeMap::new();
@@ -1889,6 +2180,9 @@ impl PpScenarioSummary {
                         timed_out = true;
                         break;
                     };
+                    let observed_at =
+                        observation_start_offset_ms.saturating_add(start.elapsed().as_millis());
+                    self.record_construction_observations(&snapshot, observed_at);
                     let deadline = time::Instant::now() + remaining;
                     match verify_pp_snapshot_chain(config, &snapshot, deadline).await {
                         Ok(verification) => {
@@ -2158,7 +2452,31 @@ impl PpScenarioSummary {
                 let api_accepted = timing
                     .get("api_accepted")
                     .and_then(serde_json::Value::as_bool);
-                let deadline_expired = self
+                let submission_started = timing
+                    .get("submission_started")
+                    .and_then(serde_json::Value::as_bool);
+                let mempool_reason = match (api_accepted, submission_started) {
+                    (Some(true), _) => {
+                        "payment-processor acceptance precedes worker broadcast and exposes no per-batch mempool timestamp"
+                    }
+                    (Some(false), _) => {
+                        "payment-processor API explicitly rejected the batch before worker broadcast"
+                    }
+                    (None, Some(false)) => {
+                        "payment-processor API submission did not start"
+                    }
+                    (None, Some(true)) => {
+                        "payment-processor API submission started but no acceptance result established worker broadcast"
+                    }
+                    (None, None) => {
+                        "payment-processor API submission state was not observed before the deadline"
+                    }
+                };
+                let deadline_expired = timing
+                    .get("deadline_expired")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || self
                     .extra_metrics
                     .get("db_observation_timed_out")
                     .and_then(serde_json::Value::as_bool)
@@ -2186,12 +2504,11 @@ impl PpScenarioSummary {
                 transaction_observation(
                     proof.map(|proof| proof.chain_tx_id.as_str()),
                     Some(&enriched_timing),
+                    timing_u128(timing, "construction_ms"),
+                    timing_u128(timing, "api_accept_ms")
+                        .or_else(|| timing_u128(timing, "submission_attempt_ms")),
                     None,
-                    timing_u128(timing, "api_accept_ms"),
-                    None,
-                    Some(
-                        "payment-processor acceptance precedes worker broadcast and exposes no per-batch mempool timestamp",
-                    ),
+                    Some(mempool_reason),
                     timing_u128(timing, "api_dispatch_to_confirmed_at_c_min_ms"),
                     proof.map(|proof| proof.fee_microtari).or(proposed_fee),
                     proof.map(|proof| proof.amount_microtari),
@@ -2477,7 +2794,7 @@ impl Mode1TransferOutcome {
             self.tx_timings.push(serde_json::json!({
                 "batch_index": batch_index,
                 "tx_id": null,
-                "construction_complete_ms": submit_response_ms,
+                "construction_complete_ms": null,
                 "grpc_round_trip_ms": submit_response_ms,
                 "construction_timing_reason": "console-wallet gRPC does not expose internal construction completion",
                 "submission_timing_origin": "console_wallet_grpc_round_trip",
@@ -2494,7 +2811,7 @@ impl Mode1TransferOutcome {
                     map.insert("batch_index".to_string(), serde_json::json!(batch_index));
                     map.insert(
                         "construction_complete_ms".to_string(),
-                        serde_json::json!(submit_response_ms),
+                        serde_json::Value::Null,
                     );
                     map.insert(
                         "grpc_round_trip_ms".to_string(),
@@ -2572,6 +2889,16 @@ impl Mode1TransferOutcome {
 }
 
 impl Mode1TransferSummary {
+    fn retain_constructed_output_shape_for_new_tx_ids(
+        &mut self,
+        first_new_tx_id: usize,
+        shape: ConstructedOutputShape,
+    ) {
+        for tx_id in &self.tx_ids[first_new_tx_id..] {
+            self.constructed_output_shapes.insert(tx_id.clone(), shape);
+        }
+    }
+
     fn backfill_verified_fee_total(&mut self) {
         let verified_fee_total = self
             .tx_infos
@@ -2597,7 +2924,7 @@ impl Mode1TransferSummary {
         batch_index: u32,
         items_per_batch: u32,
         submit_offset_ms: u128,
-        construction_complete_offset_ms: u128,
+        grpc_response_offset_ms: u128,
         recipients: Vec<String>,
         result: anyhow::Result<Mode1TransferOutcome>,
     ) {
@@ -2611,7 +2938,11 @@ impl Mode1TransferSummary {
                         );
                         map.insert(
                             "construction_complete_offset_ms".to_string(),
-                            serde_json::json!(construction_complete_offset_ms),
+                            serde_json::Value::Null,
+                        );
+                        map.insert(
+                            "grpc_response_offset_ms".to_string(),
+                            serde_json::json!(grpc_response_offset_ms),
                         );
                         if !recipients.is_empty() && map.get("recipients").is_none() {
                             map.insert("recipients".to_string(), serde_json::json!(&recipients));
@@ -2638,22 +2969,77 @@ impl Mode1TransferSummary {
             }
             Err(error) => {
                 println!("mode1 gRPC batch {batch_index} failed: {error:#}");
+                let grpc_status = error.downcast_ref::<tonic::Status>();
+                let definitely_rejected = grpc_status.is_some_and(|status| {
+                    matches!(
+                        status.code(),
+                        tonic::Code::InvalidArgument
+                            | tonic::Code::FailedPrecondition
+                            | tonic::Code::PermissionDenied
+                            | tonic::Code::Unauthenticated
+                            | tonic::Code::NotFound
+                            | tonic::Code::AlreadyExists
+                            | tonic::Code::OutOfRange
+                            | tonic::Code::Unimplemented
+                    )
+                });
+                let error_message = format!("{error:#}");
                 self.tx_timings.push(serde_json::json!({
                     "batch_index": batch_index,
                     "tx_id": null,
                     "submit_offset_ms": submit_offset_ms,
-                    "construction_complete_offset_ms": construction_complete_offset_ms,
-                    "construction_complete_ms": construction_complete_offset_ms.saturating_sub(submit_offset_ms),
-                    "construction_timing_reason": "console-wallet gRPC call did not complete",
-                    "submission_timing_origin": "console_wallet_grpc_round_trip",
-                    "api_accepted": false,
+                    "construction_complete_offset_ms": null,
+                    "construction_complete_ms": null,
+                    "grpc_response_offset_ms": grpc_response_offset_ms,
+                    "grpc_round_trip_ms": grpc_response_offset_ms.saturating_sub(submit_offset_ms),
+                    "construction_timing_reason": "console-wallet gRPC does not expose internal construction completion",
+                    "submission_timing_origin": if definitely_rejected {
+                        "console_wallet_grpc_rejection"
+                    } else {
+                        "console_wallet_grpc_request_ambiguous"
+                    },
+                    "submission_started": true,
+                    "api_accepted": definitely_rejected.then_some(false),
+                    "api_error": &error_message,
+                    "failure_class": if definitely_rejected { "wallet" } else { "transport" },
+                    "grpc_code": grpc_status.map(|status| format!("{:?}", status.code())),
                     "recipients": recipients,
-                    "error": format!("{error:#}")
+                    "error": &error_message
                 }));
                 self.failure_count = self.failure_count.saturating_add(items_per_batch);
-                self.errors.push(format!("{error:#}"));
+                self.errors.push(error_message);
             }
         }
+    }
+
+    fn record_deadline_timeout(
+        &mut self,
+        batch_index: u32,
+        items_per_batch: u32,
+        submit_offset_ms: u128,
+        deadline_offset_ms: u128,
+        recipients: Vec<String>,
+        error: String,
+    ) {
+        self.tx_timings.push(serde_json::json!({
+            "batch_index": batch_index,
+            "tx_id": null,
+            "submit_offset_ms": submit_offset_ms,
+            "construction_complete_offset_ms": null,
+            "construction_complete_ms": null,
+            "grpc_response_offset_ms": null,
+            "grpc_round_trip_ms": null,
+            "construction_timing_reason": "console-wallet gRPC does not expose internal construction completion",
+            "submission_timing_origin": "console_wallet_grpc_round_trip",
+            "api_accepted": null,
+            "deadline_expired": true,
+            "deadline_offset_ms": deadline_offset_ms,
+            "recipients": recipients,
+            "error": error,
+            "failure_class": "arm_deadline"
+        }));
+        self.failure_count = self.failure_count.saturating_add(items_per_batch);
+        self.errors.push(error);
     }
 
     fn add_batch(&mut self, configured_batch: u32, mut batch: Self) {
@@ -2690,6 +3076,8 @@ impl Mode1TransferSummary {
         self.construction_complete_ms
             .extend(batch.construction_complete_ms);
         self.transaction_shapes.extend(batch.transaction_shapes);
+        self.constructed_output_shapes
+            .extend(batch.constructed_output_shapes);
         self.extra_metrics.extend(batch.extra_metrics);
         self.batch_summaries.push(Mode1BatchSummary {
             configured_batch,
@@ -2791,6 +3179,10 @@ impl Mode1TransferSummary {
             "verified_transactions".to_string(),
             serde_json::json!(self.tx_infos),
         );
+        metrics.insert(
+            "constructed_output_shapes_by_tx_id".to_string(),
+            serde_json::json!(self.constructed_output_shapes),
+        );
         if scenario == ScenarioName::S4 {
             metrics.insert(
                 "s4_arms".to_string(),
@@ -2839,10 +3231,10 @@ impl Mode1TransferSummary {
                 if let Some(shape) = tx_id.and_then(|id| self.transaction_shapes.get(id))
                     && let Some(map) = enriched_timing.as_object_mut()
                 {
-                    let payment_output_count = if scenario == ScenarioName::S1 {
-                        shape.total_output_count
+                    let constructed_shape = if scenario == ScenarioName::S1 {
+                        tx_id.and_then(|id| self.constructed_output_shapes.get(id))
                     } else {
-                        1
+                        None
                     };
                     map.insert("input_count".to_string(), serde_json::json!(shape.input_count));
                     map.insert(
@@ -2853,20 +3245,28 @@ impl Mode1TransferSummary {
                         "output_commitments".to_string(),
                         serde_json::json!(shape.output_commitments),
                     );
-                    map.insert(
-                        "payment_output_count".to_string(),
-                        serde_json::json!(payment_output_count),
-                    );
-                    map.insert(
-                        "change_output_count".to_string(),
-                        serde_json::json!(shape.total_output_count.saturating_sub(payment_output_count)),
-                    );
+                    if let Some(constructed_shape) = constructed_shape {
+                        map.insert(
+                            "payment_output_count".to_string(),
+                            serde_json::json!(constructed_shape.payment_output_count),
+                        );
+                        map.insert(
+                            "change_output_count".to_string(),
+                            serde_json::json!(constructed_shape.change_output_count),
+                        );
+                    } else if scenario != ScenarioName::S1 {
+                        map.insert("payment_output_count".to_string(), serde_json::json!(1));
+                        map.insert(
+                            "change_output_count".to_string(),
+                            serde_json::json!(shape.total_output_count.saturating_sub(1)),
+                        );
+                    }
                 }
                 transaction_observation(
                     tx_id,
                     Some(&enriched_timing),
                     None,
-                    timing_u128(timing, "construction_complete_ms"),
+                    timing_u128(timing, "grpc_round_trip_ms"),
                     None,
                     Some("console-wallet gRPC does not expose a per-transaction mempool timestamp"),
                     timing_u128(timing, "dispatch_to_confirmed_at_c_min_ms"),
@@ -2878,8 +3278,20 @@ impl Mode1TransferSummary {
                     verified.and_then(|tx| tx.amount_microtari),
                     if confirmed {
                         "confirmed"
-                    } else if timing.get("error").is_some() {
+                    } else if timing
+                        .get("deadline_expired")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "timed_out"
+                    } else if timing
+                        .get("api_accepted")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    {
                         "rejected"
+                    } else if timing.get("error").is_some() {
+                        "stalled"
                     } else {
                         "timed_out"
                     },
@@ -2964,11 +3376,32 @@ impl Mode1TransferSummary {
 }
 
 impl ScenarioSendSummary {
+    fn retain_s1_construction_evidence(
+        &mut self,
+        result: &anyhow::Result<OneSidedSendOutcome>,
+        amount_microtari: u64,
+        output_shape: ConstructedOutputShape,
+    ) {
+        let tx_id = match result {
+            Ok(outcome) => Some(outcome.tx_id.as_str()),
+            Err(error) => error
+                .downcast_ref::<OneSidedSubmissionFailure>()
+                .and_then(|failure| failure.identity.as_ref())
+                .map(|identity| identity.tx_id.as_str()),
+        };
+        if let Some(tx_id) = tx_id {
+            self.constructed_amounts_microtari
+                .insert(tx_id.to_string(), amount_microtari);
+            self.constructed_output_shapes
+                .insert(tx_id.to_string(), output_shape);
+        }
+    }
+
     fn record_attempt(
         &mut self,
         attempt: u32,
         submit_offset_ms: u128,
-        construction_complete_offset_ms: u128,
+        construction_complete_offset_ms: Option<u128>,
         recipient: String,
         result: anyhow::Result<OneSidedSendOutcome>,
     ) {
@@ -3018,21 +3451,65 @@ impl ScenarioSendSummary {
             }
             Err(error) => {
                 println!("mode2 send attempt {attempt} failed: {error:#}");
+                let submission_failure = error.downcast_ref::<OneSidedSubmissionFailure>();
+                let identity = submission_failure.and_then(|failure| failure.identity.as_ref());
+                let tx_id = identity.map(|identity| identity.tx_id.clone());
+                let construction_ms =
+                    identity
+                        .map(|identity| identity.construction_ms)
+                        .or_else(|| {
+                            construction_complete_offset_ms
+                                .map(|completed| completed.saturating_sub(submit_offset_ms))
+                        });
+                let broadcast_start_offset_ms = identity.map(|identity| {
+                    submit_offset_ms.saturating_add(identity.broadcast_start_offset_ms)
+                });
+                let fee_microtari = identity.map(|identity| identity.fee_microtari);
+                let api_accepted: Option<bool> = None;
+                let submission_started =
+                    submission_failure.is_some_and(|failure| failure.submission_started);
+                let submission_elapsed_ms =
+                    submission_failure.and_then(|failure| failure.submission_elapsed_ms);
+                let failure_class = Some(
+                    submission_failure
+                        .map(|failure| failure.failure_class)
+                        .unwrap_or(ObservationFailureClass::Wallet),
+                );
+                let deadline_expired = failure_class == Some(ObservationFailureClass::ArmDeadline);
+                let checkpoint_status = identity.map(|_| "prepared");
+                let error_message = format!("{error:#}");
                 self.tx_timings.push(serde_json::json!({
                     "attempt": attempt,
-                    "tx_id": null,
+                    "tx_id": tx_id,
                     "submit_offset_ms": submit_offset_ms,
                     "construction_complete_offset_ms": construction_complete_offset_ms,
-                    "construction_ms": construction_complete_offset_ms.saturating_sub(submit_offset_ms),
+                    "construction_ms": construction_ms,
                     "construction_timing_origin": "library_build_and_sign_attempt",
+                    "fee_microtari": fee_microtari,
+                    "broadcast_start_offset_ms": broadcast_start_offset_ms,
+                    "submission_attempt_ms": submission_elapsed_ms,
+                    "submission_timing_origin": submission_started.then_some("base_node_submit_transaction_ambiguous"),
+                    "submission_started": submission_started,
+                    "submission_ambiguous": submission_started,
+                    "checkpoint_status": checkpoint_status,
                     "recipient": recipient,
-                    "api_accepted": false,
+                    "api_accepted": api_accepted,
                     "broadcast_to_mempool_ms": null,
-                    "accepted": false,
-                    "error": format!("{error:#}")
+                    "accepted": api_accepted,
+                    "api_error": error_message,
+                    "failure_class": failure_class,
+                    "deadline_expired": deadline_expired,
+                    "error": error_message
                 }));
+                if submission_started && let Some(tx_id) = tx_id {
+                    // The durable prepared checkpoint is the reconciliation handle for a
+                    // request that may have reached the base node despite a transport error.
+                    self.tx_ids.push(tx_id);
+                }
                 self.failure_count += 1;
-                self.errors.push(format!("{error:#}"));
+                if !submission_started {
+                    self.errors.push(error_message);
+                }
             }
         }
     }
@@ -3064,6 +3541,10 @@ impl ScenarioSendSummary {
         self.construction_complete_ms
             .extend(batch.construction_complete_ms);
         self.tx_infos.extend(batch.tx_infos);
+        self.constructed_amounts_microtari
+            .extend(batch.constructed_amounts_microtari);
+        self.constructed_output_shapes
+            .extend(batch.constructed_output_shapes);
         self.confirmation_observed_offsets_ms
             .extend(batch.confirmation_observed_offsets_ms);
         self.transaction_shapes.extend(batch.transaction_shapes);
@@ -3101,6 +3582,11 @@ impl ScenarioSendSummary {
         )
         .unwrap_or(u32::MAX);
         self.tx_infos = verification.observed_transactions;
+        for transaction in &mut self.tx_infos {
+            if let Some(amount) = self.constructed_amounts_microtari.get(&transaction.tx_id) {
+                transaction.amount_microtari = Some(*amount);
+            }
+        }
         self.confirmation_observed_offsets_ms = verification.confirmation_observed_offsets_ms;
         self.transaction_shapes = verification.transaction_shapes;
         self.extra_metrics.insert(
@@ -3213,6 +3699,14 @@ impl ScenarioSendSummary {
             "observed_transactions".to_string(),
             serde_json::json!(self.tx_infos),
         );
+        metrics.insert(
+            "constructed_amounts_microtari_by_tx_id".to_string(),
+            serde_json::json!(self.constructed_amounts_microtari),
+        );
+        metrics.insert(
+            "constructed_output_shapes_by_tx_id".to_string(),
+            serde_json::json!(self.constructed_output_shapes),
+        );
         if scenario == ScenarioName::S4 {
             metrics.insert(
                 "s4_arms".to_string(),
@@ -3254,10 +3748,9 @@ impl ScenarioSendSummary {
             .map(|timing| {
                 let tx_id = timing.get("tx_id").and_then(serde_json::Value::as_str);
                 let verified = tx_id.and_then(|id| self.tx_infos.iter().find(|tx| tx.tx_id == id));
-                let accepted = timing
-                    .get("accepted")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                let api_accepted = timing
+                    .get("api_accepted")
+                    .and_then(serde_json::Value::as_bool);
                 let rejection = timing
                     .get("rejection_reason")
                     .and_then(serde_json::Value::as_str)
@@ -3270,10 +3763,10 @@ impl ScenarioSendSummary {
                 if let Some(shape) = tx_id.and_then(|id| self.transaction_shapes.get(id))
                     && let Some(map) = enriched_timing.as_object_mut()
                 {
-                    let payment_output_count = if scenario == ScenarioName::S1 {
-                        shape.total_output_count
+                    let constructed_shape = if scenario == ScenarioName::S1 {
+                        tx_id.and_then(|id| self.constructed_output_shapes.get(id))
                     } else {
-                        1
+                        None
                     };
                     map.insert(
                         "input_count".to_string(),
@@ -3287,48 +3780,75 @@ impl ScenarioSendSummary {
                         "output_commitments".to_string(),
                         serde_json::json!(shape.output_commitments),
                     );
-                    map.insert(
-                        "payment_output_count".to_string(),
-                        serde_json::json!(payment_output_count),
-                    );
-                    map.insert(
-                        "change_output_count".to_string(),
-                        serde_json::json!(
-                            shape
-                                .total_output_count
-                                .saturating_sub(payment_output_count)
-                        ),
-                    );
+                    if let Some(constructed_shape) = constructed_shape {
+                        map.insert(
+                            "payment_output_count".to_string(),
+                            serde_json::json!(constructed_shape.payment_output_count),
+                        );
+                        map.insert(
+                            "change_output_count".to_string(),
+                            serde_json::json!(constructed_shape.change_output_count),
+                        );
+                    } else if scenario != ScenarioName::S1 {
+                        map.insert("payment_output_count".to_string(), serde_json::json!(1));
+                        map.insert(
+                            "change_output_count".to_string(),
+                            serde_json::json!(shape.total_output_count.saturating_sub(1)),
+                        );
+                    }
                 }
                 let confirmed = verified.is_some_and(|tx| tx.confirmed);
                 let terminal_outcome = if confirmed {
                     "confirmed"
-                } else if !accepted {
+                } else if api_accepted == Some(false) {
                     "rejected"
+                } else if timing
+                    .get("deadline_expired")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || timing
+                        .get("failure_class")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("request_timeout")
+                {
+                    "timed_out"
+                } else if timing.get("error").is_some() {
+                    "stalled"
                 } else {
                     "timed_out"
+                };
+                let mempool_reason = match api_accepted {
+                    Some(true) => "base-node submit_transaction accepted the transaction",
+                    Some(false) => "base-node submit_transaction rejected the transaction",
+                    None if timing
+                        .get("submission_started")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false) =>
+                    {
+                        "base-node submission result was ambiguous; durable checkpoint retained for reconciliation"
+                    }
+                    None => "base-node submission did not start or return an acceptance result",
                 };
                 transaction_observation(
                     tx_id,
                     Some(&enriched_timing),
                     timing_u128(timing, "construction_ms"),
-                    timing_u128(timing, "broadcast_to_mempool_ms"),
-                    Some(accepted),
-                    Some(if accepted {
-                        "base-node submit_transaction accepted the transaction"
-                    } else {
-                        "base-node submit_transaction rejected the transaction"
-                    }),
+                    timing_u128(timing, "broadcast_to_mempool_ms")
+                        .or_else(|| timing_u128(timing, "submission_attempt_ms")),
+                    api_accepted,
+                    Some(mempool_reason),
                     timing_u128(timing, "broadcast_to_confirmed_at_c_min_ms"),
                     verified.and_then(|tx| tx.fee_microtari).or_else(|| {
                         timing
                             .get("fee_microtari")
                             .and_then(serde_json::Value::as_u64)
                     }),
-                    verified.and_then(|tx| tx.amount_microtari),
+                    verified.and_then(|tx| tx.amount_microtari).or_else(|| {
+                        tx_id.and_then(|id| self.constructed_amounts_microtari.get(id).copied())
+                    }),
                     terminal_outcome,
-                    rejection.or(timing_error).or_else(|| {
-                        (!confirmed).then(|| {
+                    (!confirmed).then(|| {
+                        rejection.or(timing_error).unwrap_or_else(|| {
                             "transaction did not reach C_min before the observation deadline"
                                 .to_string()
                         })
@@ -3594,6 +4114,21 @@ fn transaction_observation(
     } else {
         None
     };
+    let api_accepted = timing
+        .and_then(|value| value.get("api_accepted"))
+        .and_then(serde_json::Value::as_bool);
+    let submission_timing_origin = timing_string(timing, "submission_timing_origin");
+    let submission_started = timing
+        .and_then(|value| value.get("submission_started"))
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| api_accepted.map(|_| true))
+        .or_else(|| {
+            (submission_ms.is_some()
+                && submission_timing_origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.ends_with("_ambiguous")))
+            .then_some(true)
+        });
     serde_json::to_value(TransactionObservation {
         transaction_id: transaction_id.map(ToString::to_string),
         attempt_index: timing.and_then(|value| value.get("attempt")).and_then(serde_json::Value::as_u64).and_then(|value| u32::try_from(value).ok()),
@@ -3604,13 +4139,16 @@ fn transaction_observation(
         broadcast_start_offset_ms: timing_u128_opt(timing, "broadcast_start_offset_ms"),
         construction_ms,
         construction_timing_origin: timing_string(timing, "construction_timing_origin"),
-        construction_timing_reason: construction_ms.is_none().then(|| {
-            timing_string(timing, "construction_timing_reason").unwrap_or_else(|| {
-                "wallet surface does not expose internal construction duration".to_string()
-            })
-        }),
+        construction_timing_reason: timing_string(timing, "construction_timing_reason").or_else(
+            || {
+                construction_ms.is_none().then(|| {
+                    "wallet surface does not expose internal construction duration".to_string()
+                })
+            },
+        ),
         submission_ms,
-        submission_timing_origin: timing_string(timing, "submission_timing_origin"),
+        submission_timing_origin,
+        submission_started,
         mempool_available,
         mempool_reason: mempool_reason.map(ToString::to_string),
         confirmation_ms,
@@ -3648,12 +4186,14 @@ fn transaction_observation(
             })
             .or_else(|| timing_string(timing, "recipient").map(|recipient| vec![recipient]))
             .unwrap_or_default(),
-        api_accepted: timing
-            .and_then(|value| value.get("api_accepted"))
-            .and_then(serde_json::Value::as_bool),
+        api_accepted,
         api_error: timing_string(timing, "api_error"),
         http_status,
         failure_class,
+        deadline_expired: timing
+            .and_then(|value| value.get("deadline_expired"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         terminal_outcome,
         error,
         mined_height,
@@ -3719,6 +4259,13 @@ async fn construct_sign_broadcast_one_sided_multi_recipient_owned(
 pub async fn construct_sign_broadcast_one_sided(
     request: OneSidedSendRequest<'_>,
 ) -> anyhow::Result<OneSidedSendOutcome> {
+    let prepared = prepare_one_sided_transaction(&request)?;
+    finalize_prepared_one_sided_and_broadcast_without_retry(prepared, request).await
+}
+
+fn prepare_one_sided_transaction(
+    request: &OneSidedSendRequest<'_>,
+) -> anyhow::Result<PreparedOneSidedTransaction> {
     let construction_start = Instant::now();
     let pool = init_db(request.db_path.to_path_buf())?;
     let mut sender = TransactionSender::new(
@@ -3746,9 +4293,13 @@ pub async fn construct_sign_broadcast_one_sided(
             Ok(signed) => signed,
             Err(error) => anyhow::bail!("signing locked transaction failed: {error}"),
         };
-    let construction_ms = construction_start.elapsed().as_millis();
-    finalize_transaction_and_broadcast_without_retry(&sender, signed, request, construction_ms)
-        .await
+    Ok(PreparedOneSidedTransaction {
+        db_pool: sender.db_pool.clone(),
+        account_id: sender.account.id,
+        pending_tx_id: sender.processed_transactions.id().to_string(),
+        signed,
+        construction_ms: construction_start.elapsed().as_millis(),
+    })
 }
 
 pub async fn construct_sign_broadcast_one_sided_multi_recipient(
@@ -3941,6 +4492,84 @@ fn validate_normal_split_shape(
     Ok(())
 }
 
+pub fn require_dedicated_source_wallet(config: &Config, source_db: &Path) -> anyhow::Result<()> {
+    let source = config.require_source_wallet(source_db)?;
+    let connection = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening source wallet {} read-only", source_db.display()))?;
+    let actual: Vec<u8> = connection
+        .query_row(
+            "SELECT fingerprint FROM accounts WHERE friendly_name = 'default'",
+            [],
+            |row| row.get(0),
+        )
+        .context("reading dedicated source wallet fingerprint")?;
+    let expected = hex::decode(&source.wallet_fingerprint_hex)
+        .context("decoding source_wallet.wallet_fingerprint_hex")?;
+    if actual != expected {
+        bail!("source wallet database fingerprint does not match source_wallet configuration");
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceWalletChainAnchor {
+    height: u64,
+    hash_hex: String,
+}
+
+fn source_wallet_chain_anchor(source_db: &Path) -> anyhow::Result<SourceWalletChainAnchor> {
+    let connection = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening source wallet {} read-only", source_db.display()))?;
+    let (height, hash): (i64, Vec<u8>) = connection
+        .query_row(
+            "SELECT scanned_tip_blocks.height, scanned_tip_blocks.hash \
+             FROM scanned_tip_blocks \
+             JOIN accounts ON accounts.id = scanned_tip_blocks.account_id \
+             WHERE accounts.friendly_name = 'default' \
+             ORDER BY scanned_tip_blocks.height DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .context("dedicated source wallet has no persisted selected-chain scan anchor")?;
+    if height < 0 || hash.len() != 32 {
+        bail!("dedicated source wallet has an invalid selected-chain scan anchor");
+    }
+    Ok(SourceWalletChainAnchor {
+        height: height as u64,
+        hash_hex: hex::encode(hash),
+    })
+}
+
+fn require_source_wallet_anchor_hashes(
+    anchor: &SourceWalletChainAnchor,
+    selected_hash: &str,
+    authority_hash: &str,
+) -> anyhow::Result<()> {
+    if !anchor.hash_hex.eq_ignore_ascii_case(selected_hash)
+        || !anchor.hash_hex.eq_ignore_ascii_case(authority_hash)
+    {
+        bail!(
+            "source wallet scan anchor at height {} is not on the selected Esmeralda authority chain",
+            anchor.height
+        );
+    }
+    Ok(())
+}
+
+pub async fn require_dedicated_source_wallet_on_selected_chain(
+    config: &Config,
+    source_db: &Path,
+) -> anyhow::Result<()> {
+    require_dedicated_source_wallet(config, source_db)?;
+    let anchor = source_wallet_chain_anchor(source_db)?;
+    let selected_hash =
+        base_node_header_hash(&config.network.base_node_http_url, anchor.height).await?;
+    let authority_hash =
+        base_node_header_hash(&config.network.authority_http_url, anchor.height).await?;
+    require_source_wallet_anchor_hashes(&anchor, &selected_hash, &authority_hash)
+}
+
 pub async fn fund_one_sided_outputs(
     config: &Config,
     source_db: &Path,
@@ -3958,9 +4587,7 @@ pub async fn fund_one_sided_outputs(
     if batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
-    if !source_db.exists() {
-        bail!("source DB not found at {}", source_db.display());
-    }
+    require_dedicated_source_wallet_on_selected_chain(config, source_db).await?;
     let amount = parse_amount(amount)?;
     let request = OwnedOneSidedSendRequest {
         db_path: source_db.to_path_buf(),
@@ -3973,6 +4600,7 @@ pub async fn fund_one_sided_outputs(
         confirmation_window: config.benchmark.c_min,
         request_timeout: Duration::from_secs(30),
         tip_height_at_broadcast: None,
+        prepared_transaction_binding: None,
     };
 
     if recipients.len() > 1 {
@@ -4043,6 +4671,7 @@ pub async fn fund_one_sided_outputs(
 pub async fn submit_s0_outputs<F>(
     config: &Config,
     source_db: &Path,
+    b0_run_id: &str,
     recipients: &[String],
     on_broadcast: F,
 ) -> anyhow::Result<crate::result_profile::S0FundingSubmissionEvidence>
@@ -4052,9 +4681,7 @@ where
     if recipients.len() != 3 {
         bail!("S0 funding requires exactly three wallet-mode recipients");
     }
-    if !source_db.exists() {
-        bail!("source DB not found at {}", source_db.display());
-    }
+    require_dedicated_source_wallet_on_selected_chain(config, source_db).await?;
     let request = OwnedOneSidedSendRequest {
         db_path: source_db.to_path_buf(),
         password: wallet_password(&config.seeds.wallet_password_env)?,
@@ -4066,6 +4693,12 @@ where
         confirmation_window: config.benchmark.c_min,
         request_timeout: Duration::from_secs(30),
         tip_height_at_broadcast: None,
+        prepared_transaction_binding: Some(s0_prepared_transaction_binding(
+            b0_run_id,
+            &config.protocol_fingerprint()?,
+            recipients,
+            config.a_fund()?.0,
+        )),
     };
     let tip_height_at_broadcast = base_node_tip_height(&config.network.base_node_http_url).await?;
     let request = OwnedOneSidedSendRequest {
@@ -4193,7 +4826,7 @@ pub async fn synchronize_s0_recipients(
         ("new_wallet", config.modes.new_wallet_database.as_path()),
         ("payment_processor", payment_receiver_db.as_path()),
     ] {
-        let report = scan_to_tip(
+        let report = refresh_wallet_to_tip(
             db_path,
             &password,
             &config.network.base_node_http_url,
@@ -4224,7 +4857,7 @@ pub async fn refresh_library_wallets_to_tip(config: &Config) -> anyhow::Result<(
         ("new_wallet", config.modes.new_wallet_database.as_path()),
         ("payment_processor", payment_receiver_db.as_path()),
     ] {
-        let report = scan_to_tip(
+        let report = refresh_wallet_to_tip(
             db_path,
             &password,
             &config.network.base_node_http_url,
@@ -4242,12 +4875,26 @@ pub async fn refresh_library_wallets_to_tip(config: &Config) -> anyhow::Result<(
     Ok(())
 }
 
-pub async fn plan_s0_wallet_initialization(config: &Config) -> anyhow::Result<(u16, u64)> {
+pub async fn plan_s0_wallet_initialization(
+    config: &Config,
+) -> anyhow::Result<(u16, u64, u64, u16)> {
     let birthday = current_birthday();
-    let birthday_timestamp = u64::from(birthday.saturating_sub(2))
+    let birthday_height = birthday_height_at_day(config, birthday).await?;
+    let birthday_start_height =
+        birthday_height_at_day(config, birthday.saturating_sub(STOCK_BIRTHDAY_OFFSET_DAYS)).await?;
+    Ok((
+        birthday,
+        birthday_height,
+        birthday_start_height,
+        STOCK_BIRTHDAY_OFFSET_DAYS,
+    ))
+}
+
+async fn birthday_height_at_day(config: &Config, birthday: u16) -> anyhow::Result<u64> {
+    let birthday_timestamp = u64::from(birthday)
         .saturating_mul(24 * 60 * 60)
-        .saturating_add(1_640_995_200);
-    let birthday_start_height = base_node_http_client()?
+        .saturating_add(BIRTHDAY_GENESIS_FROM_UNIX_EPOCH);
+    base_node_http_client()?
         .get(format!(
             "{}/get_height_at_time?time={birthday_timestamp}",
             config.network.base_node_http_url.trim_end_matches('/')
@@ -4256,8 +4903,8 @@ pub async fn plan_s0_wallet_initialization(config: &Config) -> anyhow::Result<(u
         .await?
         .error_for_status()?
         .json()
-        .await?;
-    Ok((birthday, birthday_start_height))
+        .await
+        .context("resolving wallet birthday timestamp to an Esmeralda height")
 }
 
 pub fn require_fresh_s0_wallet_paths(config: &Config) -> anyhow::Result<()> {
@@ -4325,19 +4972,66 @@ pub async fn initialize_s0_wallets(
     Ok(())
 }
 
-async fn finalize_transaction_and_broadcast_without_retry(
-    sender: &TransactionSender,
+struct PreparedOneSidedTransaction {
+    db_pool: SqlitePool,
+    account_id: i64,
+    pending_tx_id: String,
     signed: SignedOneSidedTransactionResult,
-    request: OneSidedSendRequest<'_>,
     construction_ms: u128,
+}
+
+impl PreparedOneSidedTransaction {
+    fn into_parts(
+        self,
+    ) -> (
+        SqlitePool,
+        i64,
+        String,
+        SignedOneSidedTransactionResult,
+        u128,
+    ) {
+        (
+            self.db_pool,
+            self.account_id,
+            self.pending_tx_id,
+            self.signed,
+            self.construction_ms,
+        )
+    }
+}
+
+async fn finalize_prepared_one_sided_and_broadcast_without_retry(
+    prepared: PreparedOneSidedTransaction,
+    request: OneSidedSendRequest<'_>,
 ) -> anyhow::Result<OneSidedSendOutcome> {
+    let (db_pool, account_id, pending_tx_id, signed, construction_ms) = prepared.into_parts();
     finalize_signed_transaction_and_broadcast_without_retry(
-        &sender.db_pool,
-        sender.account.id,
-        sender.processed_transactions.id(),
+        &db_pool,
+        account_id,
+        &pending_tx_id,
         signed,
         request,
         construction_ms,
+    )
+    .await
+}
+
+async fn finalize_prepared_one_sided_and_broadcast_without_retry_before_observed(
+    prepared: PreparedOneSidedTransaction,
+    request: OneSidedSendRequest<'_>,
+    broadcast_deadline: time::Instant,
+    observer: &OneSidedSubmissionObserver,
+) -> anyhow::Result<OneSidedSendOutcome> {
+    let (db_pool, account_id, pending_tx_id, signed, construction_ms) = prepared.into_parts();
+    finalize_signed_transaction_and_broadcast_without_retry_before(
+        &db_pool,
+        account_id,
+        &pending_tx_id,
+        signed,
+        request,
+        construction_ms,
+        Some(broadcast_deadline),
+        Some(observer),
     )
     .await
 }
@@ -4350,9 +5044,34 @@ async fn finalize_signed_transaction_and_broadcast_without_retry(
     request: OneSidedSendRequest<'_>,
     construction_ms: u128,
 ) -> anyhow::Result<OneSidedSendOutcome> {
+    finalize_signed_transaction_and_broadcast_without_retry_before(
+        db_pool,
+        account_id,
+        pending_tx_id,
+        signed,
+        request,
+        construction_ms,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_signed_transaction_and_broadcast_without_retry_before(
+    db_pool: &SqlitePool,
+    account_id: i64,
+    pending_tx_id: &str,
+    signed: SignedOneSidedTransactionResult,
+    request: OneSidedSendRequest<'_>,
+    construction_ms: u128,
+    broadcast_deadline: Option<time::Instant>,
+    observer: Option<&OneSidedSubmissionObserver>,
+) -> anyhow::Result<OneSidedSendOutcome> {
     let finalize_start = Instant::now();
     persist_signed_transaction(db_pool, account_id, pending_tx_id, &signed)?;
     let tx_id = signed.signed_transaction.tx_id;
+    let tx_id_string = tx_id.to_string();
     let fee_microtari = signed
         .signed_transaction
         .transaction
@@ -4373,8 +5092,27 @@ async fn finalize_signed_transaction_and_broadcast_without_retry(
         broadcast_start_offset_ms,
         broadcasted_at,
         request.tip_height_at_broadcast,
+        request.prepared_transaction_binding,
         &signed.signed_transaction.transaction,
     )?;
+    let identity = OneSidedSubmissionIdentity {
+        tx_id: tx_id_string.clone(),
+        fee_microtari,
+        construction_ms,
+        broadcast_start_offset_ms,
+    };
+    if let Some(observer) = observer {
+        observer(OneSidedSubmissionProgress::Prepared, &identity)?;
+    }
+    if broadcast_deadline.is_some_and(|deadline| deadline <= time::Instant::now()) {
+        return Err(anyhow::Error::new(OneSidedSubmissionFailure::arm_deadline(
+            Some(identity),
+            "Mode 2 S4 deadline expired before transaction broadcast",
+        )));
+    }
+    if let Some(observer) = observer {
+        observer(OneSidedSubmissionProgress::SubmissionStarted, &identity)?;
+    }
     let broadcast_start = Instant::now();
     let submission = submit_transaction_without_retry(
         request.base_node_url,
@@ -4390,11 +5128,11 @@ async fn finalize_signed_transaction_and_broadcast_without_retry(
             db::mark_completed_transaction_as_broadcasted(&conn, tx_id, 1)?;
             mark_prepared_transaction_checkpoint_accepted(
                 request.db_path,
-                &tx_id.to_string(),
+                &tx_id_string,
                 broadcast_to_mempool_ms,
             )?;
             Ok(OneSidedSendOutcome {
-                tx_id: tx_id.to_string(),
+                tx_id: tx_id_string,
                 fee_microtari,
                 accepted: response.accepted,
                 is_synced: response.is_synced,
@@ -4408,7 +5146,7 @@ async fn finalize_signed_transaction_and_broadcast_without_retry(
         }
         Ok(response) if response.rejection_reason == TxSubmissionRejectionReason::AlreadyMined => {
             Ok(OneSidedSendOutcome {
-                tx_id: tx_id.to_string(),
+                tx_id: tx_id_string,
                 fee_microtari,
                 accepted: response.accepted,
                 is_synced: response.is_synced,
@@ -4425,15 +5163,57 @@ async fn finalize_signed_transaction_and_broadcast_without_retry(
             db::mark_completed_transaction_as_rejected(&conn, tx_id, &rejection_reason)?;
             mark_prepared_transaction_checkpoint_rejected(
                 request.db_path,
-                &tx_id.to_string(),
+                &tx_id_string,
                 &rejection_reason,
             )?;
-            anyhow::bail!(
-                "transaction was not accepted by the network: {}",
-                response.rejection_reason
-            );
+            Ok(OneSidedSendOutcome {
+                tx_id: tx_id_string,
+                fee_microtari,
+                accepted: false,
+                is_synced: response.is_synced,
+                rejection_reason: Some(rejection_reason),
+                construction_ms,
+                broadcast_to_mempool_ms: Some(broadcast_to_mempool_ms),
+                broadcast_start_offset_ms: Some(broadcast_start_offset_ms),
+                broadcasted_at: Some(broadcasted_at),
+                recipient: request.recipient.to_string(),
+            })
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let failure_class = classify_submission_failure(&error);
+            Err(anyhow::Error::new(OneSidedSubmissionFailure {
+                identity: Some(identity),
+                submission_started: true,
+                submission_elapsed_ms: Some(broadcast_to_mempool_ms),
+                failure_class,
+                message: format!("{error:#}"),
+            }))
+        }
+    }
+}
+
+fn classify_submission_failure(error: &anyhow::Error) -> ObservationFailureClass {
+    for cause in error.chain() {
+        if let Some(request_error) = cause.downcast_ref::<reqwest::Error>() {
+            return if request_error.is_timeout() {
+                ObservationFailureClass::RequestTimeout
+            } else if request_error.is_decode() {
+                ObservationFailureClass::ResponseDecode
+            } else {
+                ObservationFailureClass::Transport
+            };
+        }
+        if cause.downcast_ref::<serde_json::Error>().is_some() {
+            return ObservationFailureClass::ResponseDecode;
+        }
+    }
+    let message = error.to_string();
+    if message.starts_with("submit_transaction HTTP ") {
+        ObservationFailureClass::HttpResponse
+    } else if message.starts_with("submit_transaction JSON-RPC error:") {
+        ObservationFailureClass::ResponseShape
+    } else {
+        ObservationFailureClass::Transport
     }
 }
 
@@ -4450,10 +5230,56 @@ pub enum PreparedTransactionRecovery {
     RejectedCheckpointReconciled,
     RecoveredConfirmedTransaction(crate::result_profile::S0FundingSubmissionEvidence),
     RecoveredAcceptedPendingConfirmation(crate::result_profile::S0FundingSubmissionEvidence),
+    MeasuredCheckpointUnresolved {
+        tx_id: String,
+        checkpoint_state: String,
+        observed_location: String,
+        submission_allowed: bool,
+        reason: String,
+    },
 }
 
-fn checkpoint_recovery_submission_allowed(status: &str) -> bool {
-    status != "rejected"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointRecoveryPolicy {
+    ReconcileMeasuredWallet,
+    ReconcileKnownS0Submission,
+    RecoverS0SourceFunding,
+}
+
+fn checkpoint_recovery_submission_allowed(policy: CheckpointRecoveryPolicy, status: &str) -> bool {
+    policy == CheckpointRecoveryPolicy::RecoverS0SourceFunding && status != "rejected"
+}
+
+fn require_checkpoint_matches_wallet_row(
+    checkpoint_tx_id: &str,
+    checkpoint_serialized_transaction: &[u8],
+    row: Option<&Mode2CompletedTransactionRow>,
+) -> anyhow::Result<()> {
+    let row = row.with_context(|| {
+        format!("prepared transaction checkpoint {checkpoint_tx_id} has no matching wallet row")
+    })?;
+    if row.serialized_transaction != checkpoint_serialized_transaction {
+        bail!(
+            "prepared transaction checkpoint {checkpoint_tx_id} does not match the wallet row transaction"
+        );
+    }
+    Ok(())
+}
+
+fn require_checkpoint_matches_s0_submission(
+    checkpoint: &PreparedTransactionCheckpoint,
+    submission: &crate::result_profile::S0FundingSubmissionEvidence,
+) -> anyhow::Result<()> {
+    if checkpoint.tx_id != submission.tx_id
+        || checkpoint.fee_microtari != submission.fee_microtari
+        || checkpoint.construction_ms != submission.construction_ms
+        || checkpoint.prepared_at != submission.broadcasted_at
+        || checkpoint.tip_height_at_broadcast != submission.tip_height_at_broadcast
+        || checkpoint.broadcast_to_mempool_ms != submission.broadcast_to_mempool_ms
+    {
+        bail!("prepared transaction checkpoint does not match the durable S0 submission evidence");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4465,11 +5291,12 @@ fn persist_prepared_transaction_checkpoint(
     broadcast_start_offset_ms: u128,
     prepared_at: chrono::DateTime<chrono::Utc>,
     tip_height_at_broadcast: Option<u64>,
+    binding: Option<&PreparedTransactionBinding>,
     transaction: &Transaction,
 ) -> anyhow::Result<()> {
     let path = prepared_transaction_checkpoint_path(db_path, &tx_id.to_string())?;
     let checkpoint = PreparedTransactionCheckpoint {
-        schema_version: 1,
+        schema_version: 2,
         state: "prepared_before_network_submission".to_string(),
         tx_id: tx_id.to_string(),
         fee_microtari,
@@ -4479,6 +5306,7 @@ fn persist_prepared_transaction_checkpoint(
         rejection_reason: None,
         prepared_at,
         tip_height_at_broadcast,
+        binding: binding.cloned(),
         serialized_transaction: transaction.clone(),
     };
     let mut bytes = serde_json::to_vec_pretty(&checkpoint)?;
@@ -4530,6 +5358,30 @@ fn mark_prepared_transaction_checkpoint_rejected_at(
     crate::result_profile::durable_atomic_write(path, &bytes)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct PreparedTransactionBinding {
+    purpose: String,
+    b0_run_id: String,
+    protocol_fingerprint: String,
+    recipients: Vec<String>,
+    amount_microtari_per_recipient: u64,
+}
+
+pub(crate) fn s0_prepared_transaction_binding(
+    b0_run_id: &str,
+    protocol_fingerprint: &str,
+    recipients: &[String],
+    amount_microtari_per_recipient: u64,
+) -> PreparedTransactionBinding {
+    PreparedTransactionBinding {
+        purpose: S0_SOURCE_FUNDING_PURPOSE.to_string(),
+        b0_run_id: b0_run_id.to_string(),
+        protocol_fingerprint: protocol_fingerprint.to_string(),
+        recipients: recipients.to_vec(),
+        amount_microtari_per_recipient,
+    }
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PreparedTransactionCheckpoint {
     schema_version: u32,
@@ -4545,6 +5397,8 @@ struct PreparedTransactionCheckpoint {
     prepared_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     tip_height_at_broadcast: Option<u64>,
+    #[serde(default)]
+    binding: Option<PreparedTransactionBinding>,
     serialized_transaction: Transaction,
 }
 
@@ -4597,7 +5451,12 @@ fn load_prepared_transaction_checkpoint_at(
         &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
     )
     .with_context(|| format!("decoding {}", path.display()))?;
-    if checkpoint.schema_version != 1
+    let supported_schema = match checkpoint.schema_version {
+        1 => checkpoint.binding.is_none(),
+        2 => true,
+        _ => false,
+    };
+    if !supported_schema
         || !matches!(
             checkpoint.state.as_str(),
             "prepared_before_network_submission" | "network_accepted" | "network_rejected"
@@ -4617,11 +5476,23 @@ fn load_prepared_transaction_checkpoint_at(
     Ok(Some(checkpoint))
 }
 
-pub async fn recover_prepared_transaction_checkpoint(
+fn require_expected_s0_checkpoint_binding(
+    actual: Option<&PreparedTransactionBinding>,
+    expected: &PreparedTransactionBinding,
+) -> anyhow::Result<()> {
+    if actual != Some(expected) {
+        bail!("prepared transaction checkpoint is not bound to the current S0 source-funding plan");
+    }
+    Ok(())
+}
+
+pub(crate) async fn recover_s0_source_prepared_transaction_checkpoint(
     db_path: &Path,
     base_node_url: &str,
     timeout: Duration,
     required_depth: u64,
+    expected_binding: &PreparedTransactionBinding,
+    existing_submission: Option<&crate::result_profile::S0FundingSubmissionEvidence>,
 ) -> anyhow::Result<PreparedTransactionRecovery> {
     let paths = prepared_transaction_checkpoint_paths(db_path)?;
     if paths.is_empty() {
@@ -4640,11 +5511,18 @@ pub async fn recover_prepared_transaction_checkpoint(
         base_node_url,
         timeout,
         required_depth,
+        if existing_submission.is_some() {
+            CheckpointRecoveryPolicy::ReconcileKnownS0Submission
+        } else {
+            CheckpointRecoveryPolicy::RecoverS0SourceFunding
+        },
+        Some(expected_binding),
+        existing_submission,
     )
     .await
 }
 
-pub async fn recover_prepared_transaction_checkpoints(
+pub async fn reconcile_measured_prepared_transaction_checkpoints(
     db_path: &Path,
     base_node_url: &str,
     timeout: Duration,
@@ -4659,40 +5537,47 @@ pub async fn recover_prepared_transaction_checkpoints(
             base_node_url,
             timeout,
             required_depth,
+            CheckpointRecoveryPolicy::ReconcileMeasuredWallet,
+            None,
+            None,
         )
         .await?;
-        if matches!(
-            recovery,
-            PreparedTransactionRecovery::RecoveredConfirmedTransaction(_)
-                | PreparedTransactionRecovery::RejectedCheckpointReconciled
-        ) {
-            crate::result_profile::durable_remove_file(&path)?;
-        }
         recoveries.push(recovery);
     }
     Ok(recoveries)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_prepared_transaction_checkpoint_at(
     db_path: &Path,
     checkpoint_path: &Path,
     base_node_url: &str,
     timeout: Duration,
     required_depth: u64,
+    policy: CheckpointRecoveryPolicy,
+    expected_binding: Option<&PreparedTransactionBinding>,
+    existing_submission: Option<&crate::result_profile::S0FundingSubmissionEvidence>,
 ) -> anyhow::Result<PreparedTransactionRecovery> {
     let checkpoint = load_prepared_transaction_checkpoint_at(checkpoint_path)?
         .context("prepared transaction checkpoint disappeared before recovery")?;
+    if let Some(expected_binding) = expected_binding {
+        require_expected_s0_checkpoint_binding(checkpoint.binding.as_ref(), expected_binding)?;
+    }
+    if let Some(existing_submission) = existing_submission {
+        require_checkpoint_matches_s0_submission(&checkpoint, existing_submission)?;
+    }
     if checkpoint.state == "network_rejected" {
         return Ok(PreparedTransactionRecovery::RejectedCheckpointReconciled);
     }
     let tx_id: u64 = checkpoint.tx_id.parse()?;
     let conn = Connection::open(db_path)?;
-    if mode2_completed_transaction_row(&conn, tx_id as i64)?
-        .is_some_and(|row| !checkpoint_recovery_submission_allowed(&row.status))
-    {
+    let row = mode2_completed_transaction_row(&conn, tx_id as i64)?;
+    let serialized = serde_json::to_vec(&checkpoint.serialized_transaction)?;
+    require_checkpoint_matches_wallet_row(&checkpoint.tx_id, &serialized, row.as_ref())?;
+    let wallet_status = row.as_ref().map(|row| row.status.clone());
+    if wallet_status.as_deref() == Some("rejected") {
         return Ok(PreparedTransactionRecovery::RejectedCheckpointReconciled);
     }
-    let serialized = serde_json::to_vec(&checkpoint.serialized_transaction)?;
     let kernel = mode2_kernel_query_from_serialized_transaction(&serialized)?;
     let client = base_node_http_client()?;
     let deadline = time::Instant::now() + timeout;
@@ -4743,6 +5628,21 @@ async fn recover_prepared_transaction_checkpoint_at(
             break true;
         }
         if matches!(response.location, TxLocation::NotStored | TxLocation::None) && !submitted {
+            let wallet_status = wallet_status.as_deref().unwrap_or("completed");
+            if !checkpoint_recovery_submission_allowed(policy, wallet_status) {
+                if policy == CheckpointRecoveryPolicy::ReconcileKnownS0Submission {
+                    submitted = true;
+                    continue;
+                }
+                return Ok(PreparedTransactionRecovery::MeasuredCheckpointUnresolved {
+                    tx_id: checkpoint.tx_id.clone(),
+                    checkpoint_state: checkpoint.state.clone(),
+                    observed_location: format!("{:?}", response.location),
+                    submission_allowed: false,
+                    reason: "measured-wallet recovery is query/reconciliation-only; automatic resubmission is restricted to the dedicated S0 source-funding workflow"
+                        .to_string(),
+                });
+            }
             let remaining = deadline.saturating_duration_since(time::Instant::now());
             let submission_start = Instant::now();
             let submission = time::timeout(
@@ -4949,18 +5849,40 @@ impl FreshScanSpec {
     }
 }
 
-fn resolved_birthday_start_height(config: &Config, mode: &str, spec: FreshScanSpec) -> u64 {
-    if spec.birthday() == 0 {
-        return 0;
-    }
+fn scan_funding_record<'a>(config: &'a Config, mode: &str) -> Option<&'a FundingRecord> {
     match mode {
         "old_wallet" => config.funding.old_wallet.as_ref(),
         "new_wallet" => config.funding.new_wallet.as_ref(),
         "payment_processor" => config.funding.payment_processor.as_ref(),
         _ => None,
     }
-    .and_then(|funding| funding.birthday_start_height)
-    .unwrap_or_default()
+}
+
+fn resolved_birthday_height(config: &Config, mode: &str, spec: FreshScanSpec) -> u64 {
+    if spec.birthday() == 0 {
+        return 0;
+    }
+    scan_funding_record(config, mode)
+        .and_then(|funding| funding.birthday_height)
+        .unwrap_or_default()
+}
+
+fn resolved_birthday_offset_days(config: &Config, mode: &str, spec: FreshScanSpec) -> u16 {
+    if spec.birthday() == 0 {
+        return 0;
+    }
+    scan_funding_record(config, mode)
+        .and_then(|funding| funding.birthday_offset_days)
+        .unwrap_or(STOCK_BIRTHDAY_OFFSET_DAYS)
+}
+
+fn resolved_birthday_start_height(config: &Config, mode: &str, spec: FreshScanSpec) -> u64 {
+    if spec.birthday() == 0 {
+        return 0;
+    }
+    scan_funding_record(config, mode)
+        .and_then(|funding| funding.birthday_start_height)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5231,6 +6153,26 @@ struct ScanProgress {
     no_progress_attempts: u64,
 }
 
+#[derive(Debug)]
+struct ScanDeadlineExceeded {
+    timeout: Duration,
+    wall_ms: u128,
+    target_tip: u64,
+    initial_height: u64,
+}
+
+impl std::fmt::Display for ScanDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "wallet scan exceeded its fixed deadline of {:?}: target_tip={} initial_cursor={}",
+            self.timeout, self.target_tip, self.initial_height
+        )
+    }
+}
+
+impl std::error::Error for ScanDeadlineExceeded {}
+
 #[derive(Debug, Clone)]
 pub struct ScanToTipReport {
     pub wall_ms: u128,
@@ -5269,6 +6211,10 @@ impl ScanToTipReport {
             serde_json::json!(self.completion_tip.saturating_sub(self.target_tip)),
         );
         metrics.insert(
+            "scan_tip_lag_blocks".to_string(),
+            serde_json::json!(self.target_tip.saturating_sub(self.completion_tip)),
+        );
+        metrics.insert(
             "scan_max_height".to_string(),
             serde_json::json!(self.max_height),
         );
@@ -5294,8 +6240,8 @@ impl ScanToTipReport {
         );
         metrics.insert(
             "scan_stop_reason".to_string(),
-            serde_json::json!(if self.stopped_without_progress {
-                Some("scanner_stopped_below_fixed_target")
+            serde_json::json!(if self.max_height < self.target_tip {
+                Some("scanner_returned_below_fixed_target")
             } else {
                 None
             }),
@@ -5315,8 +6261,11 @@ struct ScanExpectations {
 struct ScanMeasurement {
     wall_ms: u128,
     birthday: u16,
+    birthday_height: u64,
+    birthday_offset_days: u16,
     birthday_start_height: u64,
     max_height: u64,
+    target_cursor_hash: Option<String>,
     cursor_hash: Option<String>,
     available_microtari: u64,
     tip_start: Option<u64>,
@@ -5336,7 +6285,9 @@ struct ScanMeasurement {
     scan_no_progress_attempts: u64,
     scan_stopped_without_progress: bool,
     scan_last_more_blocks: Option<bool>,
+    scan_timeout_ms: Option<u128>,
     scan_error: Option<String>,
+    allow_target_overshoot: bool,
 }
 
 impl ScanMeasurement {
@@ -5354,14 +6305,12 @@ impl ScanMeasurement {
     }
 
     fn metrics(&self, mode: &str, spec: FreshScanSpec) -> serde_json::Value {
-        let blocks_scanned = Some(self.max_height.saturating_sub(self.birthday_start_height));
-        let blocks_per_sec = blocks_scanned.and_then(|blocks| {
-            if self.wall_ms == 0 {
-                None
-            } else {
-                Some((blocks as f64) / (self.wall_ms as f64 / 1000.0))
-            }
-        });
+        let blocks_scanned = self.max_height.saturating_sub(self.birthday_height);
+        let effective_blocks_scanned = self.max_height.saturating_sub(self.birthday_start_height);
+        let blocks_per_sec =
+            (self.wall_ms != 0).then(|| (blocks_scanned as f64) / (self.wall_ms as f64 / 1000.0));
+        let effective_blocks_per_sec = (self.wall_ms != 0)
+            .then(|| (effective_blocks_scanned as f64) / (self.wall_ms as f64 / 1000.0));
         let missing_history_tx_ids = self
             .expectations
             .expected_history_tx_ids
@@ -5400,22 +6349,30 @@ impl ScanMeasurement {
             "balance_matches_expected": self.expectations.expected_available_microtari.map(|expected| expected == self.available_microtari),
             "balance_delta_microtari": self.expectations.expected_available_microtari.map(|expected| i128::from(expected) - i128::from(self.available_microtari)),
             "birthday": self.birthday,
+            "H_birth": self.birthday_height,
+            "birthday_height": self.birthday_height,
+            "birthday_offset_days": self.birthday_offset_days,
             "birthday_start_height": self.birthday_start_height,
             "tip_start": self.tip_start,
             "tip_end": self.tip_end,
             "H_tip_start": self.tip_start,
             "H_tip_end": self.tip_end,
             "H_tip_target_hash": self.tip_target_hash,
+            "H_scan_target_cursor_hash": self.target_cursor_hash,
             "H_scan_cursor_hash": self.cursor_hash,
             "H_tip_completion": self.tip_completion,
             "H_tip_completion_hash": self.tip_completion_hash,
             "tip_drift_blocks": self.tip_completion.zip(self.tip_end).map(|(completion, target)| completion.saturating_sub(target)),
             "tip_lag_blocks": self.tip_lag_blocks(),
+            "scan_overshoot_blocks": self.tip_end.map(|tip| self.max_height.saturating_sub(tip)),
+            "scan_target_overshoot_allowed": self.allow_target_overshoot,
             "tip_lag_tolerance_blocks": self.tip_lag_tolerance_blocks,
             "scan_reached_tip": self.scan_reached_tip(),
             "scan_invocations": self.scan_invocations,
             "blocks_scanned": blocks_scanned,
             "blocks_per_sec": blocks_per_sec,
+            "effective_blocks_scanned": effective_blocks_scanned,
+            "effective_blocks_per_sec": effective_blocks_per_sec,
             "detected_outputs": self.detected_outputs,
             "history_transactions": self.history_transactions,
             "history_count_matches_expected": self.expectations.expected_history_transactions.map(|expected| self.history_transactions == expected),
@@ -5427,7 +6384,15 @@ impl ScanMeasurement {
             "scan_no_progress_attempts": self.scan_no_progress_attempts,
             "scan_stopped_without_progress": self.scan_stopped_without_progress,
             "scan_last_more_blocks": self.scan_last_more_blocks,
-            "scan_stop_reason": if self.scan_stopped_without_progress { Some("scanner_stopped_below_fixed_target") } else { None },
+            "scan_stop_reason": if self.scan_timeout_ms.is_some() {
+                Some("scan_timeout")
+            } else if !self.scan_reached_tip() {
+                Some("scanner_returned_below_fixed_target")
+            } else {
+                None
+            },
+            "scan_timed_out": self.scan_timeout_ms.is_some(),
+            "scan_timeout_ms": self.scan_timeout_ms,
             "scan_error": self.scan_error,
             "peak_rss_bytes": self.resource_peaks.peak_rss_bytes,
             "peak_cpu_percent": self.resource_peaks.peak_cpu_percent,
@@ -5439,7 +6404,7 @@ impl ScanMeasurement {
     fn scan_verification_ok(&self) -> bool {
         self.scan_error.is_none()
             && self.scan_reached_tip()
-            && self.cursor_hash == self.tip_target_hash
+            && self.target_cursor_hash == self.tip_target_hash
             && self
                 .expectations
                 .expected_outputs
@@ -5461,11 +6426,14 @@ impl ScanMeasurement {
 
     fn scan_verification_error(&self) -> String {
         format!(
-            "scan verification mismatch: scan_error={:?} max_height={} tip_end={:?} tip_lag_blocks={:?} tip_lag_tolerance_blocks={} expected_outputs={:?} spendable_outputs={} detected_outputs={} expected_available_microtari={:?} available_microtari={} expected_history_transactions={:?} history_transactions={} missing_history_tx_ids={:?} missing_history_output_tx_ids={:?}",
+            "scan verification mismatch: scan_error={:?} max_height={} tip_end={:?} target_cursor_hash={:?} tip_target_hash={:?} tip_lag_blocks={:?} scan_target_overshoot_allowed={} tip_lag_tolerance_blocks={} expected_outputs={:?} spendable_outputs={} detected_outputs={} expected_available_microtari={:?} available_microtari={} expected_history_transactions={:?} history_transactions={} missing_history_tx_ids={:?} missing_history_output_tx_ids={:?}",
             self.scan_error,
             self.max_height,
             self.tip_end,
+            self.target_cursor_hash,
+            self.tip_target_hash,
             self.tip_lag_blocks(),
+            self.allow_target_overshoot,
             self.tip_lag_tolerance_blocks,
             self.expectations.expected_outputs,
             self.spendable_outputs,
@@ -5508,8 +6476,14 @@ impl ScanMeasurement {
     }
 
     fn scan_reached_tip(&self) -> bool {
-        self.tip_end
-            .is_none_or(|tip| self.max_height == tip && self.tip_lag_tolerance_blocks == 0)
+        self.tip_end.is_none_or(|tip| {
+            self.tip_lag_tolerance_blocks == 0
+                && if self.allow_target_overshoot {
+                    self.max_height >= tip
+                } else {
+                    self.max_height == tip
+                }
+        })
     }
 }
 
@@ -5623,6 +6597,45 @@ mod tests {
     }
 
     #[test]
+    fn s4_serialization_gap_uses_only_genuine_mode_specific_construction_events() {
+        let batch_summaries = serde_json::json!([{
+            "configured_batch": 4,
+            "wall_ms": 900_000
+        }]);
+        let pp_observations = vec![
+            serde_json::json!({
+                "configured_batch": 4,
+                "api_accepted": true,
+                "terminal_outcome": "stalled",
+                "construction_complete_offset_ms": 100,
+                "construction_timing_origin": "payment_processor_db_unsigned_tx_first_observation",
+                "recipients": ["a"]
+            }),
+            serde_json::json!({
+                "configured_batch": 4,
+                "api_accepted": true,
+                "terminal_outcome": "stalled",
+                "construction_complete_offset_ms": 145,
+                "construction_timing_origin": "payment_processor_db_unsigned_tx_first_observation",
+                "recipients": ["b"]
+            }),
+        ];
+
+        let pp_arms = s4_arms_metrics("payment_processor", &pp_observations, &batch_summaries);
+        assert_eq!(pp_arms[0]["max_serialization_gap_ms"], 45);
+        assert!(pp_arms[0]["serialization_timing_reason"].is_null());
+
+        let old_arms = s4_arms_metrics("old_wallet", &pp_observations, &batch_summaries);
+        assert!(old_arms[0]["max_serialization_gap_ms"].is_null());
+        assert!(
+            old_arms[0]["serialization_timing_reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not expose a genuine")
+        );
+    }
+
+    #[test]
     fn double_selection_rejections_classifies_wallet_lock_errors() {
         let errors = vec![
             "Funds are pending. Available: 0".to_string(),
@@ -5711,6 +6724,70 @@ mod tests {
         assert_eq!(summary.failure_count, 0);
         assert!(mode1_s1_complete(&summary, 1));
         assert!(!mode1_s1_complete(&summary, 127));
+    }
+
+    #[test]
+    fn mode1_s1_observation_uses_constructed_payment_and_change_roles() {
+        let mut summary = Mode1TransferSummary {
+            tx_ids: vec!["42".to_string()],
+            tx_timings: vec![serde_json::json!({
+                "tx_id": "42",
+                "api_accepted": true
+            })],
+            tx_infos: vec![VerifiedTransaction {
+                tx_id: "42".to_string(),
+                status_value: TX_MINED_CONFIRMED_STATUS,
+                mode: "old_wallet".to_string(),
+                scenario: ScenarioName::S1.as_str().to_string(),
+                amount_microtari: None,
+                fee_microtari: Some(660),
+                mined_height: Some(784_029),
+                confirmations: Some(3),
+                min_confirmations: Some(3),
+                tip_height: Some(784_032),
+                confirmed: true,
+            }],
+            transaction_shapes: BTreeMap::from([(
+                "42".to_string(),
+                TransactionShape {
+                    input_count: 1,
+                    total_output_count: 2,
+                    output_commitments: vec!["payment".to_string(), "change".to_string()],
+                },
+            )]),
+            ..Mode1TransferSummary::default()
+        };
+        summary.retain_constructed_output_shape_for_new_tx_ids(
+            0,
+            ConstructedOutputShape {
+                payment_output_count: 1,
+                change_output_count: 1,
+                total_output_count: 2,
+            },
+        );
+
+        let metrics = summary.metrics(ScenarioName::S1);
+
+        assert_eq!(
+            metrics["constructed_output_shapes_by_tx_id"]["42"],
+            serde_json::json!({
+                "payment_output_count": 1,
+                "change_output_count": 1,
+                "total_output_count": 2
+            })
+        );
+        assert_eq!(
+            metrics["transaction_observations"][0]["payment_output_count"],
+            1
+        );
+        assert_eq!(
+            metrics["transaction_observations"][0]["change_output_count"],
+            1
+        );
+        assert_eq!(
+            metrics["transaction_observations"][0]["total_output_count"],
+            2
+        );
     }
 
     #[test]
@@ -5895,7 +6972,11 @@ mod tests {
             errors: vec!["NotFound: Transaction 42 not found within timeout".to_string()],
             tx_timings: vec![serde_json::json!({
                 "tx_id": "42",
-                "api_accepted": false,
+                "submission_timing_origin": "console_wallet_grpc_timeout_after_transaction_id_ambiguous",
+                "submission_started": true,
+                "submission_ambiguous": true,
+                "api_accepted": null,
+                "failure_class": "request_timeout",
                 "api_error": "NotFound: Transaction 42 not found within timeout"
             })],
             tx_infos: vec![VerifiedTransaction {
@@ -5926,6 +7007,45 @@ mod tests {
             metrics["tx_timings"][0]["api_error"],
             summary.tx_timings[0]["api_error"]
         );
+    }
+
+    #[test]
+    fn mode1_api_not_found_timeout_is_not_reported_as_rejected_without_chain_proof() {
+        let config = Config::default();
+        let mut profile = ResultProfile::new(&config, crate::env_capture::capture());
+        profile.modes.insert(
+            ModeName::OldWallet.as_str().to_string(),
+            empty_mode_profile(ModeName::OldWallet, None),
+        );
+        let summary = Mode1TransferSummary {
+            attempted_batches: 1,
+            attempted_payments: 1,
+            failure_count: 1,
+            tx_ids: vec!["42".to_string()],
+            errors: vec!["NotFound: Transaction 42 not found within timeout".to_string()],
+            tx_timings: vec![serde_json::json!({
+                "tx_id": "42",
+                "submission_timing_origin": "console_wallet_grpc_timeout_after_transaction_id_ambiguous",
+                "submission_started": true,
+                "submission_ambiguous": true,
+                "api_accepted": null,
+                "failure_class": "request_timeout",
+                "api_error": "NotFound: Transaction 42 not found within timeout"
+            })],
+            ..Mode1TransferSummary::default()
+        };
+
+        record_mode1_transfer_summary(&mut profile, ScenarioName::S4, &summary, None, Vec::new());
+        let repetition = &profile.modes["old_wallet"].scenarios["S4"].repetitions[0];
+        let metrics = repetition.metrics.as_ref().unwrap();
+        let observation = &metrics["transaction_observations"][0];
+
+        assert_eq!(observation["submission_started"], true);
+        assert!(observation["api_accepted"].is_null());
+        assert_eq!(observation["failure_class"], "request_timeout");
+        assert_eq!(observation["terminal_outcome"], "timed_out");
+        assert_eq!(metrics["outcome_counts"]["rejected"], 0);
+        assert_eq!(metrics["outcome_counts"]["timed_out"], 1);
     }
 
     #[test]
@@ -6257,11 +7377,125 @@ mod tests {
     }
 
     #[test]
+    fn operational_refresh_requires_the_fixed_target_cursor_and_hash() {
+        let mut report = ScanToTipReport {
+            wall_ms: 10,
+            target_tip: 100,
+            target_hash: "target".to_string(),
+            completion_tip: 105,
+            completion_hash: "completion".to_string(),
+            max_height: 99,
+            cursor_hash: Some("partial".to_string()),
+            scan_invocations: 1,
+            no_progress_attempts: 0,
+            stopped_without_progress: false,
+            last_more_blocks: Some(true),
+        };
+
+        let error = require_complete_operational_refresh(&report).unwrap_err();
+        assert!(error.to_string().contains("persisted cursor 99"));
+
+        report.max_height = 100;
+        let error = require_complete_operational_refresh(&report).unwrap_err();
+        assert!(error.to_string().contains("cursor hash mismatch"));
+
+        report.cursor_hash = Some("target".to_string());
+        require_complete_operational_refresh(&report).unwrap();
+    }
+
+    #[test]
+    fn scan_report_stop_reason_uses_the_wallet_cursor() {
+        let report = ScanToTipReport {
+            wall_ms: 10,
+            target_tip: 100,
+            target_hash: "target".to_string(),
+            completion_tip: 105,
+            completion_hash: "completion".to_string(),
+            max_height: 99,
+            cursor_hash: Some("partial".to_string()),
+            scan_invocations: 1,
+            no_progress_attempts: 0,
+            stopped_without_progress: false,
+            last_more_blocks: Some(true),
+        };
+        let mut metrics = serde_json::Map::new();
+
+        report.insert_metrics(&mut metrics);
+
+        assert_eq!(
+            metrics["scan_stop_reason"],
+            serde_json::json!("scanner_returned_below_fixed_target")
+        );
+    }
+
+    #[test]
+    fn timed_out_scan_metrics_preserve_measured_evidence() {
+        let measurement = ScanMeasurement {
+            birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
+            birthday_start_height: 0,
+            max_height: 42,
+            target_cursor_hash: None,
+            cursor_hash: Some("partial".to_string()),
+            wall_ms: 1_234,
+            available_microtari: 7,
+            tip_start: Some(100),
+            tip_end: Some(100),
+            tip_target_hash: Some("target".to_string()),
+            tip_completion: Some(101),
+            tip_completion_hash: Some("completion".to_string()),
+            detected_outputs: 2,
+            history_transactions: 1,
+            history_tx_ids: BTreeSet::new(),
+            recovered_output_commitments: BTreeSet::new(),
+            spendable_outputs: 1,
+            resource_peaks: ResourcePeaks {
+                peak_rss_bytes: Some(1_024),
+                peak_cpu_percent: Some(12.5),
+            },
+            expectations: ScanExpectations::default(),
+            tip_lag_tolerance_blocks: 0,
+            scan_invocations: 1,
+            scan_no_progress_attempts: 0,
+            scan_stopped_without_progress: false,
+            scan_last_more_blocks: None,
+            scan_timeout_ms: Some(1_000),
+            scan_error: Some("wallet scan exceeded its fixed deadline".to_string()),
+            allow_target_overshoot: false,
+        };
+        let metrics = measurement.metrics(
+            "new_wallet",
+            FreshScanSpec {
+                scenario: ScenarioName::S2,
+                wallet_state: FreshScanWalletState::FundedGenesis,
+                checkpoint: ScanCheckpoint::PostS1,
+            },
+        );
+
+        assert!(!measurement.scan_verification_ok());
+        assert_eq!(metrics["scan_timed_out"], serde_json::json!(true));
+        assert_eq!(metrics["scan_timeout_ms"], serde_json::json!(1_000));
+        assert_eq!(metrics["H_tip_end"], serde_json::json!(100));
+        assert_eq!(metrics["max_height"], serde_json::json!(42));
+        assert_eq!(metrics["scan_invocations"], serde_json::json!(1));
+        assert_eq!(metrics["peak_rss_bytes"], serde_json::json!(1_024));
+        assert_eq!(metrics["peak_cpu_percent"], serde_json::json!(12.5));
+        assert_eq!(
+            metrics["scan_stop_reason"],
+            serde_json::json!("scan_timeout")
+        );
+    }
+
+    #[test]
     fn birthday_scan_metrics_include_blocks_per_second() {
         let measurement = ScanMeasurement {
             birthday: 1_635,
+            birthday_height: 705_000,
+            birthday_offset_days: 2,
             birthday_start_height: 700_000,
             max_height: 711_305,
+            target_cursor_hash: Some("target".to_string()),
             cursor_hash: Some("target".to_string()),
             wall_ms: 10_000,
             available_microtari: 1,
@@ -6282,7 +7516,9 @@ mod tests {
             scan_no_progress_attempts: 0,
             scan_stopped_without_progress: false,
             scan_last_more_blocks: None,
+            scan_timeout_ms: None,
             scan_error: None,
+            allow_target_overshoot: false,
         };
         let spec = FreshScanSpec {
             scenario: ScenarioName::S3,
@@ -6291,16 +7527,25 @@ mod tests {
         };
         let metrics = measurement.metrics("new_wallet", spec);
 
-        assert_eq!(metrics["blocks_scanned"], serde_json::json!(11_305));
+        assert_eq!(metrics["H_birth"], serde_json::json!(705_000));
+        assert_eq!(metrics["blocks_scanned"], serde_json::json!(6_305));
+        assert_eq!(
+            metrics["effective_blocks_scanned"],
+            serde_json::json!(11_305)
+        );
         assert!(metrics["blocks_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(metrics["effective_blocks_per_sec"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
     fn scan_verification_fails_when_scan_stops_far_below_tip() {
         let measurement = ScanMeasurement {
             birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
             birthday_start_height: 0,
             max_height: 627_100,
+            target_cursor_hash: None,
             cursor_hash: Some("partial".to_string()),
             wall_ms: 10_000,
             available_microtari: 0,
@@ -6326,7 +7571,9 @@ mod tests {
             scan_no_progress_attempts: 2,
             scan_stopped_without_progress: true,
             scan_last_more_blocks: Some(true),
+            scan_timeout_ms: None,
             scan_error: None,
+            allow_target_overshoot: false,
         };
 
         assert!(!measurement.scan_verification_ok());
@@ -6343,8 +7590,11 @@ mod tests {
         let expected = BTreeSet::from(["commitment-a".to_string()]);
         let measurement = ScanMeasurement {
             birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
             birthday_start_height: 0,
             max_height: 10,
+            target_cursor_hash: Some("target".to_string()),
             cursor_hash: Some("target".to_string()),
             wall_ms: 1,
             available_microtari: 1,
@@ -6373,7 +7623,9 @@ mod tests {
             scan_no_progress_attempts: 0,
             scan_stopped_without_progress: false,
             scan_last_more_blocks: Some(false),
+            scan_timeout_ms: None,
             scan_error: None,
+            allow_target_overshoot: false,
         };
 
         assert!(measurement.scan_verification_ok());
@@ -6396,8 +7648,11 @@ mod tests {
     fn scan_verification_requires_exact_tip_for_scan_scenarios() {
         let measurement = ScanMeasurement {
             birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
             birthday_start_height: 0,
             max_height: 726_902,
+            target_cursor_hash: None,
             cursor_hash: Some("partial".to_string()),
             wall_ms: 10_000,
             available_microtari: 0,
@@ -6423,7 +7678,9 @@ mod tests {
             scan_no_progress_attempts: 0,
             scan_stopped_without_progress: false,
             scan_last_more_blocks: None,
+            scan_timeout_ms: None,
             scan_error: None,
+            allow_target_overshoot: false,
         };
 
         assert!(!measurement.scan_verification_ok());
@@ -6441,11 +7698,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_verification_rejects_overshoot_and_cursor_hash_mismatch() {
+    fn scan_verification_rejects_unapproved_overshoot_and_target_hash_mismatch() {
         let mut measurement = ScanMeasurement {
             birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
             birthday_start_height: 0,
             max_height: 101,
+            target_cursor_hash: Some("target".to_string()),
             cursor_hash: Some("target".to_string()),
             wall_ms: 1,
             available_microtari: 0,
@@ -6466,15 +7726,71 @@ mod tests {
             scan_no_progress_attempts: 0,
             scan_stopped_without_progress: false,
             scan_last_more_blocks: None,
+            scan_timeout_ms: None,
             scan_error: None,
+            allow_target_overshoot: false,
         };
 
         assert!(!measurement.scan_verification_ok());
         measurement.max_height = 100;
-        measurement.cursor_hash = Some("other".to_string());
+        measurement.target_cursor_hash = Some("other".to_string());
         assert!(!measurement.scan_verification_ok());
-        measurement.cursor_hash = Some("target".to_string());
+        measurement.target_cursor_hash = Some("target".to_string());
         assert!(measurement.scan_verification_ok());
+    }
+
+    #[test]
+    fn mode1_scan_verification_accepts_honest_overshoot_at_immutable_target() {
+        let mut measurement = ScanMeasurement {
+            birthday: 0,
+            birthday_height: 0,
+            birthday_offset_days: 0,
+            birthday_start_height: 0,
+            max_height: 101,
+            target_cursor_hash: Some("target".to_string()),
+            cursor_hash: Some("completion".to_string()),
+            wall_ms: 1,
+            available_microtari: 0,
+            tip_start: Some(100),
+            tip_end: Some(100),
+            tip_target_hash: Some("target".to_string()),
+            tip_completion: Some(101),
+            tip_completion_hash: Some("completion".to_string()),
+            detected_outputs: 0,
+            history_transactions: 0,
+            history_tx_ids: BTreeSet::new(),
+            recovered_output_commitments: BTreeSet::new(),
+            spendable_outputs: 0,
+            resource_peaks: ResourcePeaks::default(),
+            expectations: ScanExpectations::default(),
+            tip_lag_tolerance_blocks: 0,
+            scan_invocations: 1,
+            scan_no_progress_attempts: 0,
+            scan_stopped_without_progress: false,
+            scan_last_more_blocks: None,
+            scan_timeout_ms: None,
+            scan_error: None,
+            allow_target_overshoot: true,
+        };
+
+        assert!(measurement.scan_verification_ok());
+        let metrics = measurement.metrics(
+            "old_wallet",
+            FreshScanSpec {
+                scenario: ScenarioName::S2,
+                wallet_state: FreshScanWalletState::FundedGenesis,
+                checkpoint: ScanCheckpoint::PostS1,
+            },
+        );
+        assert_eq!(metrics["H_tip_end"], serde_json::json!(100));
+        assert_eq!(metrics["max_height"], serde_json::json!(101));
+        assert_eq!(metrics["H_scan_target_cursor_hash"], "target");
+        assert_eq!(metrics["H_scan_cursor_hash"], "completion");
+        assert_eq!(metrics["scan_overshoot_blocks"], serde_json::json!(1));
+        assert_eq!(metrics["scan_reached_tip"], true);
+
+        measurement.target_cursor_hash = Some("wrong".to_string());
+        assert!(!measurement.scan_verification_ok());
     }
 
     #[test]
@@ -6609,6 +7925,60 @@ mod tests {
         assert_eq!(outcome.tx_timings[0]["tx_id"], "42");
         assert_eq!(outcome.tx_timings[0]["api_accepted"], true);
         assert_eq!(outcome.tx_timings[0]["grpc_round_trip_ms"], 25);
+        assert!(outcome.tx_timings[0]["construction_complete_ms"].is_null());
+    }
+
+    #[test]
+    fn mode1_arm_deadline_is_ambiguous_and_never_classified_as_rejected() {
+        let mut summary = Mode1TransferSummary::default();
+        summary.record_deadline_timeout(
+            3,
+            1,
+            17,
+            900_000,
+            vec!["recipient".to_string()],
+            "absolute deadline expired".to_string(),
+        );
+
+        let observation = &summary.transaction_observations(ScenarioName::S4)[0];
+        assert_eq!(observation["terminal_outcome"], "timed_out");
+        assert_eq!(observation["failure_class"], "arm_deadline");
+        assert!(observation["api_accepted"].is_null());
+        assert!(observation["construction_ms"].is_null());
+        assert!(observation["construction_complete_offset_ms"].is_null());
+    }
+
+    #[test]
+    fn mode1_grpc_transport_failure_is_ambiguous_not_rejected() {
+        let mut ambiguous = Mode1TransferSummary::default();
+        ambiguous.record_batch(
+            1,
+            1,
+            5,
+            25,
+            vec!["recipient".to_string()],
+            Err(tonic::Status::unavailable("connection lost").into()),
+        );
+        let observation = &ambiguous.transaction_observations(ScenarioName::S4)[0];
+        assert_eq!(observation["terminal_outcome"], "stalled");
+        assert_eq!(observation["submission_started"], true);
+        assert_eq!(observation["failure_class"], "transport");
+        assert!(observation["api_accepted"].is_null());
+
+        let mut rejected = Mode1TransferSummary::default();
+        rejected.record_batch(
+            1,
+            1,
+            5,
+            25,
+            vec!["recipient".to_string()],
+            Err(tonic::Status::invalid_argument("bad address").into()),
+        );
+        let observation = &rejected.transaction_observations(ScenarioName::S4)[0];
+        assert_eq!(observation["terminal_outcome"], "rejected");
+        assert_eq!(observation["submission_started"], true);
+        assert_eq!(observation["failure_class"], "wallet");
+        assert_eq!(observation["api_accepted"], false);
     }
 
     #[test]
@@ -6675,6 +8045,7 @@ mod tests {
 
         let stalled = summary.transaction_observations();
         assert_eq!(stalled[0]["terminal_outcome"], "stalled");
+        assert_eq!(stalled[0]["submission_started"], true);
         assert_eq!(stalled[0]["fee_disposition"], "proposed_unresolved");
         assert_eq!(stalled[0]["fee_microtari"], 700);
         assert_eq!(
@@ -6689,6 +8060,78 @@ mod tests {
         let timed_out = summary.transaction_observations();
         assert_eq!(timed_out[0]["terminal_outcome"], "timed_out");
         assert_eq!(timed_out[0]["failure_class"], "arm_deadline");
+    }
+
+    #[test]
+    fn pp_arm_deadline_is_ambiguous_and_never_classified_as_rejected() {
+        let mut summary = PpScenarioSummary::default();
+        summary.record_deadline_timeout(
+            7,
+            21,
+            900_000,
+            vec!["recipient".to_string()],
+            "absolute deadline expired".to_string(),
+        );
+
+        let observation = &summary.transaction_observations()[0];
+        assert_eq!(observation["terminal_outcome"], "timed_out");
+        assert_eq!(observation["failure_class"], "arm_deadline");
+        assert!(observation["api_accepted"].is_null());
+        assert!(observation["construction_ms"].is_null());
+        assert!(observation["construction_complete_offset_ms"].is_null());
+    }
+
+    #[test]
+    fn pp_construction_timing_requires_first_persisted_unsigned_transaction_observation() {
+        let mut summary = PpScenarioSummary {
+            tx_timings: vec![serde_json::json!({
+                "batch_index": 1,
+                "batch_id": "batch",
+                "submit_offset_ms": 25,
+                "construction_complete_offset_ms": null,
+                "construction_ms": null,
+                "construction_timing_origin": null,
+                "api_accepted": true
+            })],
+            ..PpScenarioSummary::default()
+        };
+        let mut snapshot = PaymentProcessorDbSnapshot {
+            batches: vec![payment_processor::PaymentBatchSnapshot {
+                id: "batch".to_string(),
+                status: "PENDING_BATCHING".to_string(),
+                retry_count: 0,
+                error_message: None,
+                has_unsigned_tx: false,
+                has_signed_tx: false,
+                mined_height: None,
+                chain_tx_id: None,
+                fee_microtari: None,
+                kernel_excess_sig_nonce: None,
+                kernel_excess_sig: None,
+                input_count: None,
+                total_output_count: None,
+                output_commitments: None,
+            }],
+            payments: Vec::new(),
+        };
+
+        summary.record_construction_observations(&snapshot, 100);
+        assert!(summary.tx_timings[0]["construction_complete_offset_ms"].is_null());
+        assert!(summary.construction_complete_ms.is_empty());
+
+        snapshot.batches[0].has_unsigned_tx = true;
+        summary.record_construction_observations(&snapshot, 125);
+        summary.record_construction_observations(&snapshot, 150);
+        assert_eq!(
+            summary.tx_timings[0]["construction_complete_offset_ms"],
+            125
+        );
+        assert_eq!(summary.tx_timings[0]["construction_ms"], 100);
+        assert_eq!(
+            summary.tx_timings[0]["construction_timing_origin"],
+            "payment_processor_db_unsigned_tx_first_observation"
+        );
+        assert_eq!(summary.construction_complete_ms, vec![125]);
     }
 
     #[test]
@@ -6712,12 +8155,100 @@ mod tests {
 
         let observation = &summary.transaction_observations()[0];
         assert_eq!(observation["terminal_outcome"], "rejected");
+        assert_eq!(observation["submission_started"], true);
         assert_eq!(observation["failure_class"], "http_response");
         assert_eq!(observation["http_status"], 500);
         assert_eq!(
             observation["batch_id"],
             "2f1c928d-9516-48c8-b926-e5cbe33b3168"
         );
+    }
+
+    #[test]
+    fn pp_transport_failure_remains_ambiguous_without_an_explicit_rejection() {
+        let mut summary = PpScenarioSummary::default();
+        summary.record_batch(
+            1,
+            0,
+            1,
+            vec!["recipient".to_string()],
+            Err(payment_processor::PaymentProcessorError::Transport {
+                message: "connection closed after request write".to_string(),
+                request_id: Some("request-1".to_string()),
+                batch_id: Some("2f1c928d-9516-48c8-b926-e5cbe33b3168".to_string()),
+            }
+            .into()),
+        );
+
+        let observation = &summary.transaction_observations()[0];
+        assert_eq!(observation["terminal_outcome"], "stalled");
+        assert_eq!(observation["failure_class"], "transport");
+        assert!(observation["api_accepted"].is_null());
+        assert_eq!(observation["submission_started"], true);
+        assert_eq!(observation["submission_ms"], 1);
+        assert_eq!(
+            observation["submission_timing_origin"],
+            "payment_processor_api_request_ambiguous"
+        );
+    }
+
+    #[test]
+    fn pp_local_pre_api_failure_is_not_faked_as_rejection() {
+        let mut summary = PpScenarioSummary::default();
+        summary.record_batch(
+            1,
+            3,
+            7,
+            vec!["recipient".to_string()],
+            Err(anyhow::anyhow!("exact split planner failed")),
+        );
+
+        let observation = &summary.transaction_observations()[0];
+        assert_eq!(observation["terminal_outcome"], "stalled");
+        assert!(observation["api_accepted"].is_null());
+        assert_eq!(observation["submission_started"], false);
+        assert!(observation["submission_ms"].is_null());
+        assert_eq!(observation["failure_class"], "wallet");
+        assert_eq!(
+            observation["submission_timing_origin"],
+            "payment_processor_pre_api"
+        );
+    }
+
+    #[test]
+    fn pp_response_failures_preserve_started_ambiguous_state() {
+        let decode_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("fixture must be invalid JSON");
+        let cases = [
+            (
+                anyhow::Error::from(payment_processor::PaymentProcessorError::Decode {
+                    url: "http://localhost/v1/payment-batches".to_string(),
+                    body: "{".to_string(),
+                    source: decode_error,
+                    request_id: Some("request-1".to_string()),
+                    batch_id: None,
+                }),
+                "response_decode",
+            ),
+            (
+                anyhow::anyhow!("PP batch response missing batch_id"),
+                "response_shape",
+            ),
+        ];
+        for (error, expected_class) in cases {
+            let mut summary = PpScenarioSummary::default();
+            summary.record_batch(1, 2, 9, vec!["recipient".to_string()], Err(error));
+
+            let observation = &summary.transaction_observations()[0];
+            assert_eq!(observation["terminal_outcome"], "stalled");
+            assert_eq!(observation["submission_started"], true);
+            assert_eq!(observation["submission_ms"], 7);
+            assert_eq!(observation["failure_class"], expected_class);
+            assert_eq!(
+                observation["submission_timing_origin"],
+                "payment_processor_api_response_ambiguous"
+            );
+        }
     }
 
     #[test]
@@ -7000,6 +8531,30 @@ mod tests {
     }
 
     #[test]
+    fn pp_summary_preflight_failure_cannot_be_reported_as_success() {
+        let config = Config::default();
+        let mut profile = ResultProfile::new(&config, crate::env_capture::capture());
+        profile.modes.insert(
+            ModeName::PaymentProcessor.as_str().to_string(),
+            empty_mode_profile(ModeName::PaymentProcessor, None),
+        );
+        let summary = PpScenarioSummary {
+            failed_batches: 1,
+            errors: vec!["could not read spendable inputs".to_string()],
+            ..PpScenarioSummary::default()
+        };
+
+        record_pp_summary(&mut profile, ScenarioName::S1, &summary, Vec::new());
+
+        let repetition = &profile.modes[ModeName::PaymentProcessor.as_str()].scenarios
+            [ScenarioName::S1.as_str()]
+        .repetitions[0];
+        assert_eq!(repetition.status, CellStatus::Failed);
+        assert_eq!(repetition.success_count, 0);
+        assert_eq!(repetition.failure_count, 1);
+    }
+
+    #[test]
     fn pp_summary_emits_only_confirmed_observed_batches() {
         let config = Config::default();
         let mut profile = ResultProfile::new(&config, crate::env_capture::capture());
@@ -7099,7 +8654,7 @@ mod tests {
         summary.record_attempt(
             1,
             0,
-            12,
+            Some(12),
             "recipient".to_string(),
             Ok(OneSidedSendOutcome {
                 tx_id: "rejected-tx".to_string(),
@@ -7149,7 +8704,7 @@ mod tests {
         summary.record_attempt(
             1,
             0,
-            12,
+            Some(12),
             "recipient".to_string(),
             Ok(OneSidedSendOutcome {
                 tx_id: "confirmed-tx".to_string(),
@@ -7200,6 +8755,71 @@ mod tests {
     }
 
     #[test]
+    fn source_wallet_guard_binds_path_address_and_database_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("source-wallet.db");
+        let material = crate::seeds::material_from_seed(
+            WalletRole::OldWallet,
+            "SOURCE_WALLET_GUARD_TEST".to_string(),
+            CipherSeed::random(),
+        )
+        .unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE accounts (\
+                 id INTEGER PRIMARY KEY, friendly_name TEXT NOT NULL, fingerprint BLOB NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts (friendly_name, fingerprint) VALUES ('default', ?1)",
+                [hex::decode(&material.wallet_fingerprint_hex).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE scanned_tip_blocks (\
+                 account_id INTEGER NOT NULL, hash BLOB NOT NULL, height INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO scanned_tip_blocks (account_id, hash, height) VALUES (1, ?1, 42)",
+                [vec![7u8; 32]],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut config = Config::default();
+        config.source_wallet = Some(crate::config::SourceWalletConfig {
+            database: db_path.clone(),
+            address: material.address,
+            wallet_fingerprint_hex: material.wallet_fingerprint_hex,
+        });
+        require_dedicated_source_wallet(&config, &db_path).unwrap();
+        let anchor = source_wallet_chain_anchor(&db_path).unwrap();
+        assert_eq!(
+            anchor,
+            SourceWalletChainAnchor {
+                height: 42,
+                hash_hex: "07".repeat(32),
+            }
+        );
+        require_source_wallet_anchor_hashes(&anchor, &"07".repeat(32), &"07".repeat(32)).unwrap();
+        assert!(
+            require_source_wallet_anchor_hashes(&anchor, &"08".repeat(32), &"07".repeat(32))
+                .is_err()
+        );
+
+        let other_path = directory.path().join("other-wallet.db");
+        std::fs::write(&other_path, []).unwrap();
+        assert!(require_dedicated_source_wallet(&config, &other_path).is_err());
+    }
+
+    #[test]
     fn concurrent_transactions_use_distinct_discoverable_checkpoints() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("wallet.db");
@@ -7215,9 +8835,70 @@ mod tests {
     }
 
     #[test]
-    fn rejected_checkpoint_cannot_be_submitted_during_recovery() {
-        assert!(!checkpoint_recovery_submission_allowed("rejected"));
-        assert!(checkpoint_recovery_submission_allowed("broadcast"));
+    fn s0_recovery_requires_the_exact_prepared_transaction_binding() {
+        let expected = PreparedTransactionBinding {
+            purpose: S0_SOURCE_FUNDING_PURPOSE.to_string(),
+            b0_run_id: "b0-run".to_string(),
+            protocol_fingerprint: "a".repeat(64),
+            recipients: vec![
+                "old-wallet".to_string(),
+                "new-wallet".to_string(),
+                "payment-processor".to_string(),
+            ],
+            amount_microtari_per_recipient: 10_000,
+        };
+        require_expected_s0_checkpoint_binding(Some(&expected), &expected).unwrap();
+        assert!(require_expected_s0_checkpoint_binding(None, &expected).is_err());
+
+        let mut stale = expected.clone();
+        stale.b0_run_id = "different-b0-run".to_string();
+        assert!(require_expected_s0_checkpoint_binding(Some(&stale), &expected).is_err());
+        stale = expected.clone();
+        stale.recipients.swap(0, 1);
+        assert!(require_expected_s0_checkpoint_binding(Some(&stale), &expected).is_err());
+        stale = expected.clone();
+        stale.amount_microtari_per_recipient += 1;
+        assert!(require_expected_s0_checkpoint_binding(Some(&stale), &expected).is_err());
+        stale = expected.clone();
+        stale.protocol_fingerprint = "b".repeat(64);
+        assert!(require_expected_s0_checkpoint_binding(Some(&stale), &expected).is_err());
+    }
+
+    #[test]
+    fn only_s0_source_funding_can_resubmit_a_checkpoint() {
+        for status in ["completed", "broadcast", "rejected"] {
+            assert!(!checkpoint_recovery_submission_allowed(
+                CheckpointRecoveryPolicy::ReconcileMeasuredWallet,
+                status
+            ));
+            assert!(!checkpoint_recovery_submission_allowed(
+                CheckpointRecoveryPolicy::ReconcileKnownS0Submission,
+                status
+            ));
+        }
+        assert!(checkpoint_recovery_submission_allowed(
+            CheckpointRecoveryPolicy::RecoverS0SourceFunding,
+            "broadcast"
+        ));
+        assert!(!checkpoint_recovery_submission_allowed(
+            CheckpointRecoveryPolicy::RecoverS0SourceFunding,
+            "rejected"
+        ));
+    }
+
+    #[test]
+    fn prepared_checkpoint_must_match_the_same_wallet_transaction_row() {
+        let row = Mode2CompletedTransactionRow {
+            pending_tx_id: "pending".to_string(),
+            status: "completed".to_string(),
+            mined_height: None,
+            confirmation_height: None,
+            sent_payref: None,
+            serialized_transaction: b"transaction-a".to_vec(),
+        };
+        require_checkpoint_matches_wallet_row("42", b"transaction-a", Some(&row)).unwrap();
+        assert!(require_checkpoint_matches_wallet_row("42", b"transaction-b", Some(&row)).is_err());
+        assert!(require_checkpoint_matches_wallet_row("42", b"transaction-a", None).is_err());
     }
 
     #[test]

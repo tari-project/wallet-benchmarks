@@ -1025,20 +1025,28 @@ fn option_sub_u128(left: Option<u128>, right: Option<u128>) -> Option<i128> {
     Some(left? as i128 - right? as i128)
 }
 
-fn option_ratio_u128(numerator: Option<u128>, denominator: Option<u128>) -> Option<f64> {
+fn option_ratio_u128(
+    numerator: Option<u128>,
+    denominator: Option<u128>,
+) -> Option<serde_json::Value> {
     let denominator = denominator?;
     if denominator == 0 {
         return None;
     }
-    Some(numerator? as f64 / denominator as f64)
+    canonical_json_number(numerator? as f64 / denominator as f64)
 }
 
-fn option_ratio_f64(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+fn option_ratio_f64(numerator: Option<f64>, denominator: Option<f64>) -> Option<serde_json::Value> {
     let denominator = denominator?;
     if denominator == 0.0 {
         return None;
     }
-    Some(numerator? / denominator)
+    canonical_json_number(numerator? / denominator)
+}
+
+fn canonical_json_number(value: f64) -> Option<serde_json::Value> {
+    let encoded = serde_json::to_string(&value).ok()?;
+    serde_json::from_str(&encoded).ok()
 }
 
 impl ScenarioCell {
@@ -1264,6 +1272,14 @@ mod tests {
         assert_eq!(cell.median_wall_ms, Some(20));
         assert_eq!(cell.spread_wall_ms, Some(20));
         assert_eq!(cell.all_runs_median_wall_ms, Some(20));
+    }
+
+    #[test]
+    fn computed_ratio_is_stable_across_json_round_trip() {
+        let ratio = option_ratio_u128(Some(80_838), Some(80_962)).unwrap();
+        let encoded = serde_json::to_vec(&ratio).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(ratio, decoded);
     }
 
     #[test]

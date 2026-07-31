@@ -47,6 +47,7 @@ mod verification;
 
 const S0_SOURCE_FUNDING_PURPOSE: &str = "s0_source_funding";
 
+pub(crate) use mode1::mode1_scan_grpc_addresses;
 use mode1::{
     Mode1ScanTimeout, annotate_mode1_console_wallet, exact_pp_split_with_change,
     grpc_bind_multiaddr, mode1_scan_grpc_address, mode1_unspent_count, old_wallet_base_path,
@@ -7311,6 +7312,20 @@ mod tests {
         assert_eq!(
             mode1_scan_grpc_address("http://127.0.0.1:18143", spec, 2).unwrap(),
             "http://127.0.0.1:18445"
+        );
+    }
+
+    #[test]
+    fn mode1_scan_grpc_addresses_cover_every_fresh_scan_port() {
+        let mut config = Config::default();
+        config.benchmark.scan_repetitions = 2;
+
+        assert_eq!(
+            mode1_scan_grpc_addresses(&config).unwrap(),
+            [
+                18244, 18245, 18344, 18345, 18444, 18445, 18544, 18545, 18644, 18645,
+            ]
+            .map(|port| format!("http://127.0.0.1:{port}"))
         );
     }
 

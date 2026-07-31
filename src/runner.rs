@@ -1817,13 +1817,18 @@ fn check_listen_ports_available(config: &Config) -> anyhow::Result<()> {
     if config.benchmark.mode1_live_topology {
         let url = url::Url::parse(&config.modes.old_wallet_grpc_address)
             .context("parsing modes.old_wallet_grpc_address")?;
-        let host = url
-            .host_str()
-            .context("modes.old_wallet_grpc_address has no host")?;
-        let port = url
-            .port_or_known_default()
-            .context("modes.old_wallet_grpc_address has no port")?;
-        addresses.push(format!("{host}:{port}"));
+        addresses.push(url_listen_address(&url, "modes.old_wallet_grpc_address")?);
+    }
+    #[cfg(feature = "live-minotari")]
+    if config.benchmark.live_fresh_scan_cells {
+        for address in crate::live_minotari::mode1_scan_grpc_addresses(config)? {
+            let url =
+                url::Url::parse(&address).context("parsing derived Mode 1 scan gRPC address")?;
+            addresses.push(url_listen_address(
+                &url,
+                "derived Mode 1 scan gRPC address",
+            )?);
+        }
     }
     if config.benchmark.mode3_live_topology {
         addresses.push(config.modes.payment_processor_listen.clone());
@@ -1836,6 +1841,17 @@ fn check_listen_ports_available(config: &Config) -> anyhow::Result<()> {
         listeners.push(listener);
     }
     Ok(())
+}
+
+fn url_listen_address(url: &url::Url, label: &str) -> anyhow::Result<String> {
+    let host = url.host().with_context(|| format!("{label} has no host"))?;
+    let port = url
+        .port_or_known_default()
+        .with_context(|| format!("{label} has no port"))?;
+    Ok(match host {
+        url::Host::Ipv6(address) => format!("[{address}]:{port}"),
+        _ => format!("{host}:{port}"),
+    })
 }
 
 fn output_status_summary(db_path: &Path) -> anyhow::Result<Vec<OutputStatusSummary>> {
@@ -2025,6 +2041,32 @@ mod tests {
         require_archival_tip(&tip(0, 0), "selected endpoint").unwrap();
         assert!(require_archival_tip(&tip(1, 0), "selected endpoint").is_err());
         assert!(require_archival_tip(&tip(0, 1), "selected endpoint").is_err());
+    }
+
+    #[test]
+    fn url_listen_address_preserves_ipv6_brackets() {
+        let url = url::Url::parse("http://[::1]:18143").unwrap();
+        assert_eq!(
+            url_listen_address(&url, "test address").unwrap(),
+            "[::1]:18143"
+        );
+    }
+
+    #[cfg(feature = "live-minotari")]
+    #[test]
+    fn listen_preflight_rejects_occupied_derived_mode1_scan_port() {
+        let listener = (30_000..40_000)
+            .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("a test port between 30000 and 39999 should be available");
+        let occupied_port = listener.local_addr().unwrap().port();
+
+        let mut config = Config::default();
+        config.benchmark.scan_repetitions = 1;
+        config.benchmark.live_fresh_scan_cells = true;
+        config.modes.old_wallet_grpc_address = format!("http://127.0.0.1:{}", occupied_port - 101);
+
+        let error = check_listen_ports_available(&config).unwrap_err();
+        assert!(error.to_string().contains(&occupied_port.to_string()));
     }
 
     #[cfg(feature = "live-minotari")]

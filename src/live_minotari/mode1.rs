@@ -252,6 +252,32 @@ pub(super) fn mode1_scan_grpc_address(
     ))
 }
 
+pub(crate) fn mode1_scan_grpc_addresses(config: &Config) -> anyhow::Result<Vec<String>> {
+    let scenarios = [
+        ScenarioName::B0,
+        ScenarioName::S2,
+        ScenarioName::S3,
+        ScenarioName::S6,
+        ScenarioName::S7,
+    ];
+    let mut addresses = Vec::new();
+    for scenario in scenarios {
+        let spec = FreshScanSpec {
+            scenario,
+            wallet_state: FreshScanWalletState::EmptyGenesis,
+            checkpoint: ScanCheckpoint::Empty,
+        };
+        for run in 1..=config.benchmark.scan_repetitions {
+            addresses.push(mode1_scan_grpc_address(
+                &config.modes.old_wallet_grpc_address,
+                spec,
+                run,
+            )?);
+        }
+    }
+    Ok(addresses)
+}
+
 async fn wait_for_mode1_grpc(
     config: &Config,
     process: &mut Mode1ConsoleProcess,

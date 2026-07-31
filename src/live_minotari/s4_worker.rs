@@ -431,7 +431,7 @@ pub(super) async fn run_arm_process(
 
     let spawn_offset_ms = arm_offset_ms(arm_started_at_unix_ms);
     let mut command = match std::env::current_exe() {
-        Ok(executable) => Command::new(executable),
+        Ok(executable) => crate::managed_process::sanitized_tokio_command(executable),
         Err(error) => {
             return record_unstarted_process_failures(
                 summary,
@@ -442,7 +442,8 @@ pub(super) async fn run_arm_process(
             );
         }
     };
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, seeds);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command
         .arg("__mode2-s4-worker")
         .arg("--request")

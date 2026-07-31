@@ -90,8 +90,10 @@ pub(super) async fn start_mode1_console_wallet_with_recovery(
     let recovery_seed_words = seed_words_with_birthday(&old_seed.seed_words, birthday)
         .context("encoding Mode 1 console-wallet recovery seed birthday")?;
 
-    let mut command = Command::new(&config.paths.minotari_console_wallet);
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
+    let mut command =
+        crate::managed_process::sanitized_tokio_command(&config.paths.minotari_console_wallet);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, &config.seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command
         .env("MINOTARI_WALLET_SEED_WORDS", recovery_seed_words)
         .env("MINOTARI_WALLET_PASSWORD", &password)

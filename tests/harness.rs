@@ -65,7 +65,7 @@ fn source_provenance_inputs_are_immutable_and_verifiable() {
     let patches = [
         (
             "patches/minotari-wallet-password-env.patch",
-            "fa49b2d0fa25ae31e2fdc9e17f85ca67a9a0206b9a62192d1b632d14b67888a6",
+            "53c7e54c2ef211547196a6cbcc0adb0ce6715390da5188afc3a0150888b9ca7b",
         ),
         (
             "patches/payment-processor-fee-rate.patch",
@@ -82,6 +82,11 @@ fn source_provenance_inputs_are_immutable_and_verifiable() {
         fs::read_to_string("patches/minotari-wallet-password-env.patch")
             .unwrap()
             .contains("hide_env_values = true")
+    );
+    assert!(
+        fs::read_to_string("patches/minotari-wallet-password-env.patch")
+            .unwrap()
+            .contains(r#"format!("127.0.0.1:{}", self.api_port)"#)
     );
 
     for script in [

@@ -12,13 +12,36 @@ use tokio::{process::Command, time};
 
 use crate::config::SeedConfig;
 
-const BENCHMARK_SEED_ENV_PREFIX: &str = "HARNESS_SEED_";
+const BENCHMARK_SECRET_ENV_PREFIX: &str = "HARNESS_";
+const MINOTARI_CONFIG_ENV_PREFIX: &str = "MINOTARI_";
+const TARI_CONFIG_ENV_PREFIX: &str = "TARI_";
+const REVEAL_PII_ENV: &str = "REVEAL_PII";
 
-pub(crate) fn remove_benchmark_seed_envs(command: &mut Command, seeds: &SeedConfig) {
-    remove_benchmark_seed_envs_from(command, seeds, std::env::vars_os().map(|(name, _)| name));
+pub(crate) fn remove_benchmark_secret_envs(command: &mut Command, seeds: &SeedConfig) {
+    remove_benchmark_secret_envs_from(command, seeds, std::env::vars_os().map(|(name, _)| name));
 }
 
-fn remove_benchmark_seed_envs_from(
+pub(crate) fn remove_tari_config_envs(command: &mut Command) {
+    remove_env_prefix_from(
+        command,
+        TARI_CONFIG_ENV_PREFIX,
+        std::env::vars_os().map(|(name, _)| name),
+    );
+}
+
+fn remove_env_prefix_from(
+    command: &mut Command,
+    prefix: &str,
+    inherited_names: impl IntoIterator<Item = OsString>,
+) {
+    for name in inherited_names {
+        if env_name_has_prefix(&name, prefix) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn remove_benchmark_secret_envs_from(
     command: &mut Command,
     seeds: &SeedConfig,
     inherited_names: impl IntoIterator<Item = OsString>,
@@ -28,24 +51,65 @@ fn remove_benchmark_seed_envs_from(
         &seeds.new_wallet_env,
         &seeds.payment_processor_env,
         &seeds.recipient_sink_env,
+        &seeds.wallet_password_env,
     ]
     .into_iter()
     .map(OsString::from);
-    let inherited_seed_names = inherited_names
+    let inherited_secret_names = inherited_names
         .into_iter()
-        .filter(|name| is_benchmark_seed_env_name(name));
+        .filter(|name| is_forbidden_child_env_name(name));
     let names = configured_names
-        .chain(inherited_seed_names)
+        .chain(inherited_secret_names)
         .collect::<BTreeSet<_>>();
     for name in names {
         command.env_remove(name);
     }
 }
 
-fn is_benchmark_seed_env_name(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn sanitized_std_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let path = std::env::var_os("PATH");
+    let mut command = std::process::Command::new(program);
+    command.env_clear();
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    #[cfg(windows)]
+    for name in ["SYSTEMROOT", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+pub(crate) fn sanitized_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let path = std::env::var_os("PATH");
+    let mut command = Command::new(program);
+    command.env_clear();
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    #[cfg(windows)]
+    for name in ["SYSTEMROOT", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+fn is_forbidden_child_env_name(name: &std::ffi::OsStr) -> bool {
+    env_name_has_prefix(name, BENCHMARK_SECRET_ENV_PREFIX)
+        || env_name_has_prefix(name, MINOTARI_CONFIG_ENV_PREFIX)
+        || name
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(REVEAL_PII_ENV))
+}
+
+fn env_name_has_prefix(name: &std::ffi::OsStr, prefix: &str) -> bool {
     name.to_str().is_some_and(|name| {
-        name.get(..BENCHMARK_SEED_ENV_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BENCHMARK_SEED_ENV_PREFIX))
+        name.get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
     })
 }
 
@@ -239,13 +303,21 @@ mod tests {
         command
             .env("CUSTOM_OLD_SEED", "old-secret")
             .env("HARNESS_SEED_UNRELATED", "unrelated-secret")
+            .env("MINOTARI_WALLET_VIEW_PRIVATE_KEY", "private-key")
+            .env("REVEAL_PII", "true")
             .env("SAFE_CHILD_VALUE", "safe");
 
-        remove_benchmark_seed_envs_from(
+        seeds.wallet_password_env = "CUSTOM_WALLET_PASSWORD".to_string();
+        command.env("CUSTOM_WALLET_PASSWORD", "wallet-secret");
+
+        remove_benchmark_secret_envs_from(
             &mut command,
             &seeds,
             [
                 OsString::from("HARNESS_SEED_UNRELATED"),
+                OsString::from("CUSTOM_WALLET_PASSWORD"),
+                OsString::from("MINOTARI_WALLET_VIEW_PRIVATE_KEY"),
+                OsString::from("REVEAL_PII"),
                 OsString::from("SAFE_CHILD_VALUE"),
             ],
         );
@@ -261,19 +333,90 @@ mod tests {
             Some(&None)
         );
         assert_eq!(
+            env.get(&OsString::from("CUSTOM_WALLET_PASSWORD")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(&OsString::from("MINOTARI_WALLET_VIEW_PRIVATE_KEY")),
+            Some(&None)
+        );
+        assert_eq!(env.get(&OsString::from("REVEAL_PII")), Some(&None));
+        assert_eq!(
             env.get(&OsString::from("SAFE_CHILD_VALUE")),
             Some(&Some(OsString::from("safe")))
         );
     }
 
     #[test]
-    fn benchmark_seed_prefix_matching_is_case_insensitive() {
-        assert!(is_benchmark_seed_env_name(std::ffi::OsStr::new(
+    fn sanitized_std_command_does_not_forward_benchmark_secrets() {
+        let command = sanitized_std_command("unused-test-program");
+        let explicit_env = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(!explicit_env.contains_key(&OsString::from("HARNESS_WALLET_PW")));
+        assert!(!explicit_env.contains_key(&OsString::from("HARNESS_SEED_OLD")));
+        assert!(explicit_env.keys().all(|name| {
+            matches!(
+                name.to_string_lossy().to_ascii_uppercase().as_str(),
+                "PATH" | "SYSTEMROOT" | "WINDIR"
+            )
+        }));
+    }
+
+    #[test]
+    fn benchmark_secret_prefix_matching_is_case_insensitive() {
+        assert!(is_forbidden_child_env_name(std::ffi::OsStr::new(
             "harness_seed_extra"
         )));
-        assert!(!is_benchmark_seed_env_name(std::ffi::OsStr::new(
+        assert!(is_forbidden_child_env_name(std::ffi::OsStr::new(
             "HARNESS_WALLET_PW"
         )));
+        assert!(!is_forbidden_child_env_name(std::ffi::OsStr::new(
+            "UNRELATED_HARNESS_VALUE"
+        )));
+        assert!(is_forbidden_child_env_name(std::ffi::OsStr::new(
+            "minotari_wallet_spend_key"
+        )));
+        assert!(is_forbidden_child_env_name(std::ffi::OsStr::new(
+            "reveal_pii"
+        )));
+    }
+
+    #[test]
+    fn tari_config_environment_is_removed_case_insensitively() {
+        let mut command = Command::new("unused-test-program");
+        command
+            .env("TARI_WALLET__WEBHOOK__URL", "https://invalid.example")
+            .env("tari_wallet__account_name", "other")
+            .env("SAFE_CHILD_VALUE", "safe");
+        remove_env_prefix_from(
+            &mut command,
+            TARI_CONFIG_ENV_PREFIX,
+            [
+                OsString::from("TARI_WALLET__WEBHOOK__URL"),
+                OsString::from("tari_wallet__account_name"),
+                OsString::from("SAFE_CHILD_VALUE"),
+            ],
+        );
+
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(&OsString::from("TARI_WALLET__WEBHOOK__URL")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(&OsString::from("tari_wallet__account_name")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(&OsString::from("SAFE_CHILD_VALUE")),
+            Some(&Some(OsString::from("safe")))
+        );
     }
 
     #[cfg(unix)]

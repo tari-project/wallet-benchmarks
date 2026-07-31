@@ -116,6 +116,7 @@ pub fn build_env(config: &Config, pp_seed: &SeedMaterial) -> PaymentProcessorEnv
         "CONFIRMATION_CHECKER_REQUIRED_CONFIRMATIONS".to_string(),
         config.benchmark.c_min.to_string(),
     );
+    vars.insert("MAX_INPUT_COUNT_PER_TX".to_string(), "400".to_string());
     vars.insert(
         "FEE_PER_GRAM".to_string(),
         config
@@ -138,6 +139,60 @@ pub fn build_env(config: &Config, pp_seed: &SeedMaterial) -> PaymentProcessorEnv
 
 pub fn payment_receiver_db_path(config: &Config) -> PathBuf {
     config.paths.data_dir.join("payment-receiver/wallet.db")
+}
+
+fn payment_receiver_config_path(config: &Config) -> PathBuf {
+    config
+        .paths
+        .data_dir
+        .join("payment-receiver/config/config.toml")
+}
+
+#[derive(Serialize)]
+struct PaymentReceiverRuntimeConfig {
+    network: &'static str,
+    wallet: PaymentReceiverWalletConfig,
+}
+
+#[derive(Serialize)]
+struct PaymentReceiverWalletConfig {
+    base_url: String,
+    database_path: String,
+    batch_size: u64,
+    scan_interval_secs: u64,
+    api_port: u16,
+    confirmation_window: u64,
+    account_name: &'static str,
+    burn_proofs_dir: String,
+}
+
+fn write_payment_receiver_runtime_config(config: &Config) -> anyhow::Result<()> {
+    let runtime = PaymentReceiverRuntimeConfig {
+        network: "esmeralda",
+        wallet: PaymentReceiverWalletConfig {
+            base_url: config.network.base_node_http_url.clone(),
+            database_path: absolute_path(&payment_receiver_db_path(config))
+                .display()
+                .to_string(),
+            batch_size: config.benchmark.scan_batch_size,
+            scan_interval_secs: config.benchmark.mode3_payment_receiver_scan_interval_secs,
+            api_port: listen_port(&config.modes.payment_receiver_listen, 9146),
+            confirmation_window: config.benchmark.c_min,
+            account_name: "default",
+            burn_proofs_dir: config
+                .paths
+                .data_dir
+                .join("payment-receiver/burn-proofs")
+                .display()
+                .to_string(),
+        },
+    };
+    let bytes = toml::to_string(&runtime).context("serializing payment-receiver runtime config")?;
+    crate::result_profile::durable_atomic_write(
+        &payment_receiver_config_path(config),
+        bytes.as_bytes(),
+    )
+    .context("writing payment-receiver runtime config")
 }
 
 pub fn payment_processor_db_path(config: &Config) -> PathBuf {
@@ -164,8 +219,10 @@ pub async fn ensure_console_wallet_base(
         );
     }
     fs::create_dir_all(&base_path)?;
-    let mut command = Command::new(&config.paths.minotari_console_wallet);
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
+    let mut command =
+        crate::managed_process::sanitized_tokio_command(&config.paths.minotari_console_wallet);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, &config.seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command
         .env("MINOTARI_WALLET_SEED_WORDS", &pp_seed.seed_words)
         .env("MINOTARI_WALLET_PASSWORD", password)
@@ -217,6 +274,7 @@ pub async fn start_payment_receiver(
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    write_payment_receiver_runtime_config(config)?;
     let command = payment_receiver_command(config, password, &db_path);
     ManagedProcess::spawn(
         "mode3-payment-receiver",
@@ -227,10 +285,14 @@ pub async fn start_payment_receiver(
 
 fn payment_receiver_command(config: &Config, password: &str, db_path: &Path) -> Command {
     let api_port = listen_port(&config.modes.payment_receiver_listen, 9146);
-    let mut command = Command::new(&config.paths.minotari_binary);
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
+    let mut command =
+        crate::managed_process::sanitized_tokio_command(&config.paths.minotari_binary);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, &config.seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command
         .env("MINOTARI_WALLET_PASSWORD", password)
+        .arg("--config")
+        .arg(payment_receiver_config_path(config))
         .arg("--network")
         .arg("esmeralda")
         .arg("daemon")
@@ -268,8 +330,10 @@ pub async fn start_payment_processor(
         .append(true)
         .open(&db_path)
         .with_context(|| format!("creating PP database file {}", db_path.display()))?;
-    let mut command = Command::new(&config.paths.payment_processor_binary);
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
+    let mut command =
+        crate::managed_process::sanitized_tokio_command(&config.paths.payment_processor_binary);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, &config.seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command.envs(&env.vars);
     ManagedProcess::spawn(
         "mode3-payment-processor",
@@ -1028,8 +1092,9 @@ mod tests {
     use tari_common_types::seeds::cipher_seed::CipherSeed;
 
     use super::{
-        PaymentProcessorEnv, build_env, inspect_payment_processor_db, payment_processor_db_path,
-        payment_receiver_command, payment_receiver_db_path,
+        PaymentProcessorEnv, absolute_path, build_env, inspect_payment_processor_db,
+        payment_processor_db_path, payment_receiver_command, payment_receiver_config_path,
+        payment_receiver_db_path, write_payment_receiver_runtime_config,
     };
 
     #[test]
@@ -1096,6 +1161,10 @@ mod tests {
                 .map(String::as_str),
             Some("60")
         );
+        assert_eq!(
+            env.vars.get("MAX_INPUT_COUNT_PER_TX").map(String::as_str),
+            Some("400")
+        );
     }
 
     #[test]
@@ -1108,8 +1177,13 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        let runtime_config = payment_receiver_config_path(&cfg).display().to_string();
         assert!(!args.iter().any(|arg| arg == "--password"));
         assert!(!args.iter().any(|arg| arg == "test-secret-password"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--config" && pair[1] == runtime_config)
+        );
         assert!(command.get_envs().any(|(name, value)| {
             name == "MINOTARI_WALLET_PASSWORD"
                 && value.is_some_and(|value| value == "test-secret-password")
@@ -1120,10 +1194,69 @@ mod tests {
             &cfg.seeds.payment_processor_env,
             &cfg.seeds.recipient_sink_env,
         ] {
-            assert!(command.get_envs().any(|(name, value)| {
-                name == std::ffi::OsStr::new(seed_env) && value.is_none()
+            assert!(!command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new(seed_env) && value.is_some()
             }));
         }
+    }
+
+    #[test]
+    fn payment_receiver_runtime_config_is_candidate_scoped_and_esmeralda_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.paths.data_dir = temp.path().join("candidate");
+        cfg.network.base_node_http_url = "http://127.0.0.1:18242".to_string();
+        cfg.modes.payment_receiver_listen = "127.0.0.1:9146".to_string();
+
+        write_payment_receiver_runtime_config(&cfg).unwrap();
+        let path = payment_receiver_config_path(&cfg);
+        assert_eq!(
+            path,
+            cfg.paths
+                .data_dir
+                .join("payment-receiver/config/config.toml")
+        );
+        let contents = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&contents).unwrap();
+        let expected_db = absolute_path(&payment_receiver_db_path(&cfg))
+            .display()
+            .to_string();
+        let expected_burn_proofs = cfg
+            .paths
+            .data_dir
+            .join("payment-receiver/burn-proofs")
+            .display()
+            .to_string();
+
+        assert_eq!(parsed["network"].as_str(), Some("esmeralda"));
+        assert_eq!(
+            parsed["wallet"]["base_url"].as_str(),
+            Some("http://127.0.0.1:18242")
+        );
+        assert_eq!(
+            parsed["wallet"]["database_path"].as_str(),
+            Some(expected_db.as_str())
+        );
+        assert_eq!(
+            parsed["wallet"]["batch_size"].as_integer(),
+            Some(i64::try_from(cfg.benchmark.scan_batch_size).unwrap())
+        );
+        assert_eq!(
+            parsed["wallet"]["scan_interval_secs"].as_integer(),
+            Some(i64::try_from(cfg.benchmark.mode3_payment_receiver_scan_interval_secs).unwrap())
+        );
+        assert_eq!(parsed["wallet"]["api_port"].as_integer(), Some(9146));
+        assert_eq!(
+            parsed["wallet"]["confirmation_window"].as_integer(),
+            Some(i64::try_from(cfg.benchmark.c_min).unwrap())
+        );
+        assert_eq!(parsed["wallet"]["account_name"].as_str(), Some("default"));
+        assert_eq!(
+            parsed["wallet"]["burn_proofs_dir"].as_str(),
+            Some(expected_burn_proofs.as_str())
+        );
+        assert!(parsed["wallet"].get("webhook").is_none());
+        assert!(!contents.contains("mainnet"));
     }
 
     #[test]

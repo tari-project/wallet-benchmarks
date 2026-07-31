@@ -58,8 +58,11 @@ pinned local node, then replace `REPLACE_WITH_LOCAL_NODE_PUBLIC_KEY` with its
 a local authority endpoint, or identical scan/authority URLs.
 
 The harness links the unmodified upstream Minotari library. The runtime Minotari
-CLI adds only an environment-password patch, and the payment processor adds its
-required fee-rate patch; neither changes Mode 2 wallet selection or scanning.
+CLI patch accepts a hidden environment password and binds its unauthenticated
+control API to loopback instead of every interface. The payment processor adds
+its required fee-rate patch. Neither patch changes Mode 2 wallet selection or
+scanning. The harness writes the payment receiver an explicit, candidate-scoped
+Esmeralda configuration instead of allowing ambient Minotari defaults.
 The fetchers verify immutable patch SHA-256 values, final Git trees, and complete
 diffs before building. The second fetcher writes typed schema-v2
 `tools/build-manifest.json`; preflight fails closed unless its upstream bases,
@@ -77,6 +80,8 @@ batch creator `15s`, unsigned transaction creator `15s`, transaction signer
 `10s`, broadcaster `15s`, and confirmation checker `60s`. The result profile
 records each value and submission validation rejects tuning. The companion
 wallet's `10s` scan interval is separate from those worker settings.
+Minotari's control API has no upstream authentication; the runtime patch binds
+it to loopback, but live runs still require a trusted, single-user host.
 
 For a local node, set `network.base_node_http_url` to its HTTP endpoint and set
 `network.mode1_base_node_service_peer` to `public_key::multiaddr`. Keep

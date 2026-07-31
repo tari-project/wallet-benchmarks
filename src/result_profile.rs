@@ -833,7 +833,11 @@ fn current_harness_executable_sha256() -> anyhow::Result<String> {
 
 pub(crate) fn harness_worktree_clean() -> anyhow::Result<bool> {
     let root = env!("CARGO_MANIFEST_DIR");
-    let status = std::process::Command::new("git")
+    let mut status_command = crate::managed_process::sanitized_std_command("git");
+    status_command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", git_null_device());
+    let status = status_command
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
         .output()
@@ -841,7 +845,11 @@ pub(crate) fn harness_worktree_clean() -> anyhow::Result<bool> {
     if !status.status.success() {
         anyhow::bail!("could not verify the harness git worktree state");
     }
-    let head = std::process::Command::new("git")
+    let mut head_command = crate::managed_process::sanitized_std_command("git");
+    head_command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", git_null_device());
+    let head = head_command
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(root)
         .output()
@@ -853,6 +861,16 @@ pub(crate) fn harness_worktree_clean() -> anyhow::Result<bool> {
     Ok(status.stdout.is_empty()
         && runtime_commit.trim() == harness_git_commit()
         && harness_build_worktree_clean())
+}
+
+#[cfg(windows)]
+fn git_null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+fn git_null_device() -> &'static str {
+    "/dev/null"
 }
 
 pub(super) fn computed_deltas(profile: &ResultProfile) -> BTreeMap<String, serde_json::Value> {

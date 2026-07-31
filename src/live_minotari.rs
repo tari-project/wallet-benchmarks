@@ -34,7 +34,9 @@ use tari_transaction_components::{
     transaction_components::Transaction,
 };
 use tari_utilities::ByteArray;
-use tokio::{process::Command, task::JoinSet, time};
+#[cfg(test)]
+use tokio::process::Command;
+use tokio::{task::JoinSet, time};
 
 mod mode1;
 mod mode2;

@@ -1393,7 +1393,7 @@ fn check_local_node_process_identity(config: &Config) -> anyhow::Result<()> {
     let port = endpoint
         .port_or_known_default()
         .context("local base-node endpoint has no port")?;
-    let output = std::process::Command::new("lsof")
+    let output = crate::managed_process::sanitized_std_command("lsof")
         .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
         .output()
         .context("querying local base-node listener with lsof")?;

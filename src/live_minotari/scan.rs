@@ -656,8 +656,10 @@ async fn run_mode1_fresh_scan(
     let wait_target_height = requested_target.as_ref().unwrap_or(&launch_tip).height;
     let tip_start = Some(launch_tip.height);
     let start = Instant::now();
-    let mut command = Command::new(&config.paths.minotari_console_wallet);
-    crate::managed_process::remove_benchmark_seed_envs(&mut command, &config.seeds);
+    let mut command =
+        crate::managed_process::sanitized_tokio_command(&config.paths.minotari_console_wallet);
+    crate::managed_process::remove_benchmark_secret_envs(&mut command, &config.seeds);
+    crate::managed_process::remove_tari_config_envs(&mut command);
     command
         .env("MINOTARI_WALLET_SEED_WORDS", seed_words)
         .env("MINOTARI_WALLET_PASSWORD", &password)

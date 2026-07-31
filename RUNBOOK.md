@@ -141,13 +141,21 @@ uses its ordinary `FundLocker` selection and wallet change path: each transactio
 requests `N-1` self-payment outputs, change supplies output `N`, and the harness
 records any multi-input selection or shape failure without retry.
 
-The runtime Minotari CLI applies one operational patch only:
+The runtime Minotari CLI applies one operational hardening patch only:
 
 - `patches/minotari-wallet-password-env.patch` enables Clap's environment support
   and accepts `MINOTARI_WALLET_PASSWORD`, so the payment receiver does not expose
-  its wallet password in process arguments. It does not alter scanning,
-  selection, transaction construction, signing, or broadcasting, and it hides
-  the environment value from CLI help output.
+  its wallet password in process arguments. It also changes the daemon's
+  unauthenticated control API bind from `0.0.0.0` to `127.0.0.1`. It does not
+  alter scanning, selection, transaction construction, signing, or broadcasting,
+  and it hides the environment value from CLI help output.
+  The harness supplies the payment receiver an explicit candidate-scoped
+  Esmeralda configuration, so it does not create or inherit an ambient default
+  configuration.
+
+Minotari's control API has no upstream authentication. The runtime patch limits
+it to loopback, but the source-wallet and benchmark daemons must run only on a
+trusted, single-user host; do not expose or share the host during a live run.
 
 The scanner correctness and exact-output behavioral patches used by the
 2026-07-27 historical profile are no longer applied. Upstream premature scan

@@ -142,7 +142,7 @@ verify_checkout \
 
 if [ "${VERIFY_ONLY}" = true ]; then
   verify_checkout "${TARI_DIR}" "${TARI_NODE_REV}" "${TARI_NODE_COMMIT}" "${TARI_NODE_TREE}" "Tari node"
-  printf 'source provenance PASS: minotari base %s + runtime-only password patch -> %s; console %s; node %s\n' \
+  printf 'source provenance PASS: minotari base %s + runtime hardening patch -> %s; console %s; node %s\n' \
     "${MINOTARI_BASE_REV}" "${MINOTARI_RESULT_TREE}" "${TARI_CONSOLE_WALLET_REV}" "${TARI_NODE_REV}"
   exit 0
 fi
@@ -171,5 +171,5 @@ cp "${MINOTARI_DIR}/target/release/minotari" "${TOOLS_DIR}/minotari"
 cp "${TARI_DIR}/target/release/minotari_console_wallet" "${TOOLS_DIR}/minotari_console_wallet"
 cp "${TARI_DIR}/target/release/minotari_node" "${TOOLS_DIR}/minotari_node"
 
-printf 'installed minotari from upstream %s with runtime-only password patch, minotari_console_wallet at %s, and minotari_node at %s in %s\n' \
+printf 'installed minotari from upstream %s with runtime hardening patch, minotari_console_wallet at %s, and minotari_node at %s in %s\n' \
   "${MINOTARI_BASE_REV}" "${TARI_CONSOLE_WALLET_REV}" "${TARI_NODE_REV}" "${TOOLS_DIR}"

@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 const PATCHES: &[(&str, &str)] = &[
     (
         "patches/minotari-wallet-password-env.patch",
-        "fa49b2d0fa25ae31e2fdc9e17f85ca67a9a0206b9a62192d1b632d14b67888a6",
+        "53c7e54c2ef211547196a6cbcc0adb0ce6715390da5188afc3a0150888b9ca7b",
     ),
     (
         "patches/payment-processor-fee-rate.patch",
@@ -23,11 +23,11 @@ pub(crate) const EXPECTED_SOURCES: &[ExpectedSource] = &[
         upstream_tree: "e9bbd1fb7b538e213e17c2986b85940435adce26",
         patches: &[ExpectedPatch {
             path: "patches/minotari-wallet-password-env.patch",
-            sha256: "fa49b2d0fa25ae31e2fdc9e17f85ca67a9a0206b9a62192d1b632d14b67888a6",
-            result_tree: "cf6acf000f787817a795668c93470b139970feb6",
+            sha256: "53c7e54c2ef211547196a6cbcc0adb0ce6715390da5188afc3a0150888b9ca7b",
+            result_tree: "8ffaba109f7d413a68852a98939ec2a002105cc6",
         }],
-        complete_diff_sha256: "118dbe659efed99528159e56f509a01f5a9b789ea57a9ea3267e2b60fbf0d144",
-        result_tree: "cf6acf000f787817a795668c93470b139970feb6",
+        complete_diff_sha256: "08b5ff524839091db7c110708fac4538261b94e5c3cdda6961ecdbc42c9c0bcf",
+        result_tree: "8ffaba109f7d413a68852a98939ec2a002105cc6",
     },
     ExpectedSource {
         name: "tari_console_wallet",
@@ -70,7 +70,7 @@ pub(crate) const EXPECTED_ARTIFACTS: &[ExpectedArtifact] = &[
         name: "minotari",
         source: "minotari_cli",
         source_revision: "360c4848a54d65fd710266233cc9277b0f785e74",
-        source_tree: "cf6acf000f787817a795668c93470b139970feb6",
+        source_tree: "8ffaba109f7d413a68852a98939ec2a002105cc6",
     },
     ExpectedArtifact {
         name: "minotari_console_wallet",

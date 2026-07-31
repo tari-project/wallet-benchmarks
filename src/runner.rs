@@ -1004,8 +1004,12 @@ fn validate_prefunding_b0_metrics(profile: &ResultProfile) -> anyhow::Result<()>
     for mode in ModeName::ALL {
         let label = mode.as_str();
         let cell = &profile.modes[label].scenarios[ScenarioName::B0.as_str()];
-        if cell.status != CellStatus::Ok || cell.repetitions.is_empty() {
-            bail!("pre-funding B0 must succeed for {label}");
+        if !matches!(cell.status, CellStatus::Ok | CellStatus::Failed)
+            || cell.repetitions.len() != 1
+            || cell.status != cell.repetitions[0].status
+            || (mode == ModeName::OldWallet && cell.status != CellStatus::Ok)
+        {
+            bail!("pre-funding B0 must complete with measured evidence for {label}");
         }
         for repetition in &cell.repetitions {
             let metrics = repetition
@@ -1030,19 +1034,21 @@ fn validate_prefunding_b0_metrics(profile: &ResultProfile) -> anyhow::Result<()>
                 shared_target = Some((tip_end, target_hash));
             }
             if metrics["birthday"] != 0
+                || metrics["expected_outputs"] != 0
+                || metrics["expected_available_microtari"] != 0
+                || metrics["expected_history_transactions"] != 0
                 || metrics["detected_outputs"] != 0
                 || metrics["spendable_outputs"] != 0
                 || metrics["available_microtari"] != 0
                 || metrics["history_transactions"] != 0
-                || metrics["max_height"].as_u64() != Some(tip_end)
-                || metrics["scan_reached_tip"] != true
-                || metrics["tip_lag_blocks"] != 0
+                || metrics["outputs_match_expected"] != true
+                || metrics["balance_matches_expected"] != true
+                || metrics["history_count_matches_expected"] != true
                 || metrics["tip_lag_tolerance_blocks"] != 0
-                || metrics["H_scan_cursor_hash"].as_str() != Some(target_hash)
                 || metrics["H_tip_completion"].as_u64().is_none()
                 || metrics["H_tip_completion_hash"].as_str().is_none()
             {
-                bail!("pre-funding B0 exact empty-tip verification failed for {label}");
+                bail!("pre-funding B0 empty-wallet evidence failed for {label}");
             }
             for metric in [
                 "T_scan_ms",
@@ -1052,17 +1058,88 @@ fn validate_prefunding_b0_metrics(profile: &ResultProfile) -> anyhow::Result<()>
                 "peak_rss_bytes",
                 "peak_cpu_percent",
                 "scan_invocations",
+                "max_height",
+                "tip_lag_blocks",
+                "scan_no_progress_attempts",
             ] {
                 if !metrics[metric].is_number() {
                     bail!("pre-funding B0 metric {metric} missing for {label}");
                 }
             }
-            if repetition.wall_ms != metrics["T_scan_ms"].as_u64().map(u128::from)
+            if metrics["H_scan_cursor_hash"].as_str().is_none()
+                || metrics["scan_reached_tip"].as_bool().is_none()
+                || metrics["scan_stopped_without_progress"].as_bool().is_none()
+                || metrics["scan_timed_out"].as_bool().is_none()
+                || metrics["scan_invocations"] != 1
+                || repetition.wall_ms != metrics["T_scan_ms"].as_u64().map(u128::from)
                 || repetition.fee_microtari != Some(0)
-                || repetition.success_count != 1
-                || repetition.failure_count != 0
             {
                 bail!("pre-funding B0 repetition accounting failed for {label}");
+            }
+            match repetition.status {
+                CellStatus::Ok => {
+                    if repetition.success_count != 1
+                        || repetition.failure_count != 0
+                        || repetition.error.is_some()
+                        || metrics["max_height"].as_u64() != Some(tip_end)
+                        || metrics["scan_reached_tip"] != true
+                        || metrics["tip_lag_blocks"] != 0
+                        || metrics["H_scan_cursor_hash"].as_str() != Some(target_hash)
+                        || metrics["H_scan_target_cursor_hash"].as_str() != Some(target_hash)
+                        || metrics["scan_overshoot_blocks"] != 0
+                        || metrics["scan_target_overshoot_allowed"] != false
+                        || metrics["scan_stopped_without_progress"] != false
+                        || metrics["scan_no_progress_attempts"] != 0
+                        || metrics["scan_timed_out"] != false
+                        || !metrics["scan_timeout_ms"].is_null()
+                        || !metrics["scan_error"].is_null()
+                        || !metrics["scan_stop_reason"].is_null()
+                    {
+                        bail!("pre-funding B0 exact-tip success contract failed for {label}");
+                    }
+                }
+                CellStatus::Failed => {
+                    let max_height = metrics["max_height"]
+                        .as_u64()
+                        .expect("checked as numeric above");
+                    let lag = metrics["tip_lag_blocks"]
+                        .as_u64()
+                        .expect("checked as numeric above");
+                    let timed_out = metrics["scan_timed_out"]
+                        .as_bool()
+                        .expect("checked as boolean above");
+                    let stop_reason = metrics["scan_stop_reason"].as_str();
+                    let stopped_without_progress = metrics["scan_stopped_without_progress"]
+                        .as_bool()
+                        .expect("checked as boolean above");
+                    let no_progress_attempts = metrics["scan_no_progress_attempts"]
+                        .as_u64()
+                        .expect("checked as numeric above");
+                    if repetition.success_count != 0
+                        || repetition.failure_count != 1
+                        || repetition.error.as_deref().is_none_or(str::is_empty)
+                        || metrics["scan_reached_tip"] == true
+                        || max_height >= tip_end
+                        || lag == 0
+                        || lag != tip_end - max_height
+                        || !metrics["H_scan_target_cursor_hash"].is_null()
+                        || metrics["scan_overshoot_blocks"] != 0
+                        || metrics["scan_target_overshoot_allowed"] != false
+                        || (timed_out && stop_reason != Some("scan_timeout"))
+                        || (timed_out
+                            && (metrics["scan_timeout_ms"].as_u64().is_none()
+                                || metrics["scan_error"].as_str().is_none()))
+                        || (!timed_out
+                            && (stop_reason != Some("scanner_returned_below_fixed_target")
+                                || metrics["scan_last_more_blocks"].as_bool().is_none()
+                                || no_progress_attempts != u64::from(stopped_without_progress)
+                                || !metrics["scan_timeout_ms"].is_null()
+                                || !metrics["scan_error"].is_null()))
+                    {
+                        bail!("pre-funding B0 wallet-failure evidence failed for {label}");
+                    }
+                }
+                _ => bail!("pre-funding B0 contains non-measurement status for {label}"),
             }
         }
     }
@@ -1998,6 +2075,179 @@ fn check_harness_worktree_clean() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prefunding_b0_profile_with_library_failures() -> ResultProfile {
+        let config = Config::default();
+        let mut profile = ResultProfile::new(
+            &config,
+            env_capture::capture_for_network(
+                &config.network.base_node_http_url,
+                &config.network.authority_http_url,
+                config.network.mode1_base_node_service_peer.as_deref(),
+            ),
+        );
+        for mode in ModeName::ALL {
+            let failed = mode != ModeName::OldWallet;
+            let mut mode_profile = empty_mode_profile(mode, None);
+            let mut metrics = serde_json::json!({
+                "T_scan_ms": 10,
+                "blocks_per_sec": 10.0,
+                "H_tip_start": 100,
+                "H_tip_end": 100,
+                "H_tip_target_hash": "target",
+                "H_scan_target_cursor_hash": "target",
+                "H_scan_cursor_hash": "target",
+                "H_tip_completion": 101,
+                "H_tip_completion_hash": "completion",
+                "birthday": 0,
+                "expected_outputs": 0,
+                "outputs_match_expected": true,
+                "expected_available_microtari": 0,
+                "balance_matches_expected": true,
+                "expected_history_transactions": 0,
+                "history_count_matches_expected": true,
+                "detected_outputs": 0,
+                "spendable_outputs": 0,
+                "available_microtari": 0,
+                "history_transactions": 0,
+                "max_height": 100,
+                "tip_lag_blocks": 0,
+                "tip_lag_tolerance_blocks": 0,
+                "scan_reached_tip": true,
+                "scan_invocations": 1,
+                "scan_no_progress_attempts": 0,
+                "scan_stopped_without_progress": false,
+                "scan_last_more_blocks": false,
+                "scan_stop_reason": null,
+                "scan_timed_out": false,
+                "scan_timeout_ms": null,
+                "scan_error": null,
+                "scan_overshoot_blocks": 0,
+                "scan_target_overshoot_allowed": false,
+                "peak_rss_bytes": 1,
+                "peak_cpu_percent": 1.0
+            });
+            if failed {
+                metrics["max_height"] = serde_json::json!(83);
+                metrics["H_scan_target_cursor_hash"] = serde_json::Value::Null;
+                metrics["H_scan_cursor_hash"] = serde_json::json!("partial");
+                metrics["tip_lag_blocks"] = serde_json::json!(17);
+                metrics["scan_reached_tip"] = serde_json::json!(false);
+                metrics["scan_stop_reason"] =
+                    serde_json::json!("scanner_returned_below_fixed_target");
+            }
+            mode_profile
+                .scenarios
+                .get_mut("B0")
+                .unwrap()
+                .record_repetition(crate::result_profile::Repetition {
+                    run: 1,
+                    status: if failed {
+                        CellStatus::Failed
+                    } else {
+                        CellStatus::Ok
+                    },
+                    wall_ms: Some(10),
+                    success_count: if failed { 0 } else { 1 },
+                    failure_count: if failed { 1 } else { 0 },
+                    fee_microtari: Some(0),
+                    error: failed.then(|| "scanner returned below target".to_string()),
+                    metrics: Some(metrics),
+                });
+            profile
+                .modes
+                .insert(mode.as_str().to_string(), mode_profile);
+        }
+        profile
+    }
+
+    #[test]
+    fn prefunding_b0_accepts_strict_library_failures_without_retry() {
+        let profile = prefunding_b0_profile_with_library_failures();
+        validate_prefunding_b0_metrics(&profile).unwrap();
+
+        for field in [
+            "scan_invocations",
+            "tip_lag_blocks",
+            "H_scan_target_cursor_hash",
+            "scan_last_more_blocks",
+        ] {
+            let mut tampered = profile.clone();
+            let metrics = tampered
+                .modes
+                .get_mut("new_wallet")
+                .unwrap()
+                .scenarios
+                .get_mut("B0")
+                .unwrap()
+                .repetitions[0]
+                .metrics
+                .as_mut()
+                .unwrap();
+            metrics[field] = match field {
+                "scan_invocations" => serde_json::json!(2),
+                "tip_lag_blocks" => serde_json::json!(16),
+                "H_scan_target_cursor_hash" => serde_json::json!("false-target-claim"),
+                _ => serde_json::Value::Null,
+            };
+            assert!(
+                validate_prefunding_b0_metrics(&tampered).is_err(),
+                "{field}"
+            );
+        }
+
+        for field in [
+            "scan_timed_out",
+            "scan_target_overshoot_allowed",
+            "scan_stopped_without_progress",
+            "scan_no_progress_attempts",
+        ] {
+            let mut tampered = profile.clone();
+            let metrics = tampered
+                .modes
+                .get_mut("old_wallet")
+                .unwrap()
+                .scenarios
+                .get_mut("B0")
+                .unwrap()
+                .repetitions[0]
+                .metrics
+                .as_mut()
+                .unwrap();
+            metrics[field] = if field == "scan_no_progress_attempts" {
+                serde_json::json!(1)
+            } else {
+                serde_json::json!(true)
+            };
+            assert!(
+                validate_prefunding_b0_metrics(&tampered).is_err(),
+                "{field}"
+            );
+        }
+
+        let mut mismatched_status = profile.clone();
+        mismatched_status
+            .modes
+            .get_mut("new_wallet")
+            .unwrap()
+            .scenarios
+            .get_mut("B0")
+            .unwrap()
+            .status = CellStatus::Ok;
+        assert!(validate_prefunding_b0_metrics(&mismatched_status).is_err());
+
+        let mut harness_error = profile;
+        let cell = harness_error
+            .modes
+            .get_mut("new_wallet")
+            .unwrap()
+            .scenarios
+            .get_mut("B0")
+            .unwrap();
+        cell.status = CellStatus::HarnessError;
+        cell.repetitions[0].status = CellStatus::HarnessError;
+        assert!(validate_prefunding_b0_metrics(&harness_error).is_err());
+    }
 
     #[test]
     fn chain_tip_parser_records_effective_pruned_height() {

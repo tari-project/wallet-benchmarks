@@ -246,7 +246,8 @@ match the selected node and independent Esmeralda authority at the same height.
 Never configure a Tari Universe or other mainnet wallet here.
 
 This is setup, not measurement. Do not send funds to the three generated mode
-addresses: `baseline-workflow` does that only after B0 succeeds. The fourth
+addresses: `baseline-workflow` does that only after every B0 scan completes and
+records its measured outcome. The fourth
 generated `recipient_sink` identity starts unfunded and is never opened or
 scanned by the harness; every S4/S5 destination is recoverable from that seed.
 
@@ -294,10 +295,12 @@ the harness commit, resolved protocol, timeouts, topology,
 seed/address fingerprints, host/disk environment, endpoint identity, source
 revisions, binary/patch hashes, and scan batch size. Because the console wallet
 does not expose a stop-height API, its persisted completion cursor establishes
-one B0 anchor height/hash. Both library-backed scans must reach that exact same
-anchor. `prepare-b0` therefore requires `scan_repetitions = 1` and fails before
-scanning otherwise. Every B0 scan must recover zero outputs, balance, and history
-there.
+one B0 anchor height/hash. Both library-backed scans report success only if they
+reach that exact same anchor. A scanner that returns below it is retained as a
+completed wallet failure, without another invocation, so the rest of the matrix
+can still measure that pinned wallet. `prepare-b0` requires
+`scan_repetitions = 1` and fails before scanning otherwise. Every B0 scan must
+recover zero outputs, balance, and history.
 
 Canonical candidate commands require a clean harness worktree. The profile
 records runtime cleanliness independently at measurement and final export, plus
@@ -371,8 +374,9 @@ cargo run --release --locked -- summarize-profile \
   --out candidates/esmeralda-baseline.md
 ```
 
-Submission validation requires successful B0 and S0, all cells present, no
-harness errors, exact canonical configuration, coherent blocked prerequisites,
+Submission validation requires completed, evidence-rich B0 outcomes and
+successful S0, all cells present, no harness errors, exact canonical
+configuration, coherent blocked prerequisites,
 recomputed deltas, realistic transaction shapes, complete provenance,
 `pruned_height=0`, the complete stock birthday resolution, and all four seed
 fingerprints including `recipient_sink`. Honest downstream wallet failure is

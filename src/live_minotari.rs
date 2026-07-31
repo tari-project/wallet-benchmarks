@@ -7712,6 +7712,15 @@ mod tests {
         );
         assert_eq!(metrics["scan_reached_tip"], serde_json::json!(false));
         assert_eq!(metrics["tip_lag_blocks"], serde_json::json!(3));
+        assert_eq!(
+            metrics["H_scan_target_cursor_hash"],
+            serde_json::Value::Null
+        );
+        assert_eq!(metrics["H_scan_cursor_hash"], serde_json::json!("partial"));
+        assert_eq!(
+            metrics["scan_stop_reason"],
+            serde_json::json!("scanner_returned_below_fixed_target")
+        );
     }
 
     #[test]

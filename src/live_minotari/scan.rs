@@ -586,6 +586,9 @@ async fn run_library_fresh_scan(
     let stopped = timeout_initial_height
         .map(|initial_height| account.max_height == initial_height)
         .unwrap_or(reported_stopped);
+    let target_cursor_hash = (account.max_height == target.height)
+        .then(|| account.hash.clone())
+        .flatten();
 
     Ok(ScanMeasurement {
         wall_ms,
@@ -594,7 +597,7 @@ async fn run_library_fresh_scan(
         birthday_offset_days: resolved_birthday_offset_days(config, mode, spec),
         birthday_start_height: resolved_birthday_start_height(config, mode, spec),
         max_height: account.max_height,
-        target_cursor_hash: account.hash.clone(),
+        target_cursor_hash,
         cursor_hash: account.hash,
         available_microtari: account.available_microtari,
         tip_start,

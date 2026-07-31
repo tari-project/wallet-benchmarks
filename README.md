@@ -137,10 +137,12 @@ submission, it also requires the wallet's latest persisted scan hash to match
 the same height on both the selected Esmeralda node and the independent
 Esmeralda authority. This prevents an unrelated wallet DB such as a Tari
 Universe mainnet wallet from being selected accidentally.
-After all three empty-wallet B0 scans pass, the harness automatically broadcasts
+After all three empty-wallet B0 scans finish, the harness automatically broadcasts
 one transaction containing three `A_fund` outputs, one to each fresh mode seed,
-and waits for recipient readiness. The source wallet is not measured; its shared
-funding fee is disclosed but not deducted from any mode balance.
+and waits for recipient readiness. An exact-tip scan passes; a library scanner
+that returns below the immutable old-wallet anchor is retained as a completed
+wallet failure without reinvocation. The source wallet is not measured; its
+shared funding fee is disclosed but not deducted from any mode balance.
 The generated `recipient_sink` seed starts unfunded and is never opened or
 scanned by the harness; S4 and S5 use its recoverable address with distinct
 embedded payment IDs.

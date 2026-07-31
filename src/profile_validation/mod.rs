@@ -992,12 +992,18 @@ fn validate_reference_configuration(
     validate_cross_cutting_scenario_metrics(document)?;
     validate_scenario_specific_metrics(document)?;
     for (mode, scenarios) in mode_scenarios(document)? {
-        for required in ["B0", "S0"] {
-            if scenarios[required]["execution_status"] != "completed"
-                || scenarios[required]["outcome_status"] != "success"
-            {
-                bail!("submission requires successful {required} for {mode}");
-            }
+        if scenarios["B0"]["execution_status"] != "completed"
+            || !matches!(
+                scenarios["B0"]["outcome_status"].as_str(),
+                Some("success" | "failure")
+            )
+        {
+            bail!("submission requires completed B0 evidence for {mode}");
+        }
+        if scenarios["S0"]["execution_status"] != "completed"
+            || scenarios["S0"]["outcome_status"] != "success"
+        {
+            bail!("submission requires successful S0 for {mode}");
         }
         for (scenario, cell) in scenarios {
             if cell["execution_status"] == "not_applicable" {
@@ -2178,7 +2184,20 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
     let mut recipient_set: Option<Vec<Value>> = None;
     let mut b0_target: Option<(u64, &str)> = None;
     for (mode, scenarios) in mode_scenarios(document)? {
-        let b0 = &scenarios["B0"]["repetitions"][0]["metrics"];
+        if scenarios["B0"]["repetitions"]
+            .as_array()
+            .is_none_or(|runs| runs.len() != 1)
+        {
+            bail!("submission B0 must contain exactly one repetition for {mode}");
+        }
+        let b0_run = &scenarios["B0"]["repetitions"][0];
+        let b0 = &b0_run["metrics"];
+        if scenarios["B0"]["execution_status"] != "completed"
+            || b0_run["execution_status"] != "completed"
+            || scenarios["B0"]["outcome_status"] != b0_run["outcome_status"]
+        {
+            bail!("submission B0 cell/repetition status mismatch for {mode}");
+        }
         let target_height = b0["H_tip_end"]
             .as_u64()
             .with_context(|| format!("submission B0 target height missing for {mode}"))?;
@@ -2193,18 +2212,21 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
             b0_target = Some((target_height, target_hash));
         }
         if b0["birthday"] != 0
+            || b0["expected_outputs"] != 0
+            || b0["expected_available_microtari"] != 0
+            || b0["expected_history_transactions"] != 0
             || b0["detected_outputs"] != 0
             || b0["spendable_outputs"] != 0
             || b0["available_microtari"] != 0
             || b0["history_transactions"] != 0
-            || b0["max_height"] != b0["H_tip_end"]
+            || b0["outputs_match_expected"] != true
+            || b0["balance_matches_expected"] != true
+            || b0["history_count_matches_expected"] != true
             || b0["tip_lag_tolerance_blocks"] != 0
-            || b0["scan_reached_tip"] != true
-            || b0["H_scan_cursor_hash"].as_str() != Some(target_hash)
             || b0["H_tip_completion"].as_u64().is_none()
             || b0["H_tip_completion_hash"].as_str().is_none()
         {
-            bail!("submission B0 exact empty-tip contract failed for {mode}");
+            bail!("submission B0 empty-wallet evidence failed for {mode}");
         }
         let funding = &document["funding"][mode];
         if funding["height"]
@@ -2224,10 +2246,87 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
             "peak_rss_bytes",
             "peak_cpu_percent",
             "scan_invocations",
+            "max_height",
+            "tip_lag_blocks",
+            "scan_no_progress_attempts",
         ] {
             if !b0[key].is_number() {
                 bail!("submission B0 metric {key} missing for {mode}");
             }
+        }
+        if b0["H_scan_cursor_hash"].as_str().is_none()
+            || b0["scan_reached_tip"].as_bool().is_none()
+            || b0["scan_stopped_without_progress"].as_bool().is_none()
+            || b0["scan_timed_out"].as_bool().is_none()
+            || b0["scan_invocations"] != 1
+            || b0_run["wall_ms"] != b0["T_scan_ms"]
+            || b0_run["fee_microtari"] != 0
+        {
+            bail!("submission B0 measured evidence is incomplete for {mode}");
+        }
+        match b0_run["outcome_status"].as_str() {
+            Some("success") => {
+                if b0_run["success_count"] != 1
+                    || b0_run["failure_count"] != 0
+                    || !b0_run["error"].is_null()
+                    || b0["max_height"] != b0["H_tip_end"]
+                    || b0["scan_reached_tip"] != true
+                    || b0["tip_lag_blocks"] != 0
+                    || b0["H_scan_cursor_hash"].as_str() != Some(target_hash)
+                    || b0["H_scan_target_cursor_hash"].as_str() != Some(target_hash)
+                    || b0["scan_overshoot_blocks"] != 0
+                    || b0["scan_target_overshoot_allowed"] != false
+                    || b0["scan_stopped_without_progress"] != false
+                    || b0["scan_no_progress_attempts"] != 0
+                    || b0["scan_timed_out"] != false
+                    || !b0["scan_timeout_ms"].is_null()
+                    || !b0["scan_error"].is_null()
+                    || !b0["scan_stop_reason"].is_null()
+                {
+                    bail!("submission B0 exact-tip success contract failed for {mode}");
+                }
+            }
+            Some("failure") => {
+                let max_height = b0["max_height"].as_u64().expect("checked as numeric above");
+                let lag = b0["tip_lag_blocks"]
+                    .as_u64()
+                    .expect("checked as numeric above");
+                let timed_out = b0["scan_timed_out"]
+                    .as_bool()
+                    .expect("checked as boolean above");
+                let stop_reason = b0["scan_stop_reason"].as_str();
+                let stopped_without_progress = b0["scan_stopped_without_progress"]
+                    .as_bool()
+                    .expect("checked as boolean above");
+                let no_progress_attempts = b0["scan_no_progress_attempts"]
+                    .as_u64()
+                    .expect("checked as numeric above");
+                if b0_run["success_count"] != 0
+                    || b0_run["failure_count"] != 1
+                    || b0_run["error"].as_str().is_none_or(str::is_empty)
+                    || b0["scan_reached_tip"] == true
+                    || mode == "old_wallet"
+                    || max_height >= target_height
+                    || lag == 0
+                    || lag != target_height - max_height
+                    || !b0["H_scan_target_cursor_hash"].is_null()
+                    || b0["scan_overshoot_blocks"] != 0
+                    || b0["scan_target_overshoot_allowed"] != false
+                    || (timed_out && stop_reason != Some("scan_timeout"))
+                    || (timed_out
+                        && (b0["scan_timeout_ms"].as_u64().is_none()
+                            || b0["scan_error"].as_str().is_none()))
+                    || (!timed_out
+                        && (stop_reason != Some("scanner_returned_below_fixed_target")
+                            || b0["scan_last_more_blocks"].as_bool().is_none()
+                            || no_progress_attempts != u64::from(stopped_without_progress)
+                            || !b0["scan_timeout_ms"].is_null()
+                            || !b0["scan_error"].is_null()))
+                {
+                    bail!("submission B0 wallet-failure evidence failed for {mode}");
+                }
+            }
+            _ => bail!("submission B0 did not complete for {mode}"),
         }
         for scenario in ["S1", "S4", "S5"] {
             if scenarios[scenario]["execution_status"] != "completed" {
@@ -5308,14 +5407,29 @@ mod tests {
                     metrics: Some(json!({
                         "T_scan_ms": 10, "blocks_per_sec": 10.0,
                         "H_tip_start": 100, "H_tip_end": 100,
-                        "H_tip_target_hash": "aa", "H_scan_cursor_hash": "aa",
+                        "H_tip_target_hash": "aa", "H_scan_target_cursor_hash": "aa",
+                        "H_scan_cursor_hash": "aa",
                         "H_tip_completion": 101,
                         "H_tip_completion_hash": "bb", "birthday": 0,
+                        "expected_outputs": 0, "outputs_match_expected": true,
+                        "expected_available_microtari": 0,
+                        "expected_history_transactions": 0,
+                        "history_count_matches_expected": true,
+                        "balance_matches_expected": true,
                         "detected_outputs": 0, "spendable_outputs": 0,
                         "available_microtari": 0, "history_transactions": 0,
                         "max_height": 100, "tip_lag_blocks": 0,
                         "tip_lag_tolerance_blocks": 0, "scan_reached_tip": true,
                         "scan_invocations": 1,
+                        "scan_no_progress_attempts": 0,
+                        "scan_stopped_without_progress": false,
+                        "scan_last_more_blocks": false,
+                        "scan_stop_reason": null,
+                        "scan_timed_out": false,
+                        "scan_timeout_ms": null,
+                        "scan_error": null,
+                        "scan_overshoot_blocks": 0,
+                        "scan_target_overshoot_allowed": false,
                         "peak_rss_bytes": 1, "peak_cpu_percent": 1.0,
                         "balance_delta_microtari": 0
                     })),
@@ -5437,6 +5551,78 @@ mod tests {
         profile.refresh_computed_deltas();
         profile.validate_submission().unwrap();
 
+        let mut b0_failure = serde_json::to_value(&profile).unwrap();
+        for mode in ["new_wallet", "payment_processor"] {
+            let cell = &mut b0_failure["modes"][mode]["scenarios"]["B0"];
+            cell["execution_status"] = json!("completed");
+            cell["outcome_status"] = json!("failure");
+            let run = &mut cell["repetitions"][0];
+            run["execution_status"] = json!("completed");
+            run["outcome_status"] = json!("failure");
+            run["success_count"] = json!(0);
+            run["failure_count"] = json!(1);
+            run["error"] = json!("scanner returned 17 blocks below fixed target");
+            let metrics = &mut run["metrics"];
+            metrics["max_height"] = json!(83);
+            metrics["H_scan_target_cursor_hash"] = Value::Null;
+            metrics["H_scan_cursor_hash"] = json!("partial");
+            metrics["tip_lag_blocks"] = json!(17);
+            metrics["scan_reached_tip"] = json!(false);
+            metrics["scan_stop_reason"] = json!("scanner_returned_below_fixed_target");
+        }
+        let mut b0_failure_profile: ResultProfile = serde_json::from_value(b0_failure).unwrap();
+        b0_failure_profile.refresh_computed_deltas();
+        let b0_failure = serde_json::to_value(&b0_failure_profile).unwrap();
+        validate_document(&b0_failure, true).unwrap();
+
+        for field in [
+            "scan_invocations",
+            "tip_lag_blocks",
+            "H_scan_target_cursor_hash",
+            "scan_last_more_blocks",
+        ] {
+            let mut tampered = b0_failure.clone();
+            tampered["modes"]["new_wallet"]["scenarios"]["B0"]["repetitions"][0]["metrics"]
+                [field] = match field {
+                "scan_invocations" => json!(2),
+                "tip_lag_blocks" => json!(16),
+                "H_scan_target_cursor_hash" => json!("false-target-claim"),
+                _ => Value::Null,
+            };
+            assert!(validate_document(&tampered, true).is_err(), "{field}");
+        }
+
+        for field in [
+            "scan_timed_out",
+            "scan_target_overshoot_allowed",
+            "scan_stopped_without_progress",
+            "scan_no_progress_attempts",
+        ] {
+            let mut tampered = serde_json::to_value(&profile).unwrap();
+            tampered["modes"]["old_wallet"]["scenarios"]["B0"]["repetitions"][0]["metrics"]
+                [field] = if field == "scan_no_progress_attempts" {
+                json!(1)
+            } else {
+                json!(true)
+            };
+            assert!(validate_document(&tampered, true).is_err(), "{field}");
+        }
+
+        let mut mismatched_b0_status = b0_failure.clone();
+        mismatched_b0_status["modes"]["new_wallet"]["scenarios"]["B0"]["outcome_status"] =
+            json!("success");
+        assert!(validate_document(&mismatched_b0_status, true).is_err());
+
+        let mut failed_s0 = serde_json::to_value(&profile).unwrap();
+        failed_s0["modes"]["new_wallet"]["scenarios"]["S0"]["outcome_status"] = json!("failure");
+        failed_s0["modes"]["new_wallet"]["scenarios"]["S0"]["repetitions"][0]["outcome_status"] =
+            json!("failure");
+        let mut failed_s0_profile: ResultProfile = serde_json::from_value(failed_s0).unwrap();
+        failed_s0_profile.refresh_computed_deltas();
+        assert!(
+            validate_document(&serde_json::to_value(failed_s0_profile).unwrap(), true).is_err()
+        );
+
         let mut missing_disk = profile.clone();
         missing_disk.environment.disk_kind = None;
         assert!(
@@ -5511,6 +5697,8 @@ mod tests {
         mismatched["modes"]["new_wallet"]["scenarios"]["B0"]["repetitions"][0]["metrics"]["H_tip_target_hash"] =
             json!("different");
         mismatched["modes"]["new_wallet"]["scenarios"]["B0"]["repetitions"][0]["metrics"]["H_scan_cursor_hash"] =
+            json!("different");
+        mismatched["modes"]["new_wallet"]["scenarios"]["B0"]["repetitions"][0]["metrics"]["H_scan_target_cursor_hash"] =
             json!("different");
         let error = validate_document(&mismatched, true)
             .unwrap_err()

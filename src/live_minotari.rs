@@ -4797,68 +4797,6 @@ pub async fn observe_s0_funding(
     })
 }
 
-pub async fn synchronize_s0_recipients(
-    config: &Config,
-    book: &AddressBook,
-    birthday: u16,
-    funding_height: u64,
-) -> anyhow::Result<()> {
-    let old = book
-        .addresses
-        .get(WalletRole::OldWallet.label())
-        .context("old wallet seed missing")?;
-    let mut old_with_birthday = old.clone();
-    old_with_birthday.seed_words = seed_words_with_birthday(&old.seed_words, birthday)?;
-    old_with_birthday.birthday = birthday;
-    let mut context = start_mode1_console_wallet_with_recovery(
-        config,
-        &old_with_birthday,
-        false,
-        config.a_fund()?.0,
-    )
-    .await
-    .context("synchronizing funded Mode 1 recipient")?;
-    let actual = context
-        .client
-        .get_address(grpc::Empty {})
-        .await?
-        .into_inner()
-        .one_sided_address;
-    if !mode1_address_matches_seed(&actual, old)? {
-        bail!("funded Mode 1 recipient opened with the wrong address");
-    }
-    context.process.shutdown().await?;
-
-    let password = wallet_password(&config.seeds.wallet_password_env)?;
-    let payment_receiver_db = payment_processor::payment_receiver_db_path(config);
-    for (label, db_path) in [
-        ("new_wallet", config.modes.new_wallet_database.as_path()),
-        ("payment_processor", payment_receiver_db.as_path()),
-    ] {
-        let report = refresh_wallet_to_tip(
-            db_path,
-            &password,
-            &config.network.base_node_http_url,
-            config.benchmark.scan_batch_size,
-            config.benchmark.c_min,
-            config.timeout(config.timeouts.scan_batch_secs),
-        )
-        .await
-        .with_context(|| format!("synchronizing funded {label} recipient"))?;
-        if report.max_height < funding_height {
-            bail!(
-                "funded {label} recipient stopped at {}, below funding height {funding_height}",
-                report.max_height
-            );
-        }
-        println!(
-            "S0 recipient sync {label}: scanned_height={} target={} invocations={}",
-            report.max_height, report.target_tip, report.scan_invocations
-        );
-    }
-    Ok(())
-}
-
 pub async fn refresh_library_wallets_to_tip(config: &Config) -> anyhow::Result<()> {
     let password = wallet_password(&config.seeds.wallet_password_env)?;
     let payment_receiver_db = payment_processor::payment_receiver_db_path(config);

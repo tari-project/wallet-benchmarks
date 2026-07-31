@@ -1000,11 +1000,7 @@ fn validate_reference_configuration(
         {
             bail!("submission requires completed B0 evidence for {mode}");
         }
-        if scenarios["S0"]["execution_status"] != "completed"
-            || scenarios["S0"]["outcome_status"] != "success"
-        {
-            bail!("submission requires successful S0 for {mode}");
-        }
+        validate_s0_dependency_chain(mode, scenarios)?;
         for (scenario, cell) in scenarios {
             if cell["execution_status"] == "not_applicable" {
                 bail!(
@@ -1339,6 +1335,57 @@ fn validate_reference_configuration(
             || funding.birthday_start_height != first.birthday_start_height
     }) {
         bail!("submission funding records must describe one shared exact A_fund transaction");
+    }
+    Ok(())
+}
+
+fn validate_s0_dependency_chain(
+    mode: &str,
+    scenarios: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    let s0 = &scenarios["S0"];
+    let runs = s0["repetitions"].as_array().expect("schema checked");
+    if s0["execution_status"] != "completed"
+        || !matches!(s0["outcome_status"].as_str(), Some("success" | "failure"))
+        || runs.len() != 1
+        || runs[0]["execution_status"] != "completed"
+        || runs[0]["outcome_status"] != s0["outcome_status"]
+    {
+        bail!("submission requires one completed S0 wallet outcome for {mode}");
+    }
+    let run = &runs[0];
+    match s0["outcome_status"].as_str() {
+        Some("success") => {
+            if run["success_count"] != 1 || run["failure_count"] != 0 || !run["error"].is_null() {
+                bail!("submission successful S0 aggregates are incoherent for {mode}");
+            }
+        }
+        Some("failure") => {
+            if run["success_count"] != 0
+                || run["failure_count"] != 1
+                || run["error"].as_str().is_none_or(str::is_empty)
+                || run["metrics"]["balance_reconciliation_unavailable_reason"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+            {
+                bail!("submission failed S0 evidence is incomplete for {mode}");
+            }
+            for scenario in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"] {
+                let cell = &scenarios[scenario];
+                let repetitions = cell["repetitions"].as_array().expect("schema checked");
+                if cell["execution_status"] != "blocked_prerequisite"
+                    || cell["outcome_status"] != "unavailable"
+                    || repetitions.len() != 1
+                    || repetitions[0]["execution_status"] != "blocked_prerequisite"
+                    || repetitions[0]["outcome_status"] != "unavailable"
+                    || repetitions[0]["metrics"]["blocked_prerequisite"] != true
+                    || repetitions[0]["metrics"]["prerequisite"] != "S0"
+                {
+                    bail!("submission {mode}/{scenario} must be blocked by failed S0");
+                }
+            }
+        }
+        _ => unreachable!("checked above"),
     }
     Ok(())
 }
@@ -2437,7 +2484,7 @@ fn validate_scenario_specific_metrics(document: &Value) -> anyhow::Result<()> {
                 );
             }
             validate_s1_round_bindings(mode, s1_metrics)?;
-        } else {
+        } else if scenarios["S1"]["execution_status"] == "completed" {
             validate_transaction_observations(mode, "S1", s1_metrics)?;
         }
 
@@ -5614,14 +5661,51 @@ mod tests {
         assert!(validate_document(&mismatched_b0_status, true).is_err());
 
         let mut failed_s0 = serde_json::to_value(&profile).unwrap();
-        failed_s0["modes"]["new_wallet"]["scenarios"]["S0"]["outcome_status"] = json!("failure");
-        failed_s0["modes"]["new_wallet"]["scenarios"]["S0"]["repetitions"][0]["outcome_status"] =
-            json!("failure");
+        let s0 = &mut failed_s0["modes"]["new_wallet"]["scenarios"]["S0"];
+        s0["outcome_status"] = json!("failure");
+        let run = &mut s0["repetitions"][0];
+        run["outcome_status"] = json!("failure");
+        run["success_count"] = json!(0);
+        run["failure_count"] = json!(1);
+        run["error"] = json!("wallet scanner returned below the fixed S0 target");
+        run["metrics"] = json!({
+            "balance_reconciliation_unavailable_reason":
+                "wallet scanner failed before final wallet balance could be observed"
+        });
+        for scenario in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"] {
+            let cell = &mut failed_s0["modes"]["new_wallet"]["scenarios"][scenario];
+            cell["execution_status"] = json!("blocked_prerequisite");
+            cell["outcome_status"] = json!("unavailable");
+            cell["repetitions"] = json!([{
+                "run": 1,
+                "execution_status": "blocked_prerequisite",
+                "outcome_status": "unavailable",
+                "wall_ms": null,
+                "success_count": 0,
+                "failure_count": 0,
+                "fee_microtari": null,
+                "error": null,
+                "metrics": {
+                    "blocked_prerequisite": true,
+                    "prerequisite": "S0",
+                    "balance_reconciliation_unavailable_reason": "blocked by S0"
+                }
+            }]);
+        }
         let mut failed_s0_profile: ResultProfile = serde_json::from_value(failed_s0).unwrap();
         failed_s0_profile.refresh_computed_deltas();
-        assert!(
-            validate_document(&serde_json::to_value(failed_s0_profile).unwrap(), true).is_err()
-        );
+        let failed_s0 = serde_json::to_value(failed_s0_profile).unwrap();
+        validate_document(&failed_s0, true).unwrap();
+
+        let mut unblocked_after_failed_s0 = failed_s0.clone();
+        unblocked_after_failed_s0["modes"]["new_wallet"]["scenarios"]["S1"] =
+            serde_json::to_value(&profile.modes["new_wallet"].scenarios["S1"]).unwrap();
+        assert!(validate_document(&unblocked_after_failed_s0, true).is_err());
+
+        let mut missing_s0_error = failed_s0;
+        missing_s0_error["modes"]["new_wallet"]["scenarios"]["S0"]["repetitions"][0]["error"] =
+            Value::Null;
+        assert!(validate_document(&missing_s0_error, true).is_err());
 
         let mut missing_disk = profile.clone();
         missing_disk.environment.disk_kind = None;

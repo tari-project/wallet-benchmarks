@@ -343,9 +343,10 @@ wallet's unmodified safety window.
 ## Candidate Run
 
 No funding values are copied into TOML. The run derives them from evidence and
-executes strict non-spending checks before starting scenarios.
+executes strict harness, identity, and namespace checks before starting scenarios.
 
-The workflow proceeds to the candidate run only after recipient readiness. The
+The workflow proceeds to the candidate run after independent funding
+confirmation. Each wallet's recipient readiness is measured once in S0. The
 standalone `prepare-b0`, `fund-s0`, and `run` commands remain available for
 diagnosis and documented interrupted-funding recovery; each performs its own
 launch checks when invoked separately.
@@ -376,13 +377,13 @@ cargo run --release --locked -- summarize-profile \
   --out candidates/esmeralda-baseline.md
 ```
 
-Submission validation requires completed, evidence-rich B0 outcomes and
-successful S0, all cells present, no harness errors, exact canonical
+Submission validation requires completed, evidence-rich B0 and S0 wallet
+outcomes, all cells present, no harness errors, exact canonical
 configuration, coherent blocked prerequisites,
 recomputed deltas, realistic transaction shapes, complete provenance,
 `pruned_height=0`, the complete stock birthday resolution, and all four seed
-fingerprints including `recipient_sink`. Honest downstream wallet failure is
-valid evidence.
+fingerprints including `recipient_sink`. Honest S0 failure is valid when S1-S7
+for that mode are blocked by S0; honest downstream wallet failure is also valid.
 
 New candidates use result schema v7. The committed historical schema-v6 baseline
 is non-submission evidence and cannot pass the command above. Validate or

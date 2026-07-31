@@ -558,38 +558,43 @@ fn record_mode1_s0(
 }
 
 fn record_mode1_startup_failure(profile: &mut ResultProfile, wall_ms: u128, error: anyhow::Error) {
-    let Some(mode) = profile.modes.get_mut("old_wallet") else {
-        return;
-    };
-    for scenario in [
-        ScenarioName::S0,
-        ScenarioName::S1,
-        ScenarioName::S2,
-        ScenarioName::S3,
-        ScenarioName::S4,
-        ScenarioName::S5,
-        ScenarioName::S6,
-        ScenarioName::S7,
-    ] {
-        let Some(cell) = mode.scenarios.get_mut(scenario.as_str()) else {
-            continue;
-        };
+    let error = format!("{error:#}");
+    if let Some(cell) = profile
+        .modes
+        .get_mut("old_wallet")
+        .and_then(|mode| mode.scenarios.get_mut("S0"))
+    {
         cell.record_repetition(Repetition {
             run: 1,
-            status: CellStatus::HarnessError,
+            status: CellStatus::Failed,
             wall_ms: Some(wall_ms),
             success_count: 0,
             failure_count: 1,
             fee_microtari: Some(0),
-            error: Some(format!("{error:#}")),
+            error: Some(error),
             metrics: Some(unavailable_balance_metrics(
-                scenario,
+                ScenarioName::S0,
                 "Mode 1 topology failed before final wallet balance could be observed",
             )),
         });
-        cell.notes
-            .push("Mode 1 console-wallet startup failed before scenario dispatch".to_string());
+        cell.notes.push(
+            "Mode 1 console-wallet did not complete the measured S0 readiness gate".to_string(),
+        );
     }
+    record_blocked_prerequisite_cells(
+        profile,
+        "old_wallet",
+        &[
+            ScenarioName::S1,
+            ScenarioName::S2,
+            ScenarioName::S3,
+            ScenarioName::S4,
+            ScenarioName::S5,
+            ScenarioName::S6,
+            ScenarioName::S7,
+        ],
+        "S0",
+    );
 }
 
 async fn run_mode1_send_cells(
@@ -1658,6 +1663,36 @@ pub(super) fn exact_pp_split_with_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{modes::ModeName, result_profile::empty_mode_profile};
+
+    #[test]
+    fn startup_failure_is_an_s0_wallet_outcome_with_blocked_dependents() {
+        let config = Config::default();
+        let mut profile = ResultProfile::new(&config, crate::env_capture::capture());
+        profile.modes.insert(
+            "old_wallet".to_string(),
+            empty_mode_profile(ModeName::OldWallet, None),
+        );
+
+        record_mode1_startup_failure(&mut profile, 17, anyhow::anyhow!("wallet did not sync"));
+
+        let mode = &profile.modes["old_wallet"];
+        assert_eq!(mode.scenarios["S0"].status, CellStatus::Failed);
+        assert_eq!(mode.scenarios["S0"].repetitions[0].failure_count, 1);
+        for scenario in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"] {
+            assert_eq!(
+                mode.scenarios[scenario].status,
+                CellStatus::BlockedPrerequisite
+            );
+            assert_eq!(
+                mode.scenarios[scenario].repetitions[0]
+                    .metrics
+                    .as_ref()
+                    .unwrap()["prerequisite"],
+                "S0"
+            );
+        }
+    }
 
     #[test]
     fn native_coin_split_requests_one_fewer_split_than_total_outputs() {

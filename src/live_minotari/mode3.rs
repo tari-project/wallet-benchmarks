@@ -241,38 +241,42 @@ fn record_mode3_s0(
 }
 
 fn record_mode3_startup_failure(profile: &mut ResultProfile, wall_ms: u128, error: anyhow::Error) {
-    let Some(mode) = profile.modes.get_mut("payment_processor") else {
-        return;
-    };
-    for scenario in [
-        ScenarioName::S0,
-        ScenarioName::S1,
-        ScenarioName::S2,
-        ScenarioName::S3,
-        ScenarioName::S4,
-        ScenarioName::S5,
-        ScenarioName::S6,
-        ScenarioName::S7,
-    ] {
-        let Some(cell) = mode.scenarios.get_mut(scenario.as_str()) else {
-            continue;
-        };
+    let error = format!("{error:#}");
+    if let Some(cell) = profile
+        .modes
+        .get_mut("payment_processor")
+        .and_then(|mode| mode.scenarios.get_mut("S0"))
+    {
         cell.record_repetition(Repetition {
             run: 1,
-            status: CellStatus::HarnessError,
+            status: CellStatus::Failed,
             wall_ms: Some(wall_ms),
             success_count: 0,
             failure_count: 1,
             fee_microtari: Some(0),
-            error: Some(format!("{error:#}")),
+            error: Some(error),
             metrics: Some(unavailable_balance_metrics(
-                scenario,
+                ScenarioName::S0,
                 "Mode 3 topology failed before final wallet balance could be observed",
             )),
         });
         cell.notes
-            .push("Mode 3 topology startup failed before scenario dispatch".to_string());
+            .push("Mode 3 topology did not complete the measured S0 readiness gate".to_string());
     }
+    record_blocked_prerequisite_cells(
+        profile,
+        "payment_processor",
+        &[
+            ScenarioName::S1,
+            ScenarioName::S2,
+            ScenarioName::S3,
+            ScenarioName::S4,
+            ScenarioName::S5,
+            ScenarioName::S6,
+            ScenarioName::S7,
+        ],
+        "S0",
+    );
 }
 
 async fn run_mode3_send_cells(
@@ -1267,6 +1271,36 @@ pub(super) fn record_pp_summary(
 mod tests {
     use super::*;
     use crate::payment_processor::{PaymentBatchSnapshot, PaymentSnapshot};
+    use crate::{modes::ModeName, result_profile::empty_mode_profile};
+
+    #[test]
+    fn startup_failure_is_an_s0_wallet_outcome_with_blocked_dependents() {
+        let config = Config::default();
+        let mut profile = ResultProfile::new(&config, crate::env_capture::capture());
+        profile.modes.insert(
+            "payment_processor".to_string(),
+            empty_mode_profile(ModeName::PaymentProcessor, None),
+        );
+
+        record_mode3_startup_failure(&mut profile, 23, anyhow::anyhow!("receiver did not sync"));
+
+        let mode = &profile.modes["payment_processor"];
+        assert_eq!(mode.scenarios["S0"].status, CellStatus::Failed);
+        assert_eq!(mode.scenarios["S0"].repetitions[0].failure_count, 1);
+        for scenario in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"] {
+            assert_eq!(
+                mode.scenarios[scenario].status,
+                CellStatus::BlockedPrerequisite
+            );
+            assert_eq!(
+                mode.scenarios[scenario].repetitions[0]
+                    .metrics
+                    .as_ref()
+                    .unwrap()["prerequisite"],
+                "S0"
+            );
+        }
+    }
 
     #[test]
     fn pp_observation_queries_only_unresolved_ids_after_a_snapshot() {

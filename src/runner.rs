@@ -174,7 +174,7 @@ fn preflight_checks(
     if check_funds {
         let paths = live_wallet_paths(config, mode1_db, mode2_db, payment_receiver_db);
         check_live_funds_at_paths(config, &paths)?;
-        check_live_wallet_identities(config, book, &paths)?;
+        check_live_wallet_identities(config, book, &paths, true)?;
         check_payment_processor_pristine(config)?;
     }
     Ok(())
@@ -205,6 +205,29 @@ async fn preflight_for_live_run_inner(
     check_selected_chain_readiness(config, &paths)
         .await
         .context("selected-chain live-run preflight")?;
+    #[cfg(feature = "live-minotari")]
+    recover_prepared_transactions(config).await?;
+    Ok(())
+}
+
+/// Verifies the harness and candidate namespace without pre-scanning funded
+/// wallets. Recipient readiness is a measured S0 outcome, not a setup gate.
+async fn preflight_for_profile_capture_inner(
+    config: &Config,
+    book: &AddressBook,
+    run_launch_checks: bool,
+) -> anyhow::Result<()> {
+    ensure_runtime_paths_are_absolute(config)?;
+    check_harness_worktree_clean()?;
+    if run_launch_checks {
+        check_disk_space(config)?;
+    }
+    check_listen_ports_available(config)?;
+    preflight_checks(config, book, false, None, None, None, run_launch_checks)
+        .context("profile-capture harness preflight")?;
+    let paths = live_wallet_paths(config, None, None, None);
+    check_live_wallet_identities(config, book, &paths, false)?;
+    check_payment_processor_pristine(config)?;
     #[cfg(feature = "live-minotari")]
     recover_prepared_transactions(config).await?;
     Ok(())
@@ -289,7 +312,7 @@ async fn run_profile_inner(
     let config = &config;
     let _namespace_lock = RunNamespaceLock::acquire(&config.paths.data_dir)?;
     let book = AddressBook::load_required(config)?;
-    preflight_for_live_run_inner(config, &book, run_launch_checks).await?;
+    preflight_for_profile_capture_inner(config, &book, run_launch_checks).await?;
 
     let mut profile = ResultProfile::new(
         config,
@@ -651,36 +674,21 @@ async fn fund_s0_from_checkpoint_inner(
         println!("wrote S0 funding evidence {}", evidence_path.display());
     } else {
         println!(
-            "S0 funding evidence is already confirmed at {}; verifying recipient readiness",
+            "S0 funding evidence is already confirmed at {}; verifying funding evidence",
             evidence_path.display()
         );
     }
-    let transaction = evidence
+    evidence
         .transaction
         .as_ref()
         .context("confirmed S0 evidence has no transaction")?;
-    let funded_config = config_with_s0_evidence(config, evidence_path)?;
-    crate::live_minotari::synchronize_s0_recipients(
-        &funded_config,
-        &book,
-        evidence.birthday,
-        transaction.mined_height,
-    )
-    .await?;
-    preflight_for_live_run_inner(&funded_config, &book, false)
-        .await
-        .context("post-funding recipient readiness")?;
-    remove_s0_checkpoint_after_recipient_reconciliation(source_db, Ok(()))?;
-    println!("S0 recipient readiness PASS");
+    remove_s0_checkpoint_after_funding_confirmation(source_db)?;
+    println!("S0 funding confirmation PASS; recipient readiness will be measured in S0");
     Ok(())
 }
 
 #[cfg(feature = "live-minotari")]
-fn remove_s0_checkpoint_after_recipient_reconciliation(
-    source_db: &Path,
-    reconciliation: anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    reconciliation?;
+fn remove_s0_checkpoint_after_funding_confirmation(source_db: &Path) -> anyhow::Result<()> {
     crate::live_minotari::remove_prepared_transaction_checkpoint(source_db)
 }
 
@@ -1301,6 +1309,7 @@ fn check_live_wallet_identities(
     config: &Config,
     book: &AddressBook,
     paths: &LiveWalletPaths,
+    check_scan_height: bool,
 ) -> anyhow::Result<()> {
     let checks = [
         (
@@ -1328,7 +1337,8 @@ fn check_live_wallet_identities(
             errors.push(format!("{label}: {error:#}"));
             continue;
         }
-        if let Some(funding) = funding
+        if check_scan_height
+            && let Some(funding) = funding
             && let Err(error) = check_local_scan_height(db_path, funding.height)
         {
             errors.push(format!("{label}: {error:#}"));
@@ -2428,25 +2438,13 @@ mod tests {
 
     #[cfg(feature = "live-minotari")]
     #[test]
-    fn s0_checkpoint_is_retained_until_recipient_reconciliation_succeeds() {
+    fn s0_checkpoint_is_removed_after_confirmed_funding_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("wallet.db");
         let checkpoint = db_path.with_extension("prepared-transaction.json");
         fs::write(&checkpoint, b"durable submission").unwrap();
 
-        let error = remove_s0_checkpoint_after_recipient_reconciliation(
-            &db_path,
-            Err(anyhow::anyhow!("recipient reconciliation failed")),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("recipient reconciliation failed")
-        );
-        assert!(checkpoint.exists());
-
-        remove_s0_checkpoint_after_recipient_reconciliation(&db_path, Ok(())).unwrap();
+        remove_s0_checkpoint_after_funding_confirmation(&db_path).unwrap();
         assert!(!checkpoint.exists());
     }
 
@@ -2660,7 +2658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_profile_invokes_strict_preflight_before_writing() {
+    async fn run_profile_invokes_capture_preflight_before_writing() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.seeds.old_wallet_env = "WALLET_BENCH_RUN_GATE_OLD".to_string();
@@ -2683,7 +2681,7 @@ mod tests {
             Path::new("missing-s0.json"),
         )
         .await
-        .expect_err("relative runtime paths must fail the strict run gate");
+        .expect_err("relative runtime paths must fail the profile-capture gate");
 
         for material in generated.addresses.values() {
             // SAFETY: restore the test-specific process environment immediately.

@@ -385,13 +385,14 @@ recomputed deltas, realistic transaction shapes, complete provenance,
 fingerprints including `recipient_sink`. Honest S0 failure is valid when S1-S7
 for that mode are blocked by S0; honest downstream wallet failure is also valid.
 
-New candidates use result schema v7. The committed historical schema-v6 baseline
-is non-submission evidence and cannot pass the command above. Validate or
+New candidates use result schema v7. The committed `baselines/esmeralda_baseline.json`
+is the current submission profile. The historical schema-v6 baseline is preserved
+as non-submission evidence and cannot pass the command above. Validate or
 summarize that historical artifact only through the explicit legacy path:
 
 ```sh
 cargo run --release --locked -- validate-profile \
-  --profile baselines/esmeralda_baseline.json \
+  --profile baselines/esmeralda_baseline.schema-v6.json \
   --legacy-v6
 ```
 
@@ -406,6 +407,10 @@ runs.
 - During S0 confirmation: rerun the same `fund-s0` command.
 - During measured scenarios: preserve the namespace and logs as diagnostics; do
   not resume or reuse mutated benchmark wallets for a candidate.
+- After every mode checkpoint is complete: if only the final authority query
+  fails, preserve the raw checkpoint and failure log. A reviewed correction may
+  set only the final profile flag and captured end-anchor fields; bind it to the
+  raw profile hash, retain the authority responses, and reproduce it in CI.
 - SIGINT/SIGTERM triggers managed process-group shutdown. A stale
   `.wallet-bench.lock` means the namespace is non-canonical; preserve it and use a
   new namespace rather than deleting the lock to continue.

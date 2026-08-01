@@ -1,0 +1,7 @@
+Error: error sending request for url (https://rpc.esmeralda.tari.com/get_tip_info)
+
+Caused by:
+    0: client error (Connect)
+    1: tcp connect error
+    2: Network is unreachable (os error 101)
+/root/wallet-bench-state/controller-scripts/resume-v10-after-stale-checkpoint.sh failed with exit status 1.

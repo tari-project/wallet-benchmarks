@@ -1,16 +1,32 @@
 # Baseline Status
 
-`esmeralda_baseline.json` is the historical schema-v6 profile from uncapped run
-`baseline-20260727T110514Z`. It contains all 27 benchmark cells but does not pass
-the current schema-v7 submission gate. `esmeralda_baseline.summary.md` is its
-deterministic human-readable summary.
+`esmeralda_baseline.json` is the schema-v7 submission profile from uncapped run
+`run-1785531043893614543-467991`. It contains all 27 benchmark cells and passes
+the current submission gate. `esmeralda_baseline.summary.md` is its deterministic
+human-readable summary.
 
 ```sh
-cargo run --release --locked -- validate-profile --profile baselines/esmeralda_baseline.json --legacy-v6
-cargo run --release --locked -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.generated.md --legacy-v6
+cargo run --release --locked -- validate-profile --profile baselines/esmeralda_baseline.json --submission
+cargo run --release --locked -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.generated.md
 cmp -s /tmp/esmeralda_baseline.summary.generated.md baselines/esmeralda_baseline.summary.md
 ```
 
-The harness measured at commit `769e75c365ed470fbb3d964df4f30d3763f0439e`.
-Run provenance, integrity records, and the detailed scenario assessment are in
-[`analysis/baseline-20260727-audit.md`](../analysis/baseline-20260727-audit.md).
+The harness measured at commit `cfcedaaf0f15ded7b0e0826c91a890d2898006e1`.
+After all 27 cells were checkpointed, the final independent-authority query
+failed because the WSL network route disappeared. The final profile changes only
+the profile-completion and end-anchor fields through the hash-bound manifest in
+[`analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json`](../analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json).
+CI reconstructs the committed profile from the raw checkpoint and verifies the
+captured authority evidence.
+
+The prior uncapped schema-v6 result remains available as
+`esmeralda_baseline.schema-v6.json` with its deterministic
+`esmeralda_baseline.schema-v6.summary.md`. It is historical, non-submission
+evidence and validates only through the explicit legacy path:
+
+```sh
+cargo run --release --locked -- validate-profile --profile baselines/esmeralda_baseline.schema-v6.json --legacy-v6
+```
+
+Its provenance, correction evidence, and detailed assessment remain documented
+in [`analysis/baseline-20260727-audit.md`](../analysis/baseline-20260727-audit.md).

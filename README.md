@@ -149,12 +149,13 @@ The generated `recipient_sink` seed starts unfunded and is never opened or
 scanned by the harness; S4 and S5 use its recoverable address with distinct
 embedded payment IDs.
 
-New candidate profiles use result schema v7. Submission validation requires the
+Candidate profiles use result schema v7. Submission validation requires the
 effective archival proof (`pruned_height=0`), the encoded birthday height and
 stock two-day scanner-start resolution, and fingerprints for all four generated
-seeds including `recipient_sink`. The committed historical schema-v6 baseline is
-non-submission evidence and is accepted only through the explicit
-`validate-profile --legacy-v6` path.
+seeds including `recipient_sink`. The committed schema-v7 baseline passes this
+gate. The prior schema-v6 result is preserved as
+`baselines/esmeralda_baseline.schema-v6.json`; it is non-submission evidence and
+is accepted only through the explicit `validate-profile --legacy-v6` path.
 
 Do not use old namespaces, copied wallet DBs, or `--fresh-data-dir`. The harness
 locks the candidate namespace, rejects dirty PP/signer state, stores child logs

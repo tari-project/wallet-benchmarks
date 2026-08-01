@@ -1,0 +1,75 @@
+{
+  "description": "Finalize the complete 27-cell schema-v7 checkpoint after the final authority query failed because the WSL network route disappeared. No measured cell is changed.",
+  "evidence": {
+    "path": "analysis/reconciliation/esmeralda_baseline.schema-v7.finalization-evidence.json",
+    "sha256": "b662ce356713b1dd8aa90ce26a97a7b7ccf851b4129a911c3fbdd225129373de"
+  },
+  "failure_log_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.finalization.stderr.log",
+  "manifest_schema_version": 1,
+  "raw_profile_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.raw.json",
+  "raw_profile_sha256": "5043456342f72bf8de8c022ce2f4cea5ee6483f7e721c29c93e974c3291b0fa8",
+  "transformations": [
+    {
+      "pointer": "/profile_kind",
+      "value": "final"
+    },
+    {
+      "pointer": "/run_complete",
+      "value": true
+    },
+    {
+      "pointer": "/base_node/tip_end_height",
+      "value": 796494
+    },
+    {
+      "pointer": "/base_node/tip_end_hash",
+      "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+    },
+    {
+      "pointer": "/base_node/authority_tip_end_height",
+      "value": 796494
+    },
+    {
+      "pointer": "/base_node/authority_tip_end_hash",
+      "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+    },
+    {
+      "pointer": "/provenance/correction",
+      "value": {
+        "manifest_schema_version": 1,
+        "manifest_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json",
+        "tool": "scripts/correct-profile.py",
+        "tool_version": "1",
+        "corrected_at": "2026-08-01T04:32:24Z",
+        "raw_profile_sha256": "5043456342f72bf8de8c022ce2f4cea5ee6483f7e721c29c93e974c3291b0fa8",
+        "raw_profile_size": 3129634,
+        "transformations": [
+          {
+            "pointer": "/profile_kind",
+            "value": "final"
+          },
+          {
+            "pointer": "/run_complete",
+            "value": true
+          },
+          {
+            "pointer": "/base_node/tip_end_height",
+            "value": 796494
+          },
+          {
+            "pointer": "/base_node/tip_end_hash",
+            "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+          },
+          {
+            "pointer": "/base_node/authority_tip_end_height",
+            "value": 796494
+          },
+          {
+            "pointer": "/base_node/authority_tip_end_hash",
+            "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96.0
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake lsof protobuf-compiler sqlite3
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake jq lsof protobuf-compiler sqlite3
       - name: Install ast-grep
         run: npm install --global @ast-grep/cli
       - name: Verify pinned source provenance
@@ -34,18 +34,39 @@ jobs:
         run: ast-grep scan
       - name: Generated schema is current
         run: cargo run --locked -- schema --out RESULT_PROFILE_SCHEMA.json && git diff --exit-code -- RESULT_PROFILE_SCHEMA.json
-      - name: Verify committed baseline integrity
+      - name: Verify committed historical baseline integrity
         run: |
-          scripts/correct-profile.py \
+          python3 scripts/correct-profile.py \
             --raw analysis/reconciliation/esmeralda_baseline.raw.json \
             --manifest analysis/reconciliation/esmeralda_baseline.correction.json \
-            --out /tmp/esmeralda_baseline.verified.json
-          cmp baselines/esmeralda_baseline.json /tmp/esmeralda_baseline.verified.json
+            --out /tmp/esmeralda_baseline.schema-v6.verified.json
+          cmp baselines/esmeralda_baseline.schema-v6.json /tmp/esmeralda_baseline.schema-v6.verified.json
       - name: Validate committed historical baseline
-        run: cargo run --locked -- validate-profile --profile baselines/esmeralda_baseline.json --legacy-v6
+        run: cargo run --locked -- validate-profile --profile baselines/esmeralda_baseline.schema-v6.json --legacy-v6
       - name: Verify committed historical summary
         run: |
-          cargo run --locked -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.md --legacy-v6
+          cargo run --locked -- summarize-profile --profile baselines/esmeralda_baseline.schema-v6.json --out /tmp/esmeralda_baseline.schema-v6.summary.md --legacy-v6
+          cmp baselines/esmeralda_baseline.schema-v6.summary.md /tmp/esmeralda_baseline.schema-v6.summary.md
+      - name: Verify schema-v7 finalization evidence
+        run: |
+          evidence_path=$(jq -r '.evidence.path' analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json)
+          evidence_sha=$(jq -r '.evidence.sha256' analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json)
+          printf '%s  %s\n' "$evidence_sha" "$evidence_path" | sha256sum --check --strict
+          failure_path=$(jq -r '.failure_log_path' analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json)
+          failure_sha=$(jq -r '.failure_log_sha256' "$evidence_path")
+          printf '%s  %s\n' "$failure_sha" "$failure_path" | sha256sum --check --strict
+      - name: Verify committed schema-v7 baseline integrity
+        run: |
+          python3 scripts/correct-profile.py \
+            --raw analysis/reconciliation/esmeralda_baseline.schema-v7.raw.json \
+            --manifest analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json \
+            --out /tmp/esmeralda_baseline.schema-v7.verified.json
+          cmp baselines/esmeralda_baseline.json /tmp/esmeralda_baseline.schema-v7.verified.json
+      - name: Validate committed schema-v7 baseline
+        run: cargo run --locked -- validate-profile --profile baselines/esmeralda_baseline.json --submission
+      - name: Verify committed schema-v7 summary
+        run: |
+          cargo run --locked -- summarize-profile --profile baselines/esmeralda_baseline.json --out /tmp/esmeralda_baseline.summary.md
           cmp baselines/esmeralda_baseline.summary.md /tmp/esmeralda_baseline.summary.md
       - name: Reject tracked secret artifacts
         run: |

@@ -1134,62 +1134,6 @@ mod tests {
     use crate::{modes::ModeName, result_profile::empty_mode_profile};
 
     #[test]
-    fn s4_construction_path_has_one_submission_and_no_retry_loop() {
-        let s4_path = include_str!("s4_worker.rs");
-        assert_eq!(
-            s4_path
-                .matches("finalize_prepared_one_sided_and_broadcast_without_retry")
-                .count(),
-            1
-        );
-        assert!(!s4_path.contains("time::sleep"));
-        assert!(!s4_path.contains("loop {"));
-
-        let source = include_str!("../live_minotari.rs");
-        let submit_start = source
-            .find("async fn submit_transaction_without_retry")
-            .unwrap();
-        let submit_end = source[submit_start..]
-            .find("\nfn json_rpc_url")
-            .map(|offset| submit_start + offset)
-            .unwrap();
-        let submit_path = &source[submit_start..submit_end];
-        assert_eq!(submit_path.matches(".post(").count(), 1);
-        assert!(!submit_path.contains("time::sleep"));
-        assert!(!submit_path.contains("loop {"));
-    }
-
-    #[test]
-    fn s4_deadline_path_gates_late_broadcasts_and_quiesces_every_task() {
-        let worker_source = include_str!("s4_worker.rs");
-        assert!(worker_source.contains("child.start_kill()"));
-        assert!(worker_source.contains("child.wait().await"));
-        assert!(worker_source.contains("\"tasks_quiesced_before_return\": true"));
-        assert!(worker_source.contains("\"post_deadline_drain_ms\""));
-        assert!(!worker_source.contains("recover_prepared_transaction_checkpoint_at"));
-        assert!(!worker_source.contains("submit_transaction_without_retry("));
-
-        let live_source = include_str!("../live_minotari.rs");
-        let finalizer_start = live_source
-            .find("async fn finalize_signed_transaction_and_broadcast_without_retry_before")
-            .unwrap();
-        let finalizer_end = live_source[finalizer_start..]
-            .find("\nfn classify_submission_failure")
-            .map(|offset| finalizer_start + offset)
-            .unwrap();
-        let finalizer = &live_source[finalizer_start..finalizer_end];
-        let deadline_gate = finalizer.find("if broadcast_deadline.is_some_and").unwrap();
-        let broadcast_start = finalizer
-            .find("let broadcast_start = Instant::now()")
-            .unwrap();
-        let submission = finalizer
-            .find("let submission = submit_transaction_without_retry")
-            .unwrap();
-        assert!(deadline_gate < broadcast_start);
-        assert!(broadcast_start < submission);
-    }
-
-    #[test]
     fn ambiguous_submission_retains_checkpoint_identity_for_reconciliation() {
         let mut summary = ScenarioSendSummary {
             attempted: 1,

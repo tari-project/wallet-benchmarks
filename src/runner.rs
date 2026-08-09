@@ -1078,7 +1078,9 @@ fn validate_prefunding_b0_metrics(profile: &ResultProfile) -> anyhow::Result<()>
                 || metrics["scan_reached_tip"].as_bool().is_none()
                 || metrics["scan_stopped_without_progress"].as_bool().is_none()
                 || metrics["scan_timed_out"].as_bool().is_none()
-                || metrics["scan_invocations"] != 1
+                || metrics["scan_invocations"]
+                    .as_u64()
+                    .is_none_or(|count| count == 0)
                 || repetition.wall_ms != metrics["T_scan_ms"].as_u64().map(u128::from)
                 || repetition.fee_microtari != Some(0)
             {
@@ -2172,9 +2174,25 @@ mod tests {
     }
 
     #[test]
-    fn prefunding_b0_accepts_strict_library_failures_without_retry() {
+    fn prefunding_b0_accepts_strict_library_failures_with_scan_continuation() {
         let profile = prefunding_b0_profile_with_library_failures();
         validate_prefunding_b0_metrics(&profile).unwrap();
+
+        let mut continued = profile.clone();
+        for mode in ["new_wallet", "payment_processor"] {
+            continued
+                .modes
+                .get_mut(mode)
+                .unwrap()
+                .scenarios
+                .get_mut("B0")
+                .unwrap()
+                .repetitions[0]
+                .metrics
+                .as_mut()
+                .unwrap()["scan_invocations"] = serde_json::json!(2);
+        }
+        validate_prefunding_b0_metrics(&continued).unwrap();
 
         for field in [
             "scan_invocations",
@@ -2195,7 +2213,7 @@ mod tests {
                 .as_mut()
                 .unwrap();
             metrics[field] = match field {
-                "scan_invocations" => serde_json::json!(2),
+                "scan_invocations" => serde_json::json!(0),
                 "tip_lag_blocks" => serde_json::json!(16),
                 "H_scan_target_cursor_hash" => serde_json::json!("false-target-claim"),
                 _ => serde_json::Value::Null,

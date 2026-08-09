@@ -298,9 +298,11 @@ seed/address fingerprints, host/disk environment, endpoint identity, source
 revisions, binary/patch hashes, and scan batch size. Because the console wallet
 does not expose a stop-height API, its persisted completion cursor establishes
 one B0 anchor height/hash. Both library-backed scans report success only if they
-reach that exact same anchor. A scanner that returns below it is retained as a
-completed wallet failure, without another invocation, so the rest of the matrix
-can still measure that pinned wallet. `prepare-b0` requires
+reach that exact same anchor. A batched scanner that reports more work continues
+from its persisted cursor while it advances, under one fixed total deadline. A
+genuine no-progress return, completion below the anchor, or deadline expiry is
+retained as a completed wallet failure, so the rest of the matrix can still
+measure that pinned wallet. `prepare-b0` requires
 `scan_repetitions = 1` and fails before scanning otherwise. Every B0 scan must
 recover zero outputs, balance, and history.
 
@@ -353,9 +355,10 @@ launch checks when invoked separately.
 
 Each non-B0 checkpoint pair (S2/S3 and S6/S7) captures one shared immutable
 target height/hash before either cell starts. Every repetition in both cells
-makes exactly one bounded invocation of the pinned scanner toward that same
-target. A return below the target is preserved as the measured wallet outcome
-and fails verification rather than triggering another invocation. Overshoot,
+uses the pinned scanner's ordinary partial batches toward that same target.
+Continuation is bounded by one total deadline and stops when the scanner reaches
+the target, reports completion, or stops advancing. A return below the target is
+preserved as the measured wallet outcome and fails verification. Overshoot,
 cursor-hash mismatch, target reorganization, or deadline expiry also fails the
 cell. Completion tip/hash, scanner invocation count, progress, and `more_blocks`
 are recorded as drift and implementation evidence. Recovered transaction IDs,
@@ -376,6 +379,12 @@ cargo run --release --locked -- summarize-profile \
   --profile candidates/esmeralda-baseline.json \
   --out candidates/esmeralda-baseline.md
 ```
+
+`--submission` is deliberately stricter than an ordinary run. It accepts only
+the bounty's reference parameters and derives its expected 127 S1 transaction
+observations from the canonical seven-round schedule. Use checkpoint validation
+for intentionally reduced or differently parameterized diagnostic runs; do not
+present those runs as reference baselines.
 
 Submission validation requires completed, evidence-rich B0 and S0 wallet
 outcomes, all cells present, no harness errors, exact canonical
@@ -411,6 +420,11 @@ runs.
   fails, preserve the raw checkpoint and failure log. A reviewed correction may
   set only the final profile flag and captured end-anchor fields; bind it to the
   raw profile hash, retain the authority responses, and reproduce it in CI.
+  Schema-v7 correction manifests declare `profile_purpose = submission`; the
+  correction tool rejects every pointer outside the finalization-metadata
+  whitelist, including all measured cells and findings. Historical schema-v6
+  reconstruction is explicitly labelled `historical_non_submission` and cannot
+  opt a current submission schema out of that restriction.
 - SIGINT/SIGTERM triggers managed process-group shutdown. A stale
   `.wallet-bench.lock` means the namespace is non-canonical; preserve it and use a
   new namespace rather than deleting the lock to continue.

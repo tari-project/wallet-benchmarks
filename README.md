@@ -141,9 +141,10 @@ After all three empty-wallet B0 scans finish, the harness automatically broadcas
 one transaction containing three `A_fund` outputs, one to each fresh mode seed,
 and waits for independent `C_min` confirmation. Recipient readiness is measured
 once by each wallet in S0. An exact-tip scan passes; a library scanner
-that returns below the immutable old-wallet anchor is retained as a completed
-wallet failure without reinvocation, and S1-S7 for that mode are marked blocked
-by S0. The source wallet is not measured; its
+that reports more blocks continues from its persisted cursor under one fixed
+deadline until it reaches the immutable target. Continuation stops only on a
+real no-progress condition, scanner completion below target, or timeout; any
+such outcome remains measured and can block S1-S7 through S0. The source wallet is not measured; its
 shared funding fee is disclosed but not deducted from any mode balance.
 The generated `recipient_sink` seed starts unfunded and is never opened or
 scanned by the harness; S4 and S5 use its recoverable address with distinct
@@ -156,6 +157,13 @@ seeds including `recipient_sink`. The committed schema-v7 baseline passes this
 gate. The prior schema-v6 result is preserved as
 `baselines/esmeralda_baseline.schema-v6.json`; it is non-submission evidence and
 is accepted only through the explicit `validate-profile --legacy-v6` path.
+
+The harness accepts non-reference parameters for development runs and checkpoint
+profiles. `validate-profile --submission` intentionally pins the bounty's exact
+reference protocol (funding amount, confirmation depth, 512-output S1 schedule,
+full S4 ramp, S5 recipient counts, fee rate, and uncapped live modes) so published
+profiles remain comparable. Submission correction manifests are restricted to
+finalization metadata and cannot modify measured repetitions or findings.
 
 Do not use old namespaces, copied wallet DBs, or `--fresh-data-dir`. The harness
 locks the candidate namespace, rejects dirty PP/signer state, stores child logs

@@ -30,6 +30,8 @@ jobs:
         run: cargo test --locked
       - name: Test all features
         run: cargo test --locked --all-features
+      - name: Test correction policy
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: ast-grep
         run: ast-grep scan
       - name: Generated schema is current

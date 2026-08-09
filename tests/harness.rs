@@ -132,19 +132,6 @@ fn clean_build_attestation_tracks_every_versioned_input() {
 }
 
 #[test]
-fn scan_measurement_invokes_the_wallet_once() {
-    let source = fs::read_to_string("src/live_minotari.rs").unwrap();
-    assert!(
-        source.contains("time::timeout(scan_timeout, scan)"),
-        "the fixed-tip measurement must bound its single wallet scan invocation"
-    );
-    assert!(
-        !source.contains("while cursor.max_height < target_tip"),
-        "a below-target wallet return is a measured mismatch, not a reason to invoke the scanner again"
-    );
-}
-
-#[test]
 fn schema_command_writes_json() {
     let tempdir = tempfile::tempdir().unwrap();
     let schema_path = tempdir.path().join("schema.json");

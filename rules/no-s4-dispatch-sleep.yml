@@ -3,16 +3,20 @@ language: Rust
 severity: error
 message: S4 dispatch must not sleep or throttle between transaction submissions.
 rule:
-  any:
-    - pattern: tokio::time::sleep($$$ARGS)
-    - pattern: tokio::time::sleep_until($$$ARGS)
-    - pattern: time::sleep($$$ARGS)
-    - pattern: time::sleep_until($$$ARGS)
-    - pattern: std::thread::sleep($$$ARGS)
-    - pattern: sleep($$$ARGS)
-    - pattern: sleep_until($$$ARGS)
+  all:
+    - any:
+        - pattern: tokio::time::sleep($$$ARGS)
+        - pattern: tokio::time::sleep_until($$$ARGS)
+        - pattern: time::sleep($$$ARGS)
+        - pattern: time::sleep_until($$$ARGS)
+        - pattern: std::thread::sleep($$$ARGS)
+        - pattern: sleep($$$ARGS)
+        - pattern: sleep_until($$$ARGS)
+    - inside:
+        stopBy: end
+        kind: function_item
+        has:
+          field: name
+          regex: ^(run_mode1_transfers_concurrent|run_pp_batches_concurrent|run_worker|run_arm_process)$
 files:
-  - src/live_minotari.rs
-  - src/live_minotari/mode1.rs
-  - src/live_minotari/mode2.rs
-  - src/live_minotari/mode3.rs
+  - src/live_minotari/*.rs

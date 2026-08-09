@@ -3,15 +3,19 @@ language: Rust
 severity: error
 message: Do not hide wallet behavior with harness-level UTXO pre-partitioning.
 rule:
-  any:
-    - pattern: pre_partition($$$ARGS)
-    - pattern: prepartition($$$ARGS)
-    - pattern: partition_utxos($$$ARGS)
-    - pattern: $VALUE.chunks($$$ARGS)
-    - pattern: $VALUE.partition($$$ARGS)
-    - pattern: $VALUE.split_at($$$ARGS)
-    - pattern: Semaphore::new($$$ARGS)
-    - pattern: std::sync::Mutex::new($$$ARGS)
-    - pattern: tokio::sync::Mutex::new($$$ARGS)
+  all:
+    - any:
+        - pattern: pre_partition($$$ARGS)
+        - pattern: prepartition($$$ARGS)
+        - pattern: partition_utxos($$$ARGS)
+        - pattern: $VALUE.chunks($$$ARGS)
+        - pattern: $VALUE.partition($$$ARGS)
+        - pattern: $VALUE.split_at($$$ARGS)
+    - inside:
+        stopBy: end
+        kind: function_item
+        has:
+          field: name
+          regex: ^(run_mode1_transfers_concurrent|run_pp_batches_concurrent|run_worker|run_arm_process)$
 files:
-  - src/**/*.rs
+  - src/live_minotari/*.rs

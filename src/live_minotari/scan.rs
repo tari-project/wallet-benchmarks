@@ -506,6 +506,7 @@ async fn run_library_fresh_scan(
     };
     let tip_start = Some(target.height);
     let tip_tolerance = 0;
+    let required_confirmations = config.benchmark.c_min;
     let mut progress = ScanProgress::default();
     let (scan_result, resource_peaks) = with_resource_sampling(
         Some(std::process::id()),
@@ -514,7 +515,7 @@ async fn run_library_fresh_scan(
             &password,
             &config.network.base_node_http_url,
             config.benchmark.scan_batch_size,
-            tip_tolerance,
+            required_confirmations,
             config.timeout(config.timeouts.startup_secs),
             target.clone(),
             &mut progress,
@@ -703,26 +704,33 @@ async fn run_mode1_fresh_scan(
                 )
             }
         };
-        let available_microtari = client
-            .get_balance(grpc::GetBalanceRequest { payment_id: None })
-            .await
-            .context("reading final console-wallet balance")?
-            .into_inner()
-            .available_balance;
+        let recovered_state = wait_for_mode1_recovered_state(
+            &mut client,
+            expectations.expected_outputs,
+            expectations.expected_available_microtari,
+            config.timeout(config.timeouts.scan_batch_secs),
+        )
+        .await;
+        let available_microtari = recovered_state.available_microtari.unwrap_or_default();
         let cursor = mode1_scan_cursor(&wallet_db).unwrap_or(AccountSnapshot {
             max_height: grpc_height,
             hash: None,
             available_microtari,
         });
-        let spendable_outputs = mode1_unspent_count(&mut client)
-            .await
-            .context("reading final console-wallet outputs")?;
+        let spendable_outputs = recovered_state.spendable_outputs.unwrap_or_default();
         process.shutdown().await?;
-        Ok::<_, anyhow::Error>((cursor, spendable_outputs, available_microtari, scan_timeout))
+        Ok::<_, anyhow::Error>((
+            cursor,
+            spendable_outputs,
+            available_microtari,
+            scan_timeout,
+            recovered_state.error,
+        ))
     })
     .await;
 
-    let (cursor, spendable_outputs, available_microtari, scan_timeout) = match attempt {
+    let (cursor, spendable_outputs, available_microtari, scan_timeout, state_error) = match attempt
+    {
         Ok(result) => result,
         Err(error) => {
             let _ = process.shutdown().await;
@@ -732,6 +740,9 @@ async fn run_mode1_fresh_scan(
     let (scan_timeout_ms, mut validation_error) = scan_timeout
         .map(|(timeout_ms, error)| (Some(timeout_ms), Some(error)))
         .unwrap_or((None, None));
+    if let Some(error) = state_error {
+        validation_error.get_or_insert(error);
+    }
     let target = mode1_target_after_scan(
         requested_target,
         &launch_tip,
@@ -822,6 +833,103 @@ async fn run_mode1_fresh_scan(
         scan_error: validation_error,
         allow_target_overshoot: requested_target_supplied,
     })
+}
+
+#[derive(Debug)]
+struct Mode1RecoveredState {
+    available_microtari: Option<u64>,
+    spendable_outputs: Option<u64>,
+    error: Option<String>,
+}
+
+async fn wait_for_mode1_recovered_state(
+    client: &mut WalletGrpcClient<tonic::transport::Channel>,
+    expected_outputs: Option<u64>,
+    expected_available_microtari: Option<u64>,
+    timeout: Duration,
+) -> Mode1RecoveredState {
+    let start = Instant::now();
+    let mut interval = time::interval(Duration::from_secs(1));
+    let mut attempts = 0u64;
+    let mut available_microtari = None;
+    let mut spendable_outputs = None;
+    let mut unspent_sum_microtari = None;
+    let mut observation_errors = BTreeSet::new();
+
+    loop {
+        interval.tick().await;
+        attempts = attempts.saturating_add(1);
+        match client
+            .get_balance(grpc::GetBalanceRequest { payment_id: None })
+            .await
+        {
+            Ok(response) => available_microtari = Some(response.into_inner().available_balance),
+            Err(error) => {
+                observation_errors.insert(format!("get_balance: {error}"));
+            }
+        }
+        match mode1_unspent_amounts(client).await {
+            Ok(amounts) => {
+                spendable_outputs = u64::try_from(amounts.len()).ok();
+                unspent_sum_microtari = amounts
+                    .into_iter()
+                    .try_fold(0u64, |total, amount| total.checked_add(amount));
+                if unspent_sum_microtari.is_none() {
+                    observation_errors
+                        .insert("get_unspent_amounts: amount sum overflow".to_string());
+                }
+            }
+            Err(error) => {
+                observation_errors.insert(format!("get_unspent_amounts: {error:#}"));
+            }
+        }
+
+        if mode1_recovered_state_matches(
+            expected_outputs,
+            expected_available_microtari,
+            spendable_outputs,
+            available_microtari,
+            unspent_sum_microtari,
+        ) {
+            return Mode1RecoveredState {
+                available_microtari,
+                spendable_outputs,
+                error: None,
+            };
+        }
+        if start.elapsed() >= timeout {
+            let observation_error = if observation_errors.is_empty() {
+                "none".to_string()
+            } else {
+                observation_errors
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            return Mode1RecoveredState {
+                available_microtari,
+                spendable_outputs,
+                error: Some(format!(
+                    "console-wallet state did not converge after {attempts} observation(s) within {timeout:?}: expected_outputs={expected_outputs:?} observed_outputs={spendable_outputs:?} expected_available_microtari={expected_available_microtari:?} get_balance_available_microtari={available_microtari:?} unspent_amount_sum_microtari={unspent_sum_microtari:?} observation_errors={observation_error}"
+                )),
+            };
+        }
+    }
+}
+
+fn mode1_recovered_state_matches(
+    expected_outputs: Option<u64>,
+    expected_available_microtari: Option<u64>,
+    observed_outputs: Option<u64>,
+    get_balance_available_microtari: Option<u64>,
+    unspent_amount_sum_microtari: Option<u64>,
+) -> bool {
+    expected_outputs.is_none_or(|expected| observed_outputs == Some(expected))
+        && expected_available_microtari
+            .is_none_or(|expected| get_balance_available_microtari == Some(expected))
+        && expected_available_microtari
+            .is_none_or(|expected| unspent_amount_sum_microtari == Some(expected))
 }
 
 fn fresh_scan_db_path(config: &Config, mode: &str, spec: FreshScanSpec, run: u32) -> PathBuf {
@@ -1239,6 +1347,31 @@ mod tests {
         ] {
             assert_eq!(classify_scan_outcome(outcome), expected, "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn mode1_recovery_waits_for_outputs_balance_and_unspent_sum_to_agree() {
+        assert!(mode1_recovered_state_matches(
+            Some(512),
+            Some(9_999_806_740),
+            Some(512),
+            Some(9_999_806_740),
+            Some(9_999_806_740),
+        ));
+        assert!(!mode1_recovered_state_matches(
+            Some(512),
+            Some(9_999_806_740),
+            Some(639),
+            Some(0),
+            Some(9_999_806_740),
+        ));
+        assert!(!mode1_recovered_state_matches(
+            Some(512),
+            Some(9_999_806_740),
+            Some(512),
+            Some(9_999_806_740),
+            None,
+        ));
     }
 
     #[test]

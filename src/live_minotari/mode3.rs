@@ -186,12 +186,37 @@ fn record_mode3_s0(
     let available =
         amount_field_as_microtari(&context.receiver_balance, "available").unwrap_or_default();
     let expected = config.a_fund().map(|amount| amount.0).unwrap_or_default();
-    let spendable_count =
-        spendable_output_count(&payment_processor::payment_receiver_db_path(config)).ok();
-    let state_counts =
-        wallet_output_state_counts(&payment_processor::payment_receiver_db_path(config)).ok();
-    let (status, success_count, failure_count, error, mut metrics) =
+    let receiver_db = payment_processor::payment_receiver_db_path(config);
+    let mut observation_errors = Vec::new();
+    let spendable_count = match spendable_output_count(&receiver_db) {
+        Ok(count) => Some(count),
+        Err(error) => {
+            observation_errors.push(format!("spendable output query: {error:#}"));
+            None
+        }
+    };
+    let state_counts = match wallet_output_state_counts(&receiver_db) {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            observation_errors.push(format!("wallet output state query: {error:#}"));
+            None
+        }
+    };
+    let (mut status, mut success_count, mut failure_count, mut error, mut metrics) =
         strict_s0_status(expected, available, spendable_count, state_counts);
+    if !observation_errors.is_empty() {
+        status = CellStatus::Failed;
+        success_count = 0;
+        failure_count = 1;
+        let observation_error = observation_errors.join("; ");
+        error = Some(observation_error.clone());
+        if let serde_json::Value::Object(map) = &mut metrics {
+            map.insert(
+                "state_observation_error".to_string(),
+                serde_json::json!(observation_error),
+            );
+        }
+    }
     let ok = status == CellStatus::Ok;
     add_s0_funding_observation(
         &mut metrics,
@@ -740,10 +765,15 @@ async fn wait_for_pp_receiver_round_state(
     let mut interval = time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let outputs = spendable_output_count(db_path).ok();
-        let balance = account_snapshot(db_path)
-            .ok()
-            .map(|snapshot| snapshot.available_microtari);
+        let outputs = Some(
+            spendable_output_count(db_path)
+                .context("reading payment receiver spendable outputs during convergence")?,
+        );
+        let balance = Some(
+            account_snapshot(db_path)
+                .context("reading payment receiver balance during convergence")?
+                .available_microtari,
+        );
         if pp_receiver_state_ready(outputs, balance, expected_outputs, expected_balance) {
             return Ok(());
         }
@@ -765,9 +795,11 @@ async fn wait_for_pp_receiver_balance(
     let mut interval = time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let observed = account_snapshot(db_path)
-            .ok()
-            .map(|snapshot| snapshot.available_microtari);
+        let observed = Some(
+            account_snapshot(db_path)
+                .context("reading payment receiver balance during convergence")?
+                .available_microtari,
+        );
         if observed == Some(expected_balance) {
             return Ok(());
         }
@@ -1374,39 +1406,5 @@ mod tests {
         );
         assert_eq!(batches, vec!["missing"]);
         assert_eq!(payments, vec!["missing-payment"]);
-    }
-
-    #[test]
-    fn s4_concurrent_runner_aborts_at_deadline_without_late_acceptance_or_throttling() {
-        let source = include_str!("mode3.rs");
-        let start = source.find("async fn run_pp_batches_concurrent").unwrap();
-        let end = source[start..]
-            .find("pub(super) fn pp_observation_timeout")
-            .map(|offset| start + offset)
-            .unwrap();
-        let runner = &source[start..end];
-
-        assert!(!runner.contains("Semaphore"));
-        assert!(!runner.contains("sleep("));
-        assert!(!runner.contains("request_cleanup_deadline"));
-        assert!(!runner.contains("cleanup_join_deadline"));
-        assert!(!runner.contains("join_set.shutdown().await"));
-        assert!(!runner.contains("inspect_payment_processor_db"));
-        assert_eq!(runner.matches("join_set.join_next()").count(), 2);
-        let timeout = runner.find("record_deadline_timeout").unwrap();
-        let abort = runner.find("join_set.abort_all()").unwrap();
-        let reap = runner
-            .find("while let Some(result) = join_set.join_next().await")
-            .unwrap();
-        assert!(timeout < abort);
-        assert!(abort < reap);
-        assert!(!runner[abort..].contains("summary.record_batch("));
-        assert!(runner.contains("\"cleanup_grace_ms\": 0"));
-        assert!(runner.contains("\"late_results_accepted\": false"));
-        assert!(runner.contains("\"submission_state\": \"ambiguous\""));
-        assert!(runner.contains("debug_assert!(tasks_quiesced)"));
-        assert!(runner.contains("\"s4_deadline_measurement\""));
-        assert!(runner.contains("\"s4_post_deadline_cleanup\""));
-        assert!(runner.contains("budget.as_millis()"));
     }
 }

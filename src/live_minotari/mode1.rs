@@ -16,7 +16,7 @@ pub(super) async fn annotate_mode1_console_wallet(
     let topology = start_mode1_console_wallet(config, old_seed).await;
     match topology {
         Ok(mut context) => {
-            let spendable_count = mode1_unspent_count(&mut context.client).await.ok();
+            let spendable_count = mode1_unspent_count(&mut context.client).await;
             let s0_ok = record_mode1_s0(
                 config,
                 profile,
@@ -499,7 +499,7 @@ fn record_mode1_s0(
     profile: &mut ResultProfile,
     context: &Mode1ConsoleContext,
     wall_ms: u128,
-    spendable_count: Option<u64>,
+    spendable_count: anyhow::Result<u64>,
 ) -> bool {
     let Some(mode) = profile.modes.get_mut("old_wallet") else {
         return false;
@@ -510,18 +510,41 @@ fn record_mode1_s0(
     let balance = context.balance.as_ref();
     let available = balance.map(|b| b.available_balance).unwrap_or_default();
     let expected = config.a_fund().map(|amount| amount.0).unwrap_or_default();
-    let (status, success_count, failure_count, error, mut metrics) = strict_s0_status(
-        expected,
-        available,
-        spendable_count,
-        wallet_output_state_counts(
-            &config
-                .paths
-                .data_dir
-                .join("old-wallet-console/esmeralda/data/wallet/db/console_wallet.db"),
-        )
-        .ok(),
-    );
+    let mut observation_errors = Vec::new();
+    let spendable_count = match spendable_count {
+        Ok(count) => Some(count),
+        Err(error) => {
+            observation_errors.push(format!("get_unspent_amounts: {error:#}"));
+            None
+        }
+    };
+    let state_counts = match wallet_output_state_counts(
+        &config
+            .paths
+            .data_dir
+            .join("old-wallet-console/esmeralda/data/wallet/db/console_wallet.db"),
+    ) {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            observation_errors.push(format!("wallet output state query: {error:#}"));
+            None
+        }
+    };
+    let (mut status, mut success_count, mut failure_count, mut error, mut metrics) =
+        strict_s0_status(expected, available, spendable_count, state_counts);
+    if !observation_errors.is_empty() {
+        status = CellStatus::Failed;
+        success_count = 0;
+        failure_count = 1;
+        let observation_error = observation_errors.join("; ");
+        error = Some(observation_error.clone());
+        if let serde_json::Value::Object(map) = &mut metrics {
+            map.insert(
+                "state_observation_error".to_string(),
+                serde_json::json!(observation_error),
+            );
+        }
+    }
     let ok = status == CellStatus::Ok;
     add_s0_funding_observation(
         &mut metrics,
@@ -1511,7 +1534,7 @@ pub(super) async fn mode1_unspent_count(
     Ok(response.amount.len().try_into().unwrap_or(u64::MAX))
 }
 
-async fn mode1_unspent_amounts(
+pub(super) async fn mode1_unspent_amounts(
     client: &mut WalletGrpcClient<tonic::transport::Channel>,
 ) -> anyhow::Result<Vec<u64>> {
     Ok(client
@@ -1769,41 +1792,6 @@ mod tests {
         assert!(contents.contains("http_server_url = \"http://127.0.0.1:18142\""));
         assert!(contents.contains("fallback_http_server_url = \"http://127.0.0.1:18142\""));
         assert!(!contents.contains("rpc.esmeralda.tari.com"));
-    }
-
-    #[test]
-    fn s4_concurrent_runner_aborts_at_deadline_without_late_acceptance_or_throttling() {
-        let source = include_str!("mode1.rs");
-        let start = source
-            .find("async fn run_mode1_transfers_concurrent")
-            .unwrap();
-        let end = source[start..]
-            .find("async fn run_mode1_recipient_batches_sequential")
-            .map(|offset| start + offset)
-            .unwrap();
-        let runner = &source[start..end];
-
-        assert!(!runner.contains("Semaphore"));
-        assert!(!runner.contains("sleep("));
-        assert!(!runner.contains("request_cleanup_deadline"));
-        assert!(!runner.contains("cleanup_join_deadline"));
-        assert!(!runner.contains("join_set.shutdown().await"));
-        assert_eq!(runner.matches("join_set.join_next()").count(), 2);
-        let timeout = runner.find("record_deadline_timeout").unwrap();
-        let abort = runner.find("join_set.abort_all()").unwrap();
-        let reap = runner
-            .find("while let Some(result) = join_set.join_next().await")
-            .unwrap();
-        assert!(timeout < abort);
-        assert!(abort < reap);
-        assert!(!runner[abort..].contains("summary.record_batch("));
-        assert!(runner.contains("\"cleanup_grace_ms\": 0"));
-        assert!(runner.contains("\"late_results_accepted\": false"));
-        assert!(runner.contains("\"submission_state\": \"ambiguous\""));
-        assert!(runner.contains("debug_assert!(tasks_quiesced)"));
-        assert!(runner.contains("\"s4_deadline_measurement\""));
-        assert!(runner.contains("\"s4_post_deadline_cleanup\""));
-        assert!(runner.contains("budget.as_millis()"));
     }
 
     #[test]

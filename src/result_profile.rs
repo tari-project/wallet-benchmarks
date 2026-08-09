@@ -685,6 +685,7 @@ impl ResultProfile {
 
     pub fn refresh_computed_deltas(&mut self) {
         self.computed_deltas = computed_deltas(self);
+        self.findings = computed_findings(self);
     }
 
     pub fn mark_checkpoint_stage(&mut self, stage: impl Into<String>) {
@@ -878,6 +879,175 @@ pub(super) fn computed_deltas(profile: &ResultProfile) -> BTreeMap<String, serde
     deltas.insert("scan_deltas".to_string(), computed_scan_deltas(profile));
     deltas.insert("s5_throughput".to_string(), computed_s5_throughput(profile));
     deltas
+}
+
+fn computed_findings(profile: &ResultProfile) -> Vec<Finding> {
+    let mut coverage = Vec::new();
+    let mut non_success_cells = Vec::new();
+    let mut blocked_cells = Vec::new();
+    for mode in ModeName::ALL {
+        let mode_name = mode.as_str();
+        let Some(mode_profile) = profile.modes.get(mode_name) else {
+            coverage.push(format!("{mode_name}=0/9 measured"));
+            continue;
+        };
+        let mut successful = 0usize;
+        let mut measured_non_success = 0usize;
+        let mut blocked = 0usize;
+        for (scenario, cell) in &mode_profile.scenarios {
+            match cell.status {
+                CellStatus::Ok => successful += 1,
+                CellStatus::Failed | CellStatus::Partial => {
+                    measured_non_success += 1;
+                    non_success_cells.push(format!("{mode_name}/{scenario}"));
+                }
+                CellStatus::BlockedPrerequisite | CellStatus::BlockedUpstream => {
+                    blocked += 1;
+                    blocked_cells.push(format!("{mode_name}/{scenario}"));
+                }
+                CellStatus::HarnessError
+                | CellStatus::NotApplicable
+                | CellStatus::PendingFunding
+                | CellStatus::ReadyForLiveRun => {
+                    blocked += 1;
+                    blocked_cells.push(format!("{mode_name}/{scenario}"));
+                }
+            }
+        }
+        coverage.push(format!(
+            "{mode_name}={successful} successful/{measured_non_success} measured non-success/{blocked} blocked"
+        ));
+    }
+
+    let mut findings = vec![Finding {
+        id: "measurement-coverage".to_string(),
+        title: format!("27-cell outcome coverage: {}", coverage.join("; ")),
+        status: if blocked_cells.is_empty() {
+            "fully_measured".to_string()
+        } else {
+            "limited_by_prerequisites".to_string()
+        },
+        recommendation: if blocked_cells.is_empty() {
+            "Use successful and measured non-success cells together when comparing wallet behavior; failures remain benchmark results.".to_string()
+        } else {
+            format!(
+                "Do not infer performance for blocked cells; resolve the recorded prerequisites before comparison: {}.",
+                blocked_cells.join(", ")
+            )
+        },
+    }];
+
+    findings.push(Finding {
+        id: "measured-non-success-cells".to_string(),
+        title: if non_success_cells.is_empty() {
+            "No measured scenario ended in a non-success outcome.".to_string()
+        } else {
+            format!(
+                "Measured non-success outcomes occurred in {}.",
+                non_success_cells.join(", ")
+            )
+        },
+        status: if non_success_cells.is_empty() {
+            "none_observed".to_string()
+        } else {
+            "observed".to_string()
+        },
+        recommendation: "Interpret each non-success through its recorded terminal outcome, wallet error, and observation evidence; do not replace it with a retry.".to_string(),
+    });
+
+    let scan_ratios = ModeName::ALL
+        .into_iter()
+        .filter_map(|mode| {
+            let mode_name = mode.as_str();
+            let ratio = profile
+                .computed_deltas
+                .get("scan_deltas")?
+                .get(mode_name)?
+                .get("t_scan_s6_over_b0")?
+                .as_f64()?;
+            Some(format!("{mode_name}={ratio:.3}x"))
+        })
+        .collect::<Vec<_>>();
+    findings.push(Finding {
+        id: "scan-slowdown".to_string(),
+        title: if scan_ratios.is_empty() {
+            "Post-S5 scan slowdown versus empty-wallet B0 is unavailable.".to_string()
+        } else {
+            format!(
+                "Post-S5 scan time divided by empty-wallet B0: {}.",
+                scan_ratios.join(", ")
+            )
+        },
+        status: if scan_ratios.is_empty() {
+            "unavailable".to_string()
+        } else {
+            "measured".to_string()
+        },
+        recommendation: "Compare these ratios with the absolute scan durations and the recorded fixed chain targets; ratios alone do not separate chain walk from wallet-state cost.".to_string(),
+    });
+
+    let comparison = profile.computed_deltas.get("s5_throughput");
+    let wall_ratios = [
+        (
+            "new_wallet individual/payment_processor batch",
+            "new_wallet_individual_over_payment_processor_batch",
+        ),
+        (
+            "old_wallet individual/payment_processor batch",
+            "old_wallet_individual_over_payment_processor_batch",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| {
+        comparison?
+            .get("comparisons")?
+            .get(key)?
+            .as_f64()
+            .map(|ratio| format!("{label}={ratio:.3}x"))
+    })
+    .collect::<Vec<_>>();
+    let fee_ratios = [
+        (
+            "new_wallet individual/payment_processor batch",
+            "new_wallet_individual_fee_per_recipient_over_payment_processor_batch",
+        ),
+        (
+            "old_wallet individual/payment_processor batch",
+            "old_wallet_individual_fee_per_recipient_over_payment_processor_batch",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| {
+        comparison?
+            .get("comparisons")?
+            .get(key)?
+            .as_f64()
+            .map(|ratio| format!("{label}={ratio:.3}x"))
+    })
+    .collect::<Vec<_>>();
+    findings.push(Finding {
+        id: "s5-payment-processor-comparison".to_string(),
+        title: format!(
+            "S5 wall-time ratios: {}; fee-per-recipient ratios: {}.",
+            if wall_ratios.is_empty() {
+                "unavailable".to_string()
+            } else {
+                wall_ratios.join(", ")
+            },
+            if fee_ratios.is_empty() {
+                "unavailable".to_string()
+            } else {
+                fee_ratios.join(", ")
+            }
+        ),
+        status: if wall_ratios.is_empty() && fee_ratios.is_empty() {
+            "unavailable".to_string()
+        } else {
+            "measured".to_string()
+        },
+        recommendation: "A ratio above 1 favors payment-processor batching for the named metric; report wall time and fee efficiency together rather than treating either as the sole result.".to_string(),
+    });
+    findings
 }
 
 fn computed_scan_deltas(profile: &ResultProfile) -> serde_json::Value {
@@ -1409,6 +1579,14 @@ mod tests {
         assert_eq!(
             profile.computed_deltas["s5_throughput"]["comparisons"]["old_wallet_individual_fee_per_recipient_over_payment_processor_batch"],
             serde_json::json!(5.0)
+        );
+        assert_eq!(profile.findings.len(), 4);
+        assert!(
+            profile
+                .findings
+                .iter()
+                .any(|finding| finding.id == "s5-payment-processor-comparison"
+                    && finding.title.contains("2.500x"))
         );
     }
 }

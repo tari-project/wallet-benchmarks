@@ -8,6 +8,20 @@ import json
 from pathlib import Path
 
 
+SUBMISSION_PROFILE_SCHEMA_VERSION = 7
+SUBMISSION_ALLOWED_POINTERS = frozenset(
+    {
+        "/profile_kind",
+        "/run_complete",
+        "/base_node/tip_end_height",
+        "/base_node/tip_end_hash",
+        "/base_node/authority_tip_end_height",
+        "/base_node/authority_tip_end_hash",
+        "/provenance/correction",
+    }
+)
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -26,6 +40,41 @@ def set_pointer(document: object, pointer: str, value: object) -> None:
         target[int(leaf)] = value
     else:
         target[leaf] = value
+
+
+def validate_manifest(document: object, manifest: object) -> None:
+    if not isinstance(document, dict) or not isinstance(manifest, dict):
+        raise ValueError("profile and correction manifest must be JSON objects")
+    schema_version = document.get("schema_version")
+    purpose = manifest.get("profile_purpose")
+    if purpose == "submission":
+        if not isinstance(schema_version, int) or schema_version < SUBMISSION_PROFILE_SCHEMA_VERSION:
+            raise ValueError(
+                f"submission corrections require schema version {SUBMISSION_PROFILE_SCHEMA_VERSION} or newer"
+            )
+        transformations = manifest.get("transformations")
+        if not isinstance(transformations, list) or not transformations:
+            raise ValueError("submission correction manifest must contain transformations")
+        pointers = [item.get("pointer") for item in transformations if isinstance(item, dict)]
+        if len(pointers) != len(transformations) or any(not isinstance(pointer, str) for pointer in pointers):
+            raise ValueError("every correction transformation must contain a string pointer")
+        if len(set(pointers)) != len(pointers):
+            raise ValueError("correction manifest contains duplicate pointers")
+        rejected = sorted(set(pointers).difference(SUBMISSION_ALLOWED_POINTERS))
+        if rejected:
+            raise ValueError(
+                "submission correction may change only finalization metadata; rejected pointers: "
+                + ", ".join(rejected)
+            )
+    elif purpose == "historical_non_submission":
+        if not isinstance(schema_version, int) or schema_version >= SUBMISSION_PROFILE_SCHEMA_VERSION:
+            raise ValueError(
+                "schema-v7 and newer profiles cannot opt out of submission correction restrictions"
+            )
+    else:
+        raise ValueError(
+            "correction manifest profile_purpose must be 'submission' or 'historical_non_submission'"
+        )
 
 
 def main() -> None:
@@ -48,6 +97,10 @@ def main() -> None:
                 f"evidence SHA-256 mismatch: expected {evidence['sha256']}, got {evidence_actual}"
             )
     document = json.loads(raw_bytes)
+    try:
+        validate_manifest(document, manifest)
+    except ValueError as error:
+        raise SystemExit(f"invalid correction manifest: {error}") from error
     for transformation in manifest["transformations"]:
         set_pointer(document, transformation["pointer"], copy.deepcopy(transformation["value"]))
     output = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")

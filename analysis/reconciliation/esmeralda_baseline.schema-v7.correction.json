@@ -6,6 +6,7 @@
   },
   "failure_log_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.finalization.stderr.log",
   "manifest_schema_version": 1,
+  "profile_purpose": "submission",
   "raw_profile_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.raw.json",
   "raw_profile_sha256": "5043456342f72bf8de8c022ce2f4cea5ee6483f7e721c29c93e974c3291b0fa8",
   "transformations": [

@@ -1,5 +1,7 @@
 .DS_Store
 target/
+__pycache__/
+*.pyc
 
 # Local operator state and secrets
 .secrets/

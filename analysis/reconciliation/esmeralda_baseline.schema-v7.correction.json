@@ -2,13 +2,13 @@
   "description": "Finalize the complete 27-cell schema-v7 checkpoint after the final authority query failed because the WSL network route disappeared. No measured cell is changed.",
   "evidence": {
     "path": "analysis/reconciliation/esmeralda_baseline.schema-v7.finalization-evidence.json",
-    "sha256": "b662ce356713b1dd8aa90ce26a97a7b7ccf851b4129a911c3fbdd225129373de"
+    "sha256": "a5f04d2488c64d8f71565ef9f8b3c831823dfe357722ea5e8854fbbb93cffc22"
   },
   "failure_log_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.finalization.stderr.log",
   "manifest_schema_version": 1,
   "profile_purpose": "submission",
   "raw_profile_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.raw.json",
-  "raw_profile_sha256": "5043456342f72bf8de8c022ce2f4cea5ee6483f7e721c29c93e974c3291b0fa8",
+  "raw_profile_sha256": "2990db099416a4a8f24ccf6541eea527f942f86144aaed2b1051a7eedaefc826",
   "transformations": [
     {
       "pointer": "/profile_kind",
@@ -20,19 +20,19 @@
     },
     {
       "pointer": "/base_node/tip_end_height",
-      "value": 796494
+      "value": 818612
     },
     {
       "pointer": "/base_node/tip_end_hash",
-      "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+      "value": "2f03513104f9f6101b20c387d9ccc78f56e137094823657c7bf071f7e8459f4f"
     },
     {
       "pointer": "/base_node/authority_tip_end_height",
-      "value": 796494
+      "value": 818612
     },
     {
       "pointer": "/base_node/authority_tip_end_hash",
-      "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+      "value": "2f03513104f9f6101b20c387d9ccc78f56e137094823657c7bf071f7e8459f4f"
     },
     {
       "pointer": "/provenance/correction",
@@ -41,9 +41,9 @@
         "manifest_path": "analysis/reconciliation/esmeralda_baseline.schema-v7.correction.json",
         "tool": "scripts/correct-profile.py",
         "tool_version": "1",
-        "corrected_at": "2026-08-01T04:32:24Z",
-        "raw_profile_sha256": "5043456342f72bf8de8c022ce2f4cea5ee6483f7e721c29c93e974c3291b0fa8",
-        "raw_profile_size": 3129634,
+        "corrected_at": "2026-08-10T14:39:08Z",
+        "raw_profile_sha256": "2990db099416a4a8f24ccf6541eea527f942f86144aaed2b1051a7eedaefc826",
+        "raw_profile_size": 2885553,
         "transformations": [
           {
             "pointer": "/profile_kind",
@@ -55,19 +55,19 @@
           },
           {
             "pointer": "/base_node/tip_end_height",
-            "value": 796494
+            "value": 818612
           },
           {
             "pointer": "/base_node/tip_end_hash",
-            "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+            "value": "2f03513104f9f6101b20c387d9ccc78f56e137094823657c7bf071f7e8459f4f"
           },
           {
             "pointer": "/base_node/authority_tip_end_height",
-            "value": 796494
+            "value": 818612
           },
           {
             "pointer": "/base_node/authority_tip_end_hash",
-            "value": "f3badc4497da2b5bae4552e58bc3fd711a7121c51d9b1ed1b9b9b548090ccbc5"
+            "value": "2f03513104f9f6101b20c387d9ccc78f56e137094823657c7bf071f7e8459f4f"
           }
         ]
       }

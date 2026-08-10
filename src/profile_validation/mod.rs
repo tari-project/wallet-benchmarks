@@ -3894,8 +3894,11 @@ fn render_summary_document(document: &Value) -> String {
             .map(Vec::len)
             .unwrap_or_default()
     ));
-    output.push_str("\n## Findings\n\n");
-    if let Some(findings) = document["findings"].as_array() {
+    if let Some(findings) = document["findings"]
+        .as_array()
+        .filter(|findings| !findings.is_empty())
+    {
+        output.push_str("\n## Findings\n\n");
         for finding in findings {
             output.push_str(&format!(
                 "- **{}** (`{}`): {} Recommendation: {}\n",

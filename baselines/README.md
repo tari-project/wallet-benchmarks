@@ -1,7 +1,7 @@
 # Baseline Status
 
 `esmeralda_baseline.json` is the schema-v7 submission profile from uncapped run
-`run-1785531043893614543-467991`. It contains all 27 benchmark cells and passes
+`run-1786332549837382208-39335`. It contains all 27 benchmark cells and passes
 the current submission gate. `esmeralda_baseline.summary.md` is its deterministic
 human-readable summary.
 
@@ -11,7 +11,7 @@ cargo run --release --locked -- summarize-profile --profile baselines/esmeralda_
 cmp -s /tmp/esmeralda_baseline.summary.generated.md baselines/esmeralda_baseline.summary.md
 ```
 
-The harness measured at commit `cfcedaaf0f15ded7b0e0826c91a890d2898006e1`.
+The harness measured at commit `fec343e82cabd4a08e5640d3ff9a853663f1b99b`.
 After all 27 cells were checkpointed, the final independent-authority query
 failed because the WSL network route disappeared. The final profile changes only
 the profile-completion and end-anchor fields through the hash-bound manifest in

@@ -1091,6 +1091,14 @@ fn summary_is_deterministic() {
 }
 
 #[test]
+fn summary_omits_empty_findings_section() {
+    let mut document = profile_document();
+    document["findings"] = json!([]);
+    let summary = render_summary(&document).unwrap();
+    assert!(!summary.contains("## Findings"));
+}
+
+#[test]
 fn summary_outcome_counts_come_from_structured_observations() {
     let cell = json!({
         "repetitions": [{"metrics": {"transaction_observations": [

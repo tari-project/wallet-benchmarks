@@ -1,0 +1,46 @@
+[benchmark]
+a_fund = 300000000
+c_min = 3
+volume_target = 512
+doubling_rounds = 6
+fanout_outputs_per_tx = 8
+concurrent_batches = [8, 16, 32, 64, 128]
+s4_t_budget_secs = 900
+s5_m = 100
+s5_k = 10
+tx_amount_ut = 200
+fee_rate = "1"
+scan_interval_secs = 1
+# Timeout (in seconds) for waiting for daemons/wallets to become ready during startup.
+# Increase if your node is still syncing from genesis.
+startup_timeout_secs = 600
+# Timeout (in seconds) for waiting for a single transaction to be confirmed.
+# Increase this on slow testnets (e.g. Esmeralda) where blocks take longer.
+confirmation_timeout_secs = 900
+
+[paths]
+wallet_bin = ""
+minotari_bin = ""
+payment_processor_bin = ""
+console_wallet_bin = ""
+
+[network]
+base_node_grpc_url = "http://rpc.esmeralda.tari.com:18142"
+base_node_http_url = "http://rpc.esmeralda.tari.com:18142"
+grpc_port = 18143
+
+[passwords]
+old_wallet = "benchmark123"
+new_wallet = "benchmark_mode2_password_32_chars"
+payment_processor = "benchmark_mode3_password_32_chars"
+library_wallet = "benchmark_lib_password_32_chars"
+
+[data]
+old_wallet = "./wallet-data"
+new_wallet = "./wallet-data-new"
+payment_processor = "./wallet-data-pp"
+
+[versions]
+console_wallet = "set-me-to-exact-tag-or-commit"
+minotari_cli = "set-me-to-exact-tag-or-commit"
+base_node = "set-me-to-exact-tag-or-commit"

@@ -1,0 +1,78 @@
+name: S1 Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/harness-implementation]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  s1-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          curl -fLsS -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Download and extract Tari suite
+        run: |
+          curl -fL -o /tmp/tari_suite.zip \
+            "https://github.com/tari-project/tari/releases/download/v5.3.1/tari_suite-5.3.1-esme-bc0e4f2-linux-x86_64.zip"
+          mkdir -p tools
+          unzip -o /tmp/tari_suite.zip -d tools/
+          chmod +x tools/minotari_*
+
+      - name: Clone minotari-cli repo
+        run: git clone --depth 1 https://github.com/tari-project/minotari-cli.git /tmp/minotari-cli
+
+      - name: Cache minotari-cli target
+        uses: actions/cache@v4
+        with:
+          path: /tmp/minotari-cli/target
+          key: minotari-cli-target-${{ runner.os }}
+          restore-keys: |
+            minotari-cli-target-${{ runner.os }}-
+
+      - name: Build minotari CLI
+        run: |
+          cargo build --release --manifest-path /tmp/minotari-cli/minotari/Cargo.toml
+          cp /tmp/minotari-cli/target/release/minotari tools/
+          chmod +x tools/minotari
+
+      - name: Configure binary paths
+        run: |
+          ABS_TOOLS="$(pwd)/tools"
+          sed -i "s|wallet_bin = \"\"|wallet_bin = \"$ABS_TOOLS/minotari_console_wallet\"|" micro_config.toml
+          sed -i "s|minotari_bin = \"\"|minotari_bin = \"$ABS_TOOLS/minotari\"|" micro_config.toml
+          sed -i "s|payment_processor_bin = \"\"|payment_processor_bin = \"$ABS_TOOLS/minotari_payment_processor\"|" micro_config.toml
+          sed -i "s|console_wallet_bin = \"\"|console_wallet_bin = \"$ABS_TOOLS/minotari_console_wallet\"|" micro_config.toml
+
+      - name: Build harness
+        run: cargo build --release --manifest-path harness/Cargo.toml
+
+      - name: Run S1 scenario
+        id: s1
+        continue-on-error: true
+        run: |
+          cd harness
+          cargo run --release -- --config ../micro_config.toml --scenario S1 2>&1 | tee /tmp/s1_output.txt
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s1-result
+          path: /tmp/s1_output.txt
+          retention-days: 30

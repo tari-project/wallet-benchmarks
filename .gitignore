@@ -1,0 +1,22 @@
+/target
+Cargo.lock
+wallet-data/
+wallet-data-new/
+wallet-data-pp/
+
+# Binary artifacts
+*.exe
+*.dll
+*.pdb
+*.so
+
+# Runtime logs
+/logs
+
+# Unrelated daemon sample config
+/config
+
+# Locally built/binary tools
+/minotari-cli
+/tools
+s1_output.txt

@@ -1,0 +1,66 @@
+[package]
+name = "wallet-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "wallet-benchmarks"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + IO
+tokio       = { version = "1.47", features = ["full"] }
+reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+url         = { version = "2.5", features = ["serde"] }
+
+# CLI / config / logging (mirrors maintainer style)
+clap        = { version = "4", features = ["derive", "env"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+log         = "0.4"
+env_logger  = "0.11"
+anyhow      = "1"
+thiserror   = "1"
+tempfile    = "3"
+chrono      = { version = "0.4", features = ["serde"] }
+rand        = "0.8"
+regex       = "1"
+sha2        = "0.10"
+hex         = "0.4"
+
+# Tari ecosystem — Mode 1 (gRPC) and Mode 2/3 (offline sign + HTTP submit)
+minotari_app_grpc           = { version = "5.4.0-rc.1", default-features = false }
+minotari_node_wallet_client = "5.4.0-rc.1"
+tonic                       = { version = "0.13", features = ["transport"] }
+prost                       = "0.13"
+
+tari_common                 = "5.4.0-rc.1"
+tari_common_types           = "5.4.0-rc.1"
+tari_transaction_components = "5.4.0-rc.1"
+tari_crypto                 = { version = "0.23", features = ["borsh"] }
+tari_utilities              = "0.10"
+
+# Trait objects with async fn — matches the maintainer-idiom used by
+# minotari_node_wallet_client and the tari ecosystem broadly.
+async-trait = "0.1"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+
+# POSIX signal delivery for ConsoleWalletLifecycle teardown (SIGTERM grace +
+# SIGKILL escalation per analysis/DESIGN.md §Mode 1 step 4).
+# libc for the sampler module's /proc parsing (Linux) and proc_pidinfo FFI
+# (macOS) — see src/sampler/{linux,macos}.rs.
+[target.'cfg(unix)'.dependencies]
+nix  = { version = "0.29", features = ["signal"] }
+libc = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+walkdir  = "2"
+wiremock = "0.6"
+# tokio's `test-util` feature gates `tokio::time::pause()` and `advance()`,
+# which the `FakeClock` test uses to drive deterministic sleep resolution
+# without real wall-clock waits. Dev-only — production builds do not pull
+# the `test-util` feature.
+tokio    = { version = "1.47", features = ["test-util"] }

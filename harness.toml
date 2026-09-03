@@ -1,0 +1,30 @@
+# wallet-benchmarks harness config — COMMITTED TEMPLATE.
+#
+# Copy this to `harness.toml` (git-ignored) and adjust for your host. Every
+# field is optional; omitted fields fall back to the documented defaults in
+# src/config.rs. Unknown top-level keys are rejected at startup.
+#
+# Secrets (seed mnemonics, wallet password) are NEVER stored here — the [seeds]
+# table holds only the *names* of the environment variables that carry them.
+# Set those env vars before running (see .env.harness).
+
+network = "esmeralda"
+base_node_url = "https://rpc.esmeralda.tari.com"
+
+# Mode 1 (old_wallet) binary. When unset the harness resolves it from $PATH.
+minotari_console_wallet_path = "tools/minotari_console_wallet"
+# Mode 2/3 binary (unused by B0, accepted so the shared file validates).
+minotari_path = "tools/minotari"
+
+# Funding/fee tuning — accepted but unused by B0.
+a_fund = 2000000
+fee_rate = 1
+
+# Names of the environment variables carrying secrets (these are also the
+# defaults, so the whole [seeds] table may be omitted). B0 needs only
+# wallet_password: it creates a fresh, empty throwaway wallet.
+[seeds]
+old = "HARNESS_SEED_OLD"
+new = "HARNESS_SEED_NEW"
+payment_processor = "HARNESS_SEED_PP"
+wallet_password = "HARNESS_WALLET_PW"

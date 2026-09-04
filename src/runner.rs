@@ -116,8 +116,13 @@ pub async fn run(
     modes: &[String],
     scenario_ids: &[String],
 ) -> Result<ResultProfile> {
-    // Before anything is measured: every binary the run will spawn has to be the one the
-    // profile is about to claim it was.
+    // Before anything is measured: the settings the requested modes read have to be settings
+    // those modes can run at. Cheapest check there is, and the only one that catches a
+    // misconfiguration the operator can fix without waiting for a scan to reach it.
+    cfg.validate_for_modes(modes)?;
+
+    // Then: every binary the run will spawn has to be the one the profile is about to claim it
+    // was.
     let mut binaries = verify_pinned_binaries(&cfg, modes)?;
 
     let chain = ChainClient::new(&cfg.base_node_url)?;

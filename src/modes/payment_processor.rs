@@ -598,22 +598,11 @@ struct Inner {
 
 impl PaymentProcessor {
     pub fn new(cfg: Arc<HarnessConfig>, chain: ChainClient) -> Result<Self> {
-        // The three validations the specification asks for at start-up, done here rather than
-        // in `HarnessConfig::validate` because all three are only meaningful when this mode is
-        // actually being run.
-        if cfg.params.fee_rate == 0 {
-            return Err(anyhow!(
-                "params.fee_rate is 0, and the payment processor refuses a FEE_PER_GRAM of 0"
-            ));
-        }
-        if cfg.params.s5_k as usize > PP_MAX_BATCH_SIZE {
-            return Err(anyhow!(
-                "params.s5_k ({}) is above the payment processor's MAX_BATCH_SIZE of \
-                 {PP_MAX_BATCH_SIZE}; one POST /v1/payment-batches is one transaction, so S5's \
-                 batch arm cannot be run at this width",
-                cfg.params.s5_k
-            ));
-        }
+        // The validations the specification asks for at start-up. A run reaches them through
+        // `HarnessConfig::validate_for_modes` long before it gets here, which is where they are
+        // meant to fire; repeating the call is what makes them hold for a mode constructed on
+        // its own, and keeps this from being a second, drifting copy of the same rules.
+        cfg.validate_payment_processor()?;
         let password = Zeroizing::new(cfg.wallet_password()?);
         let signer_passphrase = Zeroizing::new(
             std::env::var(&cfg.payment_processor.signer_passphrase_env).map_err(|_| {

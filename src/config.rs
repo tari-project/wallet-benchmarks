@@ -627,13 +627,23 @@ impl HarnessConfig {
     ///
     /// Separate from [`HarnessConfig::validate`] because every one of these is a statement
     /// about the payment processor, and refusing a two-mode run over a setting only the third
-    /// mode reads would be wrong. Run before anything is measured, which is the whole point:
-    /// an unset signer passphrase surfaces as "the processor cannot sign anything" at the
-    /// first send of S1, an hour of scanning into the run, and the run is then worthless.
+    /// mode reads would be wrong. Called by [`crate::runner::run`] before anything is measured,
+    /// which is the whole point: an unset signer passphrase surfaces as "the processor cannot
+    /// sign anything" at the first send of S1, an hour of scanning into the run, and the run is
+    /// then worthless.
     pub fn validate_for_modes(&self, modes: &[String]) -> Result<()> {
         if !modes.iter().any(|m| m == crate::modes::PAYMENT_PROCESSOR) {
             return Ok(());
         }
+        self.validate_payment_processor()
+    }
+
+    /// Everything the payment processor mode needs before it is worth starting.
+    ///
+    /// The authoritative copy: `PaymentProcessor::new` calls this too, so a mode built straight
+    /// off this library rather than through the runner is held to the same settings, and there
+    /// is one place to change when the processor's limits move.
+    pub fn validate_payment_processor(&self) -> Result<()> {
         // The processor takes its fee from `FEE_PER_GRAM` in its environment and ignores
         // whatever a request asks for, so `params.fee_rate` is the only place this mode's fee
         // can be set — and it has to be the value the other two modes were run at, or the
@@ -682,6 +692,7 @@ impl HarnessConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::{NEW_WALLET, OLD_WALLET, PAYMENT_PROCESSOR};
 
     #[test]
     fn defaults_are_the_reference_parameters() {
@@ -783,6 +794,53 @@ mod tests {
         cfg.payment_processor.max_input_count_per_tx = 25;
         cfg.resolve_derived();
         assert_eq!(cfg.payment_processor.max_input_count_per_tx, 25);
+    }
+
+    #[test]
+    fn a_processor_setting_only_stops_a_run_that_asked_for_the_processor() {
+        // Every one of these checks is about the third mode. Refusing a two-mode run over a
+        // setting neither of those modes reads would ground a run that would have worked.
+        let mut cfg = HarnessConfig::default();
+        cfg.payment_processor.signer_passphrase_env = "PP_TEST_CONFIG_PASSPHRASE".to_string();
+        std::env::set_var("PP_TEST_CONFIG_PASSPHRASE", "test-passphrase");
+        cfg.params.s5_k = 200;
+        cfg.params.s5_m = 400;
+
+        let two_modes = [OLD_WALLET.to_string(), NEW_WALLET.to_string()];
+        cfg.validate_for_modes(&two_modes).unwrap();
+
+        let err = cfg
+            .validate_for_modes(&[PAYMENT_PROCESSOR.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_BATCH_SIZE"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn the_processors_settings_are_checked_before_a_run_starts_scanning() {
+        // The point of checking here rather than at the first send: each of these surfaces an
+        // hour into a genesis scan otherwise, and the run is then worthless.
+        std::env::set_var("PP_TEST_CONFIG_PASSPHRASE", "test-passphrase");
+        let mut cfg = HarnessConfig::default();
+        cfg.payment_processor.signer_passphrase_env = "PP_TEST_CONFIG_PASSPHRASE".to_string();
+        cfg.validate_payment_processor().unwrap();
+
+        cfg.params.fee_rate = 0;
+        let err = cfg.validate_payment_processor().unwrap_err().to_string();
+        assert!(err.contains("FEE_PER_GRAM"), "unexpected error: {err}");
+
+        cfg.params.fee_rate = 5;
+        cfg.payment_processor.signer_passphrase_env = "PP_TEST_CONFIG_UNSET_PASSPHRASE".to_string();
+        std::env::remove_var("PP_TEST_CONFIG_UNSET_PASSPHRASE");
+        let err = cfg.validate_payment_processor().unwrap_err().to_string();
+        assert!(
+            err.contains("PP_TEST_CONFIG_UNSET_PASSPHRASE"),
+            "unexpected error: {err}"
+        );
+
+        // Set but empty is not set: the signer would take it and fail to open the keystore.
+        std::env::set_var("PP_TEST_CONFIG_UNSET_PASSPHRASE", "");
+        assert!(cfg.validate_payment_processor().is_err());
     }
 
     #[test]

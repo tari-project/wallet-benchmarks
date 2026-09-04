@@ -1,12 +1,13 @@
 # wallet-benchmarks
 
 A reproducible performance harness for the Tari wallets. It runs the same benchmark protocol
-against two wallet implementations and writes a structured result profile:
+against three wallet implementations and writes a structured result profile:
 
 | Mode | Wallet | Driven through |
 |---|---|---|
 | `old_wallet` | [`minotari_console_wallet`](https://github.com/tari-project/tari) | gRPC, with the harness owning the process lifecycle |
 | `new_wallet` | [`minotari-cli`](https://github.com/tari-project/minotari-cli) | the `minotari` crate as a library, signing offline with `sign_locked_transaction` |
+| `payment_processor` | [`minotari_payment_processor`](https://github.com/tari-project/minotari_payment_processor) in front of a `minotari` daemon | HTTP, with the harness owning both process lifecycles — see [Mode 3](#mode-3-the-payment-processor) |
 
 Scenarios implemented: **B0, S0, S1, S2, S3, S4, S5, S6, S7**.
 
@@ -17,7 +18,8 @@ Two traits carry the whole design:
 * `WalletMode` (`src/modes/mod.rs`) — everything a benchmark needs from a wallet: reset to a
   birthday, scan to the tip, read balances and UTXOs, construct-and-broadcast a transaction,
   follow it to confirmation. `old_wallet.rs` implements it over gRPC, `new_wallet.rs` over the
-  library. Scenarios never see the difference.
+  library, `payment_processor.rs` over HTTP to two processes. Scenarios never see the
+  difference.
 * `Scenario` (`src/scenarios/mod.rs`) — one type per protocol step, each returning a
   `ScenarioReport`. A run is the cross product of the requested modes and scenarios.
 
@@ -27,7 +29,8 @@ when a transaction pays several recipients (the S1 fan-out and the S5 batch arm)
 same pair the CLI's `create-unsigned-transaction` and the REST endpoint use. Signing is
 `sign_locked_transaction`; broadcast is `WalletHttpClient::submit_transaction`.
 
-Supporting modules: `config` (every knob, copied into the profile), `seeds` (seed generation,
+Supporting modules: `binaries` (version pinning for everything the harness spawns),
+`config` (every knob, copied into the profile), `seeds` (seed generation,
 birthday rewriting, funding addresses), `chain` (base node access shared by both modes),
 `metrics` (measurements and the result profile), `sysprobe` (environment disclosure, peak RSS
 and CPU), `runner` (orchestration).
@@ -64,11 +67,13 @@ cd wallet-benchmarks
 cp benchmark.example.toml benchmark.toml
 $EDITOR benchmark.toml          # base_node_url, old_wallet.binary, parameters
 export HARNESS_WALLET_PW='a long random passphrase'
+export HARNESS_SIGNER_PASSPHRASE='another long random passphrase'   # mode 3 only
 ```
 
 `benchmark.toml` holds no secrets. The wallet password comes from the environment variable
-named by `password_env`, and the seed words are written to `seed_file` (`data/seeds.json`,
-git-ignored, mode 0600).
+named by `password_env`, the offline signer's keystore passphrase from the one named by
+`payment_processor.signer_passphrase_env`, and the seed words are written to `seed_file`
+(`data/seeds.json`, git-ignored, mode 0600).
 
 ### 2. Create the seeds and fund them
 
@@ -106,6 +111,7 @@ Re-running `prepare` never rotates an existing seed, so the money stays where it
 cargo run --release -- plan                       # parameters and scenario list, no wallets touched
 cargo run --release -- run                        # every mode, B0 and S0-S7, in order
 cargo run --release -- run --modes new_wallet --scenarios B0,S0,S1
+cargo run --release -- run --modes payment_processor
 ```
 
 A run prints a `mode x scenario` matrix, then summary tables — time per scenario with the
@@ -142,6 +148,135 @@ a_fund = 100000000
 Reduced-scale numbers are not comparable with the reference profile. The profile records every
 parameter used, so which is which is never in doubt.
 
+## Mode 3: the payment processor
+
+`payment_processor` drives the real
+[`minotari_payment_processor`](https://github.com/tari-project/minotari_payment_processor)
+service. It is three processes the harness starts and stops, plus one it never invokes:
+
+```
+harness
+  |  spawn + lifecycle                       HTTP
+  +--> minotari daemon (payment receiver) <-------+
+  |      holds the wallet, the seed and the       |   GET  /accounts/{name}/balance
+  |      scan loop; serves lock_funds             |   POST /accounts/{name}/lock_funds
+  |  spawn + lifecycle                            |
+  +--> minotari_payment_processor  ---------------+
+  |      5 background workers, SQLite payments.db
+  |      spawns minotari_offline_signer once per batch
+  |
+  |  HTTP: POST /v1/payment-batches, GET /v1/payments/{id}, GET /v1/events
+  |
+  +--> base node (operator supplied, HTTP RPC)
+```
+
+### The four binaries
+
+| Binary | Built from | Pinned at | Version asserted at start-up |
+|---|---|---|---|
+| `minotari` (daemon) | [minotari-cli](https://github.com/tari-project/minotari-cli) | `60fde7b3` | `--version`, `pins.minotari` |
+| `minotari_payment_processor` | [minotari_payment_processor](https://github.com/tari-project/minotari_payment_processor) | `4c5d3cf` | `GET /health/version`, `pins.payment_processor` |
+| `minotari_offline_signer` | [tari](https://github.com/tari-project/tari) | `9f5adb7` (v5.3.0-pre.3) | `--version`, `pins.offline_signer` |
+| `minotari_console_wallet` (mode 1) | [tari](https://github.com/tari-project/tari) | `v5.6.0-pre.1` | `--version`, `pins.console_wallet` |
+
+`tools/fetch.sh` builds all four. Note that it checks tari out **twice**, at two different
+revisions, and that this is not something to tidy up — see the version straddle below.
+
+### Version straddle
+
+Mode 3 spans two tari generations:
+
+| Component | tari pin | Offline-signing payload format |
+|---|---|---|
+| `minotari_payment_processor` | `766f80cc` | 4.0.0 |
+| `minotari_offline_signer` | `9f5adb7` (v5.3.0-pre.3) | 4.0.0 |
+| `minotari` daemon | `tari_transaction_components 5.6.0-pre.1` | 5.0.0 |
+| this harness | `tari_* 5.6.0-pre.1` | 5.0.0 |
+
+This works because the 4.0.0 payload never crosses the seam: the processor does not call the
+daemon's `create_unsigned_transaction`, it calls `lock_funds` and builds the unsigned payload
+locally with its own pin, so the payload only ever travels processor → signer and both are on
+4.0.0. A signer built from tari v5.4.0 or later speaks 5.0.0, cannot read those payloads, and
+fails **every** signature.
+
+What *does* cross the generations is `WalletOutput`: the daemon serialises locked UTXOs at
+5.6.0-pre.1 and the processor deserialises them at `766f80cc`. At these two pins the two
+representations were compared field by field — same 17 serde-visible fields, same order, same
+names, same two `#[serde(skip)]`, every reachable field type identical, and no serde-surface
+change in `tari_script` or in the reachable part of `tari_common_types`. **That compatibility is
+incidental, not guaranteed. Re-verify it whenever either pin moves.**
+
+### Signer keystore
+
+The signer keeps its keys in the OS keyring, encrypted with the passphrase named by
+`payment_processor.signer_passphrase_env`, so the keystore survives every data-directory wipe.
+The harness initialises it from the seed the daemon account was created from, and re-points it
+(`clear` then `init seed-words`) whenever the seed changes — B0 runs on a different seed from
+S0–S7, and a keystore holding the wrong spend key fails every batch in exactly the way a
+missing keystore does, only less visibly. It holds no measurable state.
+
+### `--api-disable-auth`
+
+The daemon is started with `--api-disable-auth`, bound to loopback. It token-gates every route
+otherwise, and the processor builds its client as `MinotariConfiguration { base_path,
+..default() }` with no credential set, so every processor → daemon call would be a 401. That API
+can spend funds; loopback-only is the whole of the mitigation, and this mode should not be run
+on a host where that is not enough.
+
+### What mode 3's numbers mean
+
+* **The wallet is the daemon.** The processor has no scanner, no seed and no balance. B0, S2,
+  S3, S6 and S7 measure the daemon's scan loop — a separate process on its own schedule, which
+  is a genuinely different measurement from `new_wallet`'s in-process scan.
+* **Send scenarios run under concurrent scan load, by construction.** The daemon scans while it
+  serves, and this cannot be turned off: the processor reads
+  `GET /accounts/{name}/balance` before every lock and a stale balance fails the lock.
+* **The pipeline is serial.** One `unsigned_tx_creator`, one signer subprocess at a time. S4
+  should show a flat throughput ceiling with linearly growing latency, and that ceiling is the
+  result rather than something to tune around.
+* **One `POST /v1/payment-batches` is one transaction.** `POST /v1/payments` is never used:
+  `batch_creator` coalesces every pending payment for an account into a single batch per cycle
+  and would silently merge transactions a scenario meant to keep apart. `MAX_BATCH_SIZE` is 100,
+  which is also this mode's `max_outputs_per_tx`, and `S5_M = 100` is exactly one batch — arm A
+  cannot be widened further without changing `s5_k`.
+* **The worker sleeps are harness configuration, disclosed.** They are set to 1 s against the
+  processor's own defaults of 600/15/10/15/60 s, and recorded in the profile, so a scenario
+  measures the wallet rather than the poll loop. Same rule as `new_wallet.db_pool_size`.
+  `CONFIRMATION_CHECKER_REQUIRED_CONFIRMATIONS` is set to `params.c_min` rather than the
+  processor's default of 10, so "confirmed" means the same thing in all three modes.
+* **`MAX_INPUT_COUNT_PER_TX` is 400.** Above it the processor performs a CoinJoin cycle that
+  changes the UTXO count in ways S1's arithmetic does not expect. At `volume_target = 512` that
+  is reachable; a round that trips it halts S1 and is recorded, not tuned around.
+* **Retries stay on.** The processor retries a batch up to `MAX_RETRIES = 10` internally. That
+  is the wallet's own behaviour, not harness-level retry, so it is left enabled — but a wedged
+  batch burns ten worker cycles before failing, which the scenario timeouts have to absorb.
+
+### What mode 3 cannot report
+
+These are findings, recorded in every mode 3 scenario report under `mode_findings`:
+
+1. The processor emits no `TransactionBroadcast` or `TransactionMempoolDetected` event, despite
+   declaring both in `EventType` — only six of its ten declared variants are ever written. So
+   `broadcast_secs` is `null` for this mode, with the reason, rather than zero.
+2. It persists no per-state timestamps: payments and batches carry only `created_at` and
+   `updated_at`, overwritten on every transition. The `events` table is the sole transition
+   history, and it is what the profile's per-transaction `enrichment.timeline` comes from.
+3. It exposes no transaction id. Live polling goes by `payment_id`; on-chain identity is
+   reachable only through `payref`, and only once a payment has confirmed. So fees, kernel
+   excesses and confirmation heights are recovered after each scenario rather than at send time,
+   and the fee is read off the transaction the daemon stored, because neither service reports
+   one.
+4. The daemon has no unspent-output endpoint — `lock_funds` is the only place raw UTXOs appear
+   in its API, and calling that to read a balance would reserve funds. The harness reads the
+   daemon's `outputs` table directly instead (SQLite in WAL mode, read-only connection).
+5. `--confirmation-window` is not a flag on the `daemon` subcommand, only a `[wallet]` config
+   key, so the harness writes the daemon's `config.toml` itself rather than letting the daemon
+   materialise its default. Otherwise the daemon would run at a confirmation window of 3
+   whatever `params.c_min` said.
+6. The payment processor repository carries no LICENSE file and no `license` field in
+   `Cargo.toml`, which blocks an external contributor from redistributing a patched build. Out
+   of scope here; worth resolving upstream.
+
 ## What comes out
 
 `results/profile-<timestamp>.json` contains:
@@ -149,7 +284,8 @@ parameter used, so which is which is never in doubt.
 * **environment** — CPU model, cores, RAM, OS, architecture, base node URL and whether it is
   local or remote.
 * **versions** — harness version, the `minotari_console_wallet` version it talked to, the
-  pinned `minotari-cli` git revision, base node URL and sync state.
+  pinned `minotari-cli` git revision, every spawned binary with the version it reported and the
+  pin it was checked against, base node URL and sync state.
 * **config** — the full configuration verbatim.
 * **reports** — per mode and scenario: wall clock, chain tips at start and end, balances,
   UTXO counts, fees, success and failure counts with error strings, balance reconciliation,
@@ -162,10 +298,15 @@ parameter used, so which is which is never in doubt.
 
 ### Baseline profile
 
-No profile is committed yet: one has to come from a real run against Esmeralda with funded
-wallets. Produce it with `cargo run --release -- run` on the reference defaults and commit the
-resulting `results/profile-<timestamp>.json` together with the environment it was produced on
-(the profile records that itself).
+**Pending.** The four profiles in `results/` are superseded and not comparable to a current run:
+they were produced at `fee_rate = 1`, on the old `minotari-cli` pin, without S7 and without
+`payment_processor`. See `results/README.md`.
+
+A new baseline needs a funded Esmeralda run over the full 3 × 9 matrix: fund the three seeds
+printed by `prepare` at `A_fund` (mode 3's into the daemon account's address), then
+`cargo run --release -- run` at the reference defaults, and commit the resulting
+`results/profile-<timestamp>.json`. The profile records the environment it was produced on and
+the version every binary reported, so it identifies itself.
 
 ## The scenarios
 
@@ -191,8 +332,12 @@ Notes on what the numbers mean:
 * The console wallet builds and broadcasts inside a single gRPC call, so for `old_wallet` the
   whole call is reported as construction time and broadcast time is zero. For `new_wallet` the
   two are measured separately.
-* `new_wallet` runs inside the harness process, so its peak RSS and CPU include the harness.
-  Each scan report says so in `resource_sample_includes_harness`.
+* Resource figures are attributed per process. Each scan report carries `scan.processes` — a
+  breakdown of peak RSS and peak CPU per named process, headline first, each flagged with
+  whether it also covers the harness. `old_wallet` reports one external process, `new_wallet`
+  one process that *is* the harness, and `payment_processor` reports the daemon as the headline
+  (it is the wallet) with the payment processor alongside it. A single number for a
+  three-process mode would describe neither.
 * S4 never truncates construction. The scenario is "how fast can this wallet push N
   transactions out", so the calls run to completion however long the wallet takes, and
   `s4_budget_secs` bounds only the wait for confirmations afterwards; a level that used its

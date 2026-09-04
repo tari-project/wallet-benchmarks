@@ -1137,20 +1137,36 @@ impl WalletMode for PaymentProcessor {
         };
         let deadline = Instant::now() + timeout;
 
+        // A daemon that has stopped answering looks exactly like one that is scanning slowly,
+        // and a genesis scan's budget is hours. Tolerate a few failures — the API is briefly
+        // unavailable while a scan batch commits — then say what actually happened rather
+        // than waiting the whole budget out on a dead process.
+        let mut consecutive_failures = 0u32;
+        let mut last_scanned = 0u64;
         let scanned_height = loop {
             let tip = self.chain.tip_height().await?;
-            let scanned = self
-                .scan_status()
-                .await
-                .unwrap_or_default()
-                .last_scanned_height;
-            if scanned >= tip && scanned > 0 {
-                break scanned;
+            match self.scan_status().await {
+                Ok(status) => {
+                    consecutive_failures = 0;
+                    last_scanned = status.last_scanned_height;
+                    if last_scanned >= tip && last_scanned > 0 {
+                        break last_scanned;
+                    }
+                },
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= DAEMON_UNRESPONSIVE_POLLS {
+                        return Err(anyhow!(
+                            "The minotari daemon stopped answering: {DAEMON_UNRESPONSIVE_POLLS} \
+                             consecutive scan_status calls failed, the last with {e:#}"
+                        ));
+                    }
+                },
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "Timed out waiting for the minotari daemon to reach the tip (daemon at \
-                     {scanned}, tip {tip})"
+                     {last_scanned}, tip {tip})"
                 ));
             }
             tokio::time::sleep(self.cfg.params.poll_interval()).await;
@@ -1550,6 +1566,9 @@ impl PaymentProcessor {
         Ok(row)
     }
 }
+
+/// Consecutive failed `scan_status` polls that mean the daemon is gone rather than busy.
+const DAEMON_UNRESPONSIVE_POLLS: u32 = 10;
 
 /// Days the daemon's scanner steps back from the account birthday before resolving a start
 /// height. Matches `new_wallet`; only used to report where the scan began.

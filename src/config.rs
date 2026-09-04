@@ -30,6 +30,8 @@ pub struct HarnessConfig {
     pub old_wallet: OldWalletConfig,
     /// New wallet (`minotari-cli` library) settings.
     pub new_wallet: NewWalletConfig,
+    /// Payment processor mode settings: the daemon, the processor and the signer.
+    pub payment_processor: PaymentProcessorConfig,
     /// Versions every spawned binary has to report before a run starts.
     pub pins: Pins,
     /// Test protocol parameters. These are the knobs the issue specifies.
@@ -47,9 +49,106 @@ impl Default for HarnessConfig {
             password_env: "HARNESS_WALLET_PW".to_string(),
             old_wallet: OldWalletConfig::default(),
             new_wallet: NewWalletConfig::default(),
+            payment_processor: PaymentProcessorConfig::default(),
             pins: Pins::default(),
             params: Params::default(),
         }
+    }
+}
+
+
+/// Largest number of items one `POST /v1/payment-batches` accepts.
+///
+/// `MAX_BATCH_SIZE` in `minotari_payment_processor/src/lib.rs`. A larger request is refused
+/// with 400, so this is also the mode's `max_outputs_per_tx`.
+pub const PP_MAX_BATCH_SIZE: usize = 100;
+
+/// Settings for the payment processor mode: a `minotari` daemon, the payment processor and the
+/// offline signer the processor shells out to.
+///
+/// The worker sleep intervals are deliberately low and are recorded in the profile. They are
+/// harness-side configuration of the wallet, disclosed, so the scenario measures the wallet
+/// rather than the poll loop — the same rule already applied to `new_wallet.db_pool_size`. At
+/// the processor's own defaults a single batch would spend ten minutes waiting for
+/// `batch_creator` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaymentProcessorConfig {
+    /// The `minotari` daemon binary. This is the wallet: it holds the seed, runs the scan loop
+    /// and serves the payment receiver API the processor calls.
+    pub minotari_binary: PathBuf,
+    /// The `minotari_payment_processor` binary.
+    pub pp_binary: PathBuf,
+    /// The `minotari_offline_signer` binary. The harness never runs this to sign; the
+    /// processor spawns it once per batch. The harness only initialises its keystore.
+    pub offline_signer_binary: PathBuf,
+    /// Port the daemon serves its API on.
+    pub daemon_port: u16,
+    /// Address the daemon binds its API to. Loopback: the API can spend funds and runs with
+    /// authentication disabled.
+    pub daemon_bind_address: String,
+    /// Seconds between the daemon's scan cycles. Low on purpose and recorded.
+    pub daemon_scan_interval_secs: u64,
+    /// Port the payment processor serves its API on.
+    pub pp_port: u16,
+    /// Account name inside the daemon, and the `account_name` the processor is configured with.
+    pub account_name: String,
+    /// `MAX_INPUT_COUNT_PER_TX`. The processor silently clamps anything above 400.
+    pub max_input_count_per_tx: usize,
+    /// Worker sleep, in seconds. Processor default 600.
+    pub batch_creator_sleep_secs: u64,
+    /// Worker sleep, in seconds. Processor default 15.
+    pub unsigned_tx_creator_sleep_secs: u64,
+    /// Worker sleep, in seconds. Processor default 10.
+    pub transaction_signer_sleep_secs: u64,
+    /// Worker sleep, in seconds. Processor default 15.
+    pub broadcaster_sleep_secs: u64,
+    /// Worker sleep, in seconds. Processor default 60.
+    pub confirmation_checker_sleep_secs: u64,
+    /// Name of the environment variable carrying the offline signer's keystore passphrase.
+    ///
+    /// The keystore lives in the OS keyring, not in the data directory, so this passphrase is
+    /// what the harness needs to initialise it and what the processor needs to use it.
+    pub signer_passphrase_env: String,
+    /// How long to wait for the daemon and the processor to answer after they are spawned.
+    pub startup_timeout_secs: u64,
+}
+
+impl Default for PaymentProcessorConfig {
+    fn default() -> Self {
+        Self {
+            minotari_binary: PathBuf::from("tools/minotari"),
+            pp_binary: PathBuf::from("tools/minotari_payment_processor"),
+            offline_signer_binary: PathBuf::from("tools/minotari_offline_signer"),
+            daemon_port: 9_000,
+            daemon_bind_address: "127.0.0.1".to_string(),
+            daemon_scan_interval_secs: 5,
+            pp_port: 9_145,
+            account_name: "bench".to_string(),
+            max_input_count_per_tx: 400,
+            batch_creator_sleep_secs: 1,
+            unsigned_tx_creator_sleep_secs: 1,
+            transaction_signer_sleep_secs: 1,
+            broadcaster_sleep_secs: 1,
+            confirmation_checker_sleep_secs: 1,
+            signer_passphrase_env: "HARNESS_SIGNER_PASSPHRASE".to_string(),
+            startup_timeout_secs: 300,
+        }
+    }
+}
+
+impl PaymentProcessorConfig {
+    /// Base URL of the daemon's payment receiver API.
+    pub fn daemon_url(&self) -> String {
+        format!("http://{}:{}", self.daemon_bind_address, self.daemon_port)
+    }
+
+    /// Base URL of the payment processor's API.
+    ///
+    /// Always loopback, whatever `LISTEN_IP` the processor was told to bind: the harness and
+    /// the processor are on the same host by construction.
+    pub fn pp_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.pp_port)
     }
 }
 
@@ -468,6 +567,21 @@ impl HarnessConfig {
                  sends would fail on the connection pool before S4 stopped waiting for them",
                 self.new_wallet.db_checkout_timeout_secs,
                 p.s4_budget_secs
+            ));
+        }
+        if self.payment_processor.account_name.trim().is_empty() {
+            return Err(anyhow!("payment_processor.account_name must be set"));
+        }
+        if self.payment_processor.max_input_count_per_tx == 0 {
+            return Err(anyhow!(
+                "payment_processor.max_input_count_per_tx must be greater than zero"
+            ));
+        }
+        if self.payment_processor.daemon_port == self.payment_processor.pp_port {
+            return Err(anyhow!(
+                "payment_processor.daemon_port and payment_processor.pp_port are both {}; the \
+                 daemon and the processor cannot share a port",
+                self.payment_processor.pp_port
             ));
         }
         if self.base_node_url.trim().is_empty() {

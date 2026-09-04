@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use wallet_benchmarks::{
     config::HarnessConfig,
-    modes::{NEW_WALLET, OLD_WALLET},
+    modes::{NEW_WALLET, OLD_WALLET, PAYMENT_PROCESSOR},
     runner,
     scenarios::{self, ALL},
     seeds::SeedBook,
@@ -32,7 +32,16 @@ struct Cli {
     config: PathBuf,
 
     /// Wallet modes to act on, comma separated.
-    #[arg(long, value_delimiter = ',', default_values_t = [OLD_WALLET.to_string(), NEW_WALLET.to_string()], global = true)]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = [
+            OLD_WALLET.to_string(),
+            NEW_WALLET.to_string(),
+            PAYMENT_PROCESSOR.to_string(),
+        ],
+        global = true
+    )]
     modes: Vec<String>,
 
     #[command(subcommand)]
@@ -190,6 +199,20 @@ fn print_funding_table(cfg: &HarnessConfig, book: &SeedBook) {
     println!();
     for entry in book.funding_targets() {
         println!("  {:<24} {}", entry.label, entry.address);
+    }
+    if book
+        .funding_targets()
+        .iter()
+        .any(|e| e.label == PAYMENT_PROCESSOR)
+    {
+        println!();
+        println!(
+            "  `{PAYMENT_PROCESSOR}` is the address of the `{}` account inside the minotari\n  \
+             daemon, which is the wallet for that mode. The payment processor holds no funds\n  \
+             and has no address of its own: it watches that account by view key and asks the\n  \
+             daemon to lock its UTXOs.",
+            cfg.payment_processor.account_name
+        );
     }
     println!();
     println!("These wallets must never be funded (they are the B0 baseline):");

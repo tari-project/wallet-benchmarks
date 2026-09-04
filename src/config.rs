@@ -56,12 +56,19 @@ impl Default for HarnessConfig {
     }
 }
 
-
 /// Largest number of items one `POST /v1/payment-batches` accepts.
 ///
 /// `MAX_BATCH_SIZE` in `minotari_payment_processor/src/lib.rs`. A larger request is refused
 /// with 400, so this is also the mode's `max_outputs_per_tx`.
 pub const PP_MAX_BATCH_SIZE: usize = 100;
+
+/// Ceiling the payment processor silently applies to `MAX_INPUT_COUNT_PER_TX`.
+///
+/// `MAX_INPUT_COUNT_PER_TX_LIMIT` in the processor: a configured value above this is clamped
+/// without a warning, so a harness that recorded the configured number would be recording a
+/// setting the processor never used. The clamped value is what the profile reports and what S1
+/// compares its UTXO count against.
+pub const PP_MAX_INPUT_COUNT_CLAMP: usize = 400;
 
 /// Settings for the payment processor mode: a `minotari` daemon, the payment processor and the
 /// offline signer the processor shells out to.
@@ -149,6 +156,16 @@ impl PaymentProcessorConfig {
     /// the processor are on the same host by construction.
     pub fn pp_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.pp_port)
+    }
+
+    /// The input count the processor will actually build transactions with.
+    ///
+    /// Anything above [`PP_MAX_INPUT_COUNT_CLAMP`] is clamped by the processor without saying
+    /// so, so this is the number that has to reach both the processor's environment and the
+    /// profile. Above it the processor stops behaving like a wallet spending its UTXOs and
+    /// starts consolidating them first, which is the CoinJoin/split cycle S1 watches for.
+    pub fn effective_max_input_count(&self) -> usize {
+        self.max_input_count_per_tx.min(PP_MAX_INPUT_COUNT_CLAMP)
     }
 }
 
@@ -591,6 +608,56 @@ impl HarnessConfig {
         Ok(())
     }
 
+    /// The checks that only apply to some modes, run once the modes are known.
+    ///
+    /// Separate from [`HarnessConfig::validate`] because every one of these is a statement
+    /// about the payment processor, and refusing a two-mode run over a setting only the third
+    /// mode reads would be wrong. Run before anything is measured, which is the whole point:
+    /// an unset signer passphrase surfaces as "the processor cannot sign anything" at the
+    /// first send of S1, an hour of scanning into the run, and the run is then worthless.
+    pub fn validate_for_modes(&self, modes: &[String]) -> Result<()> {
+        if !modes.iter().any(|m| m == crate::modes::PAYMENT_PROCESSOR) {
+            return Ok(());
+        }
+        // The processor takes its fee from `FEE_PER_GRAM` in its environment and ignores
+        // whatever a request asks for, so `params.fee_rate` is the only place this mode's fee
+        // can be set — and it has to be the value the other two modes were run at, or the
+        // three columns of the profile are not comparable. The processor also rejects a fee
+        // of zero outright.
+        if self.params.fee_rate == 0 {
+            return Err(anyhow!(
+                "params.fee_rate is 0, and the payment processor refuses a FEE_PER_GRAM of 0. \
+                 This is the value the harness hands it, so it is also the fee every mode is \
+                 compared at."
+            ));
+        }
+        if self.params.s5_k as usize > PP_MAX_BATCH_SIZE {
+            return Err(anyhow!(
+                "params.s5_k ({}) is above the payment processor's MAX_BATCH_SIZE of \
+                 {PP_MAX_BATCH_SIZE}. One POST /v1/payment-batches is one transaction for this \
+                 mode, so S5's batch arm cannot be run at that width — the request would be \
+                 refused with 400.",
+                self.params.s5_k
+            ));
+        }
+        // The keystore lives in the OS keyring, so this passphrase is what the harness needs
+        // to initialise it and what the processor needs to use it. Checked here rather than at
+        // the first signature for the same reason as everything else in this function.
+        if std::env::var(&self.payment_processor.signer_passphrase_env)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "The offline signer keystore passphrase environment variable `{}` is not set. The \
+                 payment processor spawns the signer for every batch and cannot sign anything \
+                 without it, so this run would scan for an hour and then fail at its first send.",
+                self.payment_processor.signer_passphrase_env
+            ));
+        }
+        Ok(())
+    }
+
     /// Wallet data directory for one mode and wallet slot.
     pub fn wallet_dir(&self, mode: &str, slot: &str) -> PathBuf {
         self.data_dir.join(mode).join(slot)
@@ -777,6 +844,7 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.params.fee_rate, 5);
         assert_eq!(cfg.pins, Pins::default());
+        assert_eq!(cfg.payment_processor, PaymentProcessorConfig::default());
     }
 
     #[test]

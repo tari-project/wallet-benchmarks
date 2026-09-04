@@ -8,6 +8,7 @@
 
 pub mod new_wallet;
 pub mod old_wallet;
+pub mod payment_processor;
 
 use std::time::Duration;
 
@@ -15,12 +16,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{metrics::ScanMetrics, seeds::SeedEntry};
+use crate::{
+    metrics::{ScanMetrics, ScenarioReport},
+    seeds::SeedEntry,
+};
 
 /// Label of the mode backed by `minotari_console_wallet`.
 pub const OLD_WALLET: &str = "old_wallet";
 /// Label of the mode backed by the `minotari-cli` library.
 pub const NEW_WALLET: &str = "new_wallet";
+/// Label of the mode backed by the real `minotari_payment_processor` service.
+pub const PAYMENT_PROCESSOR: &str = "payment_processor";
 
 /// Where a wallet starts scanning from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +346,35 @@ pub trait WalletMode: Send + Sync {
     /// Largest number of payment outputs this mode can put in one transaction.
     fn max_outputs_per_tx(&self) -> usize {
         usize::MAX
+    }
+
+    /// Whether this mode can see the moment a transaction finished being constructed.
+    ///
+    /// Both wallet modes can: they build the transaction themselves and the call returns when
+    /// it is built. `payment_processor` cannot — its API answers 202 in a few milliseconds and
+    /// a background worker builds the transaction later, recording no timestamp for it. S4
+    /// uses this to decide whether the gaps between construction-complete events say anything
+    /// about internal serialisation, or whether it has to look at terminal states instead.
+    fn observes_construction(&self) -> bool {
+        true
+    }
+
+    /// Results about this mode that belong in the profile whatever a scenario measured.
+    ///
+    /// These are findings, not defects to fix: things the wallet does not expose, or does by
+    /// design, that bound what any measurement of it can mean.
+    fn known_findings(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Fills in what only a lookup after the scenario can supply.
+    ///
+    /// Every mode that knows its transaction's fee and id at send time leaves this alone.
+    /// `payment_processor` does not: it reports no fee and no transaction id, and the
+    /// `payref` that reaches the chain only exists once a payment has confirmed, so the
+    /// on-chain half of every transaction's record has to be recovered afterwards.
+    async fn enrich(&self, _report: &mut ScenarioReport) -> Result<()> {
+        Ok(())
     }
 
     /// The processes this mode's resource samples are attributed to, headline first.

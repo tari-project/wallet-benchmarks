@@ -246,6 +246,24 @@ pub fn max_serialization_gap(metrics: &[TxMetric]) -> f64 {
     done.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max)
 }
 
+/// Largest gap between consecutive terminal-state observations.
+///
+/// The counterpart of [`max_serialization_gap`] for a mode whose construction is not
+/// observable. `payment_processor` answers 202 in a few milliseconds and builds the
+/// transaction later in a background worker, so the gaps between its "construction complete"
+/// events are gaps between axum responses and say nothing about the wallet. The stream of
+/// moments at which transactions actually settled is what is left, and a pipeline that
+/// serialises internally shows up in it the same way.
+///
+/// Only confirmed transactions have a terminal-state offset, so this is a weaker signal than
+/// the construction gap: it also carries block time. It is reported next to the construction
+/// gap rather than instead of it, with the source named.
+pub fn max_terminal_state_gap(metrics: &[TxMetric]) -> f64 {
+    let mut settled: Vec<f64> = metrics.iter().filter_map(|m| m.confirmed_at_secs).collect();
+    settled.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    settled.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max)
+}
+
 /// Counts of how the transactions ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TxTally {
@@ -538,6 +556,27 @@ mod tests {
             0.0
         );
         assert_eq!(max_serialization_gap(&[]), 0.0);
+    }
+
+    #[test]
+    fn the_terminal_state_gap_reads_confirmations_rather_than_constructions() {
+        let settled = |at: f64| TxMetric {
+            confirmed_at_secs: Some(at),
+            outcome: TxOutcome::Confirmed,
+            ..TxMetric::default()
+        };
+        let gap = max_terminal_state_gap(&[settled(1.0), settled(9.0), settled(3.0)]);
+        assert!((gap - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transactions_that_never_settled_contribute_no_terminal_gap() {
+        // A timed-out transaction has no terminal offset at all, and inventing one from its
+        // construction time would report a gap that never happened.
+        let mut timed_out = metric(0.0, TxOutcome::TimedOut);
+        timed_out.confirmed_at_secs = None;
+        assert_eq!(max_terminal_state_gap(&[timed_out]), 0.0);
+        assert_eq!(max_terminal_state_gap(&[]), 0.0);
     }
 
     #[test]

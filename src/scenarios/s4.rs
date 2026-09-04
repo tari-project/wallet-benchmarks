@@ -18,6 +18,7 @@ use crate::{
             await_confirmations,
             distinct_errors,
             max_serialization_gap,
+            max_terminal_state_gap,
             wait_until_spendable,
             Pending,
             SpendRequirement,
@@ -50,6 +51,8 @@ impl Scenario for ConcurrentConstruction {
         report.tip_height_start = ctx.chain.tip_height().await.unwrap_or(0);
 
         let started = Instant::now();
+        // Whether the gaps between construction-complete events mean anything for this mode.
+        let observes_construction = mode.observes_construction();
         mode.sync_to_tip(params.scan_timeout()).await?;
         let address = mode.address().await?;
         report.balance_start = mode.balance().await?.total();
@@ -133,15 +136,27 @@ impl Scenario for ConcurrentConstruction {
             )
             .await;
 
-            let (tally, gap, fees, errors, infrastructure_failures) = {
+            let (tally, construction_gap, terminal_gap, fees, errors, infrastructure_failures) = {
                 let metrics = &report.transactions[first_index..];
                 (
                     TxTally::of(metrics),
                     max_serialization_gap(metrics),
+                    max_terminal_state_gap(metrics),
                     metrics.iter().map(|m| m.fee).sum::<u64>(),
                     distinct_errors(metrics, 5),
                     count_infrastructure_failures(metrics),
                 )
+            };
+            // A mode that cannot see when construction finished cannot be asked about the gaps
+            // between constructions. `payment_processor` returns 202 in milliseconds and builds
+            // the transaction later in a worker, so its construction gaps are gaps between
+            // axum responses; the stream of terminal states is what is left to read its
+            // internal serialisation from. Both are recorded, and so is which one the headline
+            // came from.
+            let (gap, gap_source) = if observes_construction {
+                (construction_gap, "construction_complete")
+            } else {
+                (terminal_gap, "terminal_state")
             };
 
             // Let the wallet catch up before the next level, otherwise the ramp measures a
@@ -163,6 +178,9 @@ impl Scenario for ConcurrentConstruction {
                 "batch_wall_clock_secs": batch_started.elapsed().as_secs_f64(),
                 "construction_wall_clock_secs": construction_wall_clock,
                 "max_serialization_gap_secs": gap,
+                "max_serialization_gap_source": gap_source,
+                "max_construction_gap_secs": construction_gap,
+                "max_terminal_state_gap_secs": terminal_gap,
                 "success_rate": tally.success_rate(),
                 // Failures that are the harness's plumbing rather than the wallet's
                 // behaviour. Anything above zero makes this level's numbers suspect.
@@ -187,6 +205,15 @@ impl Scenario for ConcurrentConstruction {
         report.successes = tally.confirmed;
         report.failures = tally.unsuccessful();
         report.note("levels", level_notes);
+        report.note("construction_is_observable", observes_construction);
+        if !observes_construction {
+            report.note(
+                "construction_note",
+                "this mode acknowledges a send before it builds anything, so construction_secs is \
+                 the time to accept the work rather than the time to construct a transaction, and \
+                 the serialisation gap is read from terminal states instead",
+            );
+        }
         report.note("tally", tally);
         report.note(
             "infrastructure_failures",

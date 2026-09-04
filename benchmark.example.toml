@@ -44,6 +44,42 @@ db_pool_size = 0
 # waiting for it (start-up refuses the combination).
 db_checkout_timeout_secs = 1200
 
+[payment_processor]
+# Mode 3 is three processes: the minotari daemon (which *is* the wallet — it holds the seed and
+# runs the scan loop), the minotari_payment_processor service in front of it, and the offline
+# signer the processor shells out to once per batch. Build all three with tools/fetch.sh.
+minotari_binary = "tools/minotari"
+pp_binary = "tools/minotari_payment_processor"
+offline_signer_binary = "tools/minotari_offline_signer"
+# The daemon's payment receiver API. Loopback only: it runs with authentication disabled,
+# because the processor builds its client with no credential and every call would be a 401
+# otherwise, and that API can spend funds.
+daemon_port = 9000
+daemon_bind_address = "127.0.0.1"
+# Seconds between the daemon's scan cycles (its own default is 60). Low on purpose and recorded
+# in the profile.
+daemon_scan_interval_secs = 5
+pp_port = 9145
+account_name = "bench"
+# MAX_INPUT_COUNT_PER_TX. Above this the processor does a CoinJoin cycle, which changes the UTXO
+# count in ways S1's arithmetic does not expect; a round that trips it is recorded as a finding.
+# The processor silently clamps anything above 400.
+max_input_count_per_tx = 400
+# Worker sleeps, in seconds. Deliberately low and recorded in the profile: these are harness-side
+# configuration of the wallet, disclosed, so the scenario measures the wallet rather than the poll
+# loop — the same rule as new_wallet.db_pool_size. The processor's own defaults are 600, 15, 10,
+# 15 and 60, so a single batch would otherwise spend ten minutes in batch_creator alone.
+batch_creator_sleep_secs = 1
+unsigned_tx_creator_sleep_secs = 1
+transaction_signer_sleep_secs = 1
+broadcaster_sleep_secs = 1
+confirmation_checker_sleep_secs = 1
+# The offline signer's keystore lives in the OS keyring, not in a data directory, so it survives
+# every wipe. This names the environment variable carrying the passphrase that encrypts it.
+signer_passphrase_env = "HARNESS_SIGNER_PASSPHRASE"
+# How long to wait for the daemon and the processor to answer after they are spawned.
+startup_timeout_secs = 300
+
 [pins]
 # Version string each spawned binary must report before a run starts. `tools/fetch.sh` builds
 # each one at the revision these correspond to; the harness refuses to run when what is on disk

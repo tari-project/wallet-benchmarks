@@ -14,7 +14,15 @@ use crate::{
     chain::ChainClient,
     config::HarnessConfig,
     metrics::{Outcome, ResultProfile, ScenarioReport, Versions, MINOTARI_CLI_REV},
-    modes::{new_wallet::NewWallet, old_wallet::OldWallet, WalletMode, NEW_WALLET, OLD_WALLET},
+    modes::{
+        new_wallet::NewWallet,
+        old_wallet::OldWallet,
+        payment_processor::PaymentProcessor,
+        WalletMode,
+        NEW_WALLET,
+        OLD_WALLET,
+        PAYMENT_PROCESSOR,
+    },
     scenarios::{self, RunContext},
     seeds::{baseline_label, SeedBook},
     sysprobe::EnvironmentInfo,
@@ -29,8 +37,10 @@ pub fn build_mode(
     match label {
         OLD_WALLET => Ok(Arc::new(OldWallet::new(cfg, chain)?)),
         NEW_WALLET => Ok(Arc::new(NewWallet::new(cfg, chain)?)),
+        PAYMENT_PROCESSOR => Ok(Arc::new(PaymentProcessor::new(cfg, chain)?)),
         other => Err(anyhow!(
-            "Unknown mode `{other}`; this harness implements `{OLD_WALLET}` and `{NEW_WALLET}`"
+            "Unknown mode `{other}`; this harness implements `{OLD_WALLET}`, `{NEW_WALLET}` and \
+             `{PAYMENT_PROCESSOR}`"
         )),
     }
 }
@@ -49,6 +59,18 @@ pub fn pinned_binaries(label: &str, cfg: &HarnessConfig) -> Vec<PinnedBinary> {
             cfg.old_wallet.binary.clone(),
             &cfg.pins.console_wallet,
         )],
+        PAYMENT_PROCESSOR => vec![
+            PinnedBinary::new(
+                "minotari",
+                cfg.payment_processor.minotari_binary.clone(),
+                &cfg.pins.minotari,
+            ),
+            PinnedBinary::new(
+                "minotari_offline_signer",
+                cfg.payment_processor.offline_signer_binary.clone(),
+                &cfg.pins.offline_signer,
+            ),
+        ],
         _ => Vec::new(),
     }
 }
@@ -153,7 +175,21 @@ pub async fn run(
             );
             let started = std::time::Instant::now();
             match scenario.run(&mode, &mut ctx).await {
-                Ok(report) => {
+                Ok(mut report) => {
+                    // Whatever the outcome: a scenario that failed part way still has
+                    // transactions worth correlating to the chain, and a mode's standing
+                    // findings belong in every one of its reports.
+                    if let Err(e) = mode.enrich(&mut report).await {
+                        warn!(
+                            "[{mode_label}] {} could not be enriched: {e:#}",
+                            report.scenario
+                        );
+                        report.note("enrichment_error", format!("{e:#}"));
+                    }
+                    let findings = mode.known_findings();
+                    if !findings.is_empty() {
+                        report.note("mode_findings", findings);
+                    }
                     if report.outcome == Outcome::Failed {
                         warn!(
                             "[{mode_label}] {} failed: {}. Skipping the rest of this mode.",
@@ -246,11 +282,74 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Arc::new(test_config(dir.path()));
         let chain = ChainClient::new(&cfg.base_node_url).unwrap();
-        let err = match build_mode("payment_processor", cfg, chain) {
+        let err = match build_mode("library_payment_processor", cfg, chain) {
             Err(e) => e.to_string(),
-            Ok(_) => panic!("the payment processor mode is out of scope for this harness"),
+            Ok(_) => panic!("this harness implements three modes, not four"),
         };
-        assert!(err.contains("payment_processor"), "unexpected error: {err}");
+        assert!(
+            err.contains("library_payment_processor"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains(PAYMENT_PROCESSOR), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn all_three_modes_can_be_built() {
+        // Building the payment processor mode reads the two secrets it needs from the
+        // environment, which is process-wide state; nothing else in this suite reads either
+        // variable, so setting them here does not race with another test.
+        std::env::set_var("HARNESS_WALLET_PW", "test-password");
+        std::env::set_var("HARNESS_SIGNER_PASSPHRASE", "test-passphrase");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(test_config(dir.path()));
+        let chain = ChainClient::new(&cfg.base_node_url).unwrap();
+        for label in [OLD_WALLET, NEW_WALLET, PAYMENT_PROCESSOR] {
+            let mode = build_mode(label, Arc::clone(&cfg), chain.clone())
+                .unwrap_or_else(|e| panic!("mode {label} could not be built: {e:#}"));
+            assert_eq!(mode.name(), label);
+        }
+    }
+
+    #[test]
+    fn the_payment_processor_needs_its_signer_passphrase_to_be_set() {
+        std::env::set_var("HARNESS_WALLET_PW", "test-password");
+        std::env::remove_var("PP_TEST_MISSING_PASSPHRASE");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.payment_processor.signer_passphrase_env = "PP_TEST_MISSING_PASSPHRASE".to_string();
+        let chain = ChainClient::new(&cfg.base_node_url).unwrap();
+        let err = match build_mode(PAYMENT_PROCESSOR, Arc::new(cfg), chain) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the mode cannot sign anything without the keystore passphrase"),
+        };
+        assert!(
+            err.contains("PP_TEST_MISSING_PASSPHRASE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_batch_arm_wider_than_the_processor_allows_is_refused_up_front() {
+        std::env::set_var("HARNESS_WALLET_PW", "test-password");
+        std::env::set_var("HARNESS_SIGNER_PASSPHRASE", "test-passphrase");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        // One POST /v1/payment-batches is one transaction, capped at MAX_BATCH_SIZE items.
+        cfg.params.s5_k = 200;
+        cfg.params.s5_m = 400;
+        let chain = ChainClient::new(&cfg.base_node_url).unwrap();
+        let err = match build_mode(PAYMENT_PROCESSOR, Arc::new(cfg), chain.clone()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("one batch request is one transaction, capped at MAX_BATCH_SIZE"),
+        };
+        assert!(err.contains("MAX_BATCH_SIZE"), "unexpected error: {err}");
+
+        // The other two modes are unaffected by the processor's limit.
+        let cfg = Arc::new(test_config(dir.path()));
+        assert!(build_mode(NEW_WALLET, cfg, chain).is_ok());
     }
 
     #[test]

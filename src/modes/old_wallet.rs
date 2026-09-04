@@ -7,7 +7,7 @@
 //! between the two is the wallet's scan.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -83,6 +83,61 @@ fn tail_of_log(data_dir: &std::path::Path, lines: usize) -> String {
         },
         Err(e) => format!("Could not read {}: {e}", path.display()),
     }
+}
+
+/// The argv and environment for the `minotari_console_wallet` process.
+///
+/// The wallet password and the seed words go in the environment rather than in argv: argv is
+/// world-readable through the process table (`ps`, `/proc/<pid>/cmdline`), so spelling them as
+/// `--password`/`--seed-words` would put a wallet password and a full seed where every other
+/// local user can read them — and this process lives for the whole of a mode 1 run, so that is
+/// the whole run, not one short-lived call. The console wallet declares clap `env` fallbacks
+/// for exactly this — `MINOTARI_WALLET_PASSWORD` and `MINOTARI_WALLET_SEED_WORDS` — and its own
+/// CLI help says to use them in preference to the flags, so dropping the flags is the whole fix.
+fn console_wallet_invocation<'a>(
+    cfg: &HarnessConfig,
+    data_dir: &Path,
+    grpc_address: &str,
+    password: &'a str,
+    seed_words: &'a str,
+) -> (Vec<String>, Vec<(&'static str, &'a str)>) {
+    let args = vec![
+        "--base-path".to_string(),
+        data_dir.display().to_string(),
+        "--network".to_string(),
+        cfg.network.clone(),
+        "--non-interactive-mode".to_string(),
+        "--grpc-address".to_string(),
+        grpc_address.to_string(),
+        "-p".to_string(),
+        format!("wallet.http_server_url={}", cfg.base_node_url),
+        "-p".to_string(),
+        format!(
+            "wallet.recovery_retry_limit={}",
+            cfg.old_wallet.recovery_retry_limit
+        ),
+    ];
+    (args, vec![
+        ("MINOTARI_WALLET_PASSWORD", password),
+        ("MINOTARI_WALLET_SEED_WORDS", seed_words),
+    ])
+}
+
+/// The wallet's `Command`, before its stdio is attached.
+///
+/// Split out so a test can spawn the same command the run does and check what the child
+/// actually receives, rather than what the caller believes it passed.
+fn console_wallet_command(
+    binary: &Path,
+    args: &[String],
+    env: &[(&'static str, &str)],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
 }
 
 /// A `minotari_console_wallet` process plus its gRPC connection.
@@ -281,26 +336,10 @@ impl WalletMode for OldWallet {
         let log_err = log.try_clone()?;
 
         let grpc_address = format!("/ip4/127.0.0.1/tcp/{}", self.cfg.old_wallet.grpc_port);
-        let mut command = tokio::process::Command::new(&self.cfg.old_wallet.binary);
+        let (args, env) =
+            console_wallet_invocation(&self.cfg, &data_dir, &grpc_address, &self.password, &words);
+        let mut command = console_wallet_command(&self.cfg.old_wallet.binary, &args, &env);
         command
-            .arg("--base-path")
-            .arg(&data_dir)
-            .arg("--network")
-            .arg(&self.cfg.network)
-            .arg("--password")
-            .arg(&self.password)
-            .arg("--seed-words")
-            .arg(&words)
-            .arg("--non-interactive-mode")
-            .arg("--grpc-address")
-            .arg(&grpc_address)
-            .arg("-p")
-            .arg(format!("wallet.http_server_url={}", self.cfg.base_node_url))
-            .arg("-p")
-            .arg(format!(
-                "wallet.recovery_retry_limit={}",
-                self.cfg.old_wallet.recovery_retry_limit
-            ))
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
@@ -685,5 +724,68 @@ mod tests {
     #[test]
     fn stealth_one_sided_is_the_payment_type_used() {
         assert_eq!(PaymentType::OneSidedToStealthAddress as i32, 2);
+    }
+
+    /// A stand-in for `minotari_console_wallet` that reports what it was actually handed.
+    #[cfg(unix)]
+    fn reporting_wallet(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("reporting_wallet");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"argv:$*\"\necho \"password:$MINOTARI_WALLET_PASSWORD\"\necho \
+             \"seed:$MINOTARI_WALLET_SEED_WORDS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_console_wallet_is_handed_its_secrets_in_its_environment_and_not_in_its_argv() {
+        // argv is world-readable through the process table, and this process runs for the
+        // length of the whole mode 1 run, so a password or mnemonic spelled as a flag is
+        // readable by every other local user for that entire time. Asserting on the child's own
+        // view of argv and environment is the only way to catch a regression here: both
+        // spellings start the same wallet, and only one of them is safe.
+        let mnemonic =
+            "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        let password = "wallet-password";
+        let cfg = HarnessConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, env) = console_wallet_invocation(
+            &cfg,
+            dir.path(),
+            "/ip4/127.0.0.1/tcp/18143",
+            password,
+            mnemonic,
+        );
+
+        let script = reporting_wallet(dir.path());
+        let output = console_wallet_command(&script, &args, &env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+        let line = |prefix: &str| {
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("`{prefix}` missing from:\n{stdout}"))
+        };
+        let argv = line("argv:");
+        assert!(!argv.contains(password), "password in argv: {argv}");
+        assert!(!argv.contains(mnemonic), "seed words in argv: {argv}");
+        assert!(!argv.contains("--password"), "{argv}");
+        assert!(!argv.contains("--seed-words"), "{argv}");
+        assert_eq!(line("password:"), password);
+        assert_eq!(line("seed:"), mnemonic);
     }
 }

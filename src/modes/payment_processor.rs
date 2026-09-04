@@ -118,9 +118,11 @@ pub const KNOWN_FINDINGS: [&str; 8] = [
     "The minotari CLI takes the wallet password and the restore seed words only as command-line \
      arguments: it declares no clap env fallback, and has no stdin prompt and no password file. \
      Both therefore appear in the process table, where any other local user can read them — for \
-     `minotari daemon` that is the whole length of the run, not an instant. The harness cannot \
-     avoid this and does not try to; run this mode on a single-user host. The fix is upstream and \
-     is one clap attribute per argument, which minotari_offline_signer already carries.",
+     `minotari daemon` that is the whole length of the run, not an instant. This is specific to \
+     the minotari binary: every other process the harness starts takes its secrets from the \
+     environment instead. The harness cannot avoid it for minotari and does not try to; run this \
+     mode on a single-user host. The fix is upstream and is one clap attribute per argument, \
+     which minotari_console_wallet and minotari_offline_signer already carry.",
 ];
 
 // --------------------------------------------------------------------------------------

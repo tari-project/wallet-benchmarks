@@ -94,7 +94,7 @@ pub const NO_BROADCAST_REASON: &str = "the payment processor emits no Transactio
                                        so broadcast time is not observable for this mode";
 
 /// Results about this mode that belong in the profile, recorded rather than worked around.
-pub const KNOWN_FINDINGS: [&str; 6] = [
+pub const KNOWN_FINDINGS: [&str; 7] = [
     "The processor emits no TransactionBroadcast or TransactionMempoolDetected event despite \
      declaring both in EventType, so broadcast-to-mempool time is not observable.",
     "The processor persists no per-state timestamps: payments and batches carry only created_at \
@@ -109,6 +109,10 @@ pub const KNOWN_FINDINGS: [&str; 6] = [
      4.0.0 and the daemon 5.0.0. The payload never crosses the seam, and the WalletOutput \
      representation that does was verified identical at these two pins, but that is incidental \
      and must be re-verified whenever either pin moves.",
+    "Nothing in either service reports what a transaction paid in fees: the processor answers a \
+     send before the transaction exists, and the daemon's completed_transactions row has no fee \
+     column. Every fee in this profile was recovered after the fact by decoding the daemon's \
+     stored copy of the transaction, which is only possible once the payment has confirmed.",
     "The payment processor repository carries no LICENSE file and no `license` field in \
      Cargo.toml, which blocks an external contributor from redistributing a patched build.",
 ];
@@ -2190,11 +2194,13 @@ mod tests {
 
     #[test]
     fn the_findings_are_the_ones_this_mode_is_meant_to_disclose() {
-        assert_eq!(KNOWN_FINDINGS.len(), 6);
+        assert_eq!(KNOWN_FINDINGS.len(), 7);
         assert!(KNOWN_FINDINGS
             .iter()
             .any(|f| f.contains("TransactionBroadcast")));
         assert!(KNOWN_FINDINGS.iter().any(|f| f.contains("serial")));
+        // Why every fee in this mode's profile is a post-run recovery.
+        assert!(KNOWN_FINDINGS.iter().any(|f| f.contains("no fee column")));
         assert!(NO_BROADCAST_REASON.contains("TransactionBroadcast"));
     }
 }

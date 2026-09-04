@@ -269,7 +269,13 @@ These are findings, recorded in every mode 3 scenario report under `mode_finding
    daemon's API reports the excess and nothing else, and the base node's transaction query is
    keyed on the signature, so without it the chain cannot be asked about the transaction at all.
    Fees that arrive this late are folded back into the scenario's balance reconciliation, which
-   would otherwise report mode 3's whole fee spend as an unexplained shortfall.
+   would otherwise report mode 3's whole fee spend as an unexplained shortfall. Everything else
+   derived from a fee waits with them: a mode answers `reports_fee_at_send()` and a scenario
+   that has fee-derived figures recomputes them in `finalise`, after enrichment. That is where
+   S1's per-round value conservation is checked for this mode, where S4's per-level cost comes
+   from, and where S5's `fee_multiplier` — the answer to "does batching save fees", and the
+   reason the scenario exists — is computed. Checked against the fee reported at send time they
+   would all be zero, and S1 would fail every round of the one mode the comparison is about.
 4. The daemon has no unspent-output endpoint — `lock_funds` is the only place raw UTXOs appear
    in its API, and calling that to read a balance would reserve funds. The harness reads the
    daemon's `outputs` table directly instead (SQLite in WAL mode, read-only connection).
@@ -318,7 +324,7 @@ the version every binary reported, so it identifies itself.
 |---|---|---|
 | B0 | Genesis scan of a never-funded wallet | 0 UTXOs, 0 balance |
 | S0 | Fresh wallet on the funded seed; resolves `H_birth`; waits for the funding UTXO | at least one spendable UTXO, worth at least `A_fund` |
-| S1 | 6 doubling rounds (1 input → 2 outputs) then a fan-out round (1 input → 8 outputs), scaled to the starting UTXO count | UTXO count per round, `total_after == total_before − fees` |
+| S1 | 6 doubling rounds (1 input → 2 outputs) then a fan-out round (1 input → 8 outputs), scaled to the starting UTXO count | UTXO count per round, `total_after == total_before − fees` (checked after enrichment for a mode that cannot price its own sends) |
 | S2 | Wipe, rescan from genesis | rediscovers the pre-wipe UTXO set and balance |
 | S3 | Wipe, rescan from the seed birthday | same, from `H_birth` |
 | S4 | 8/16/32/64/128 concurrent construct-and-broadcast calls | per-tx timings, success rate, max serialisation gap |

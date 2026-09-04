@@ -17,6 +17,8 @@ use crate::{
         support::{
             await_confirmations,
             distinct_errors,
+            fee_source,
+            fees_of,
             send_recorded,
             wait_until_spendable,
             Pending,
@@ -36,6 +38,10 @@ struct ArmResult {
     tally: TxTally,
     blocks_consumed: u64,
     txs: usize,
+    /// Half-open range of this arm's transactions in the report, so the fee figure can be
+    /// recomputed once enrichment has supplied fees the mode could not report at send time.
+    tx_index_start: usize,
+    tx_index_end: usize,
 }
 
 impl ArmResult {
@@ -49,9 +55,40 @@ impl ArmResult {
     fn complete(&self) -> bool {
         self.txs > 0 && self.tally.unsuccessful() == 0
     }
+
+    fn range(&self) -> std::ops::Range<usize> {
+        self.tx_index_start..self.tx_index_end
+    }
 }
 
-pub struct PaymentThroughput;
+pub struct PaymentThroughput {
+    /// The two arms, kept so the fee comparison can be recomputed once enrichment has supplied
+    /// the fees. Without it S5's headline number — whether batching is cheaper — is computed
+    /// against zero for the one mode whose whole feature is payment batching.
+    arms: Option<Arms>,
+    /// Whether the mode this ran against priced its own transactions as it sent them.
+    fees_known_at_send: bool,
+}
+
+impl Default for PaymentThroughput {
+    fn default() -> Self {
+        Self {
+            arms: None,
+            // Until a run says otherwise: every mode but the payment processor does.
+            fees_known_at_send: true,
+        }
+    }
+}
+
+/// Both arms, with the parameters the notes are written against.
+struct Arms {
+    /// `None` when the mode cannot put `K` outputs in one transaction, so there is no
+    /// comparison to make.
+    batch: Option<ArmResult>,
+    individual: ArmResult,
+    recipients: u32,
+    outputs_per_batch_tx: u32,
+}
 
 #[async_trait]
 impl Scenario for PaymentThroughput {
@@ -64,7 +101,7 @@ impl Scenario for PaymentThroughput {
     }
 
     async fn run(
-        &self,
+        &mut self,
         mode: &Arc<dyn WalletMode>,
         ctx: &mut RunContext,
     ) -> Result<ScenarioReport> {
@@ -74,6 +111,7 @@ impl Scenario for PaymentThroughput {
         report.tip_height_start = ctx.chain.tip_height().await.unwrap_or(0);
 
         let started = Instant::now();
+        self.fees_known_at_send = mode.reports_fee_at_send();
         mode.sync_to_tip(params.scan_timeout()).await?;
 
         // Post-S4 state, disclosed and not normalised.
@@ -123,75 +161,22 @@ impl Scenario for PaymentThroughput {
         report.successes = tally.confirmed;
         report.failures = tally.unsuccessful();
 
-        #[allow(clippy::cast_precision_loss)]
-        let per_recipient = |fees: u64| fees as f64 / f64::from(params.s5_m);
-        if let Some(batch) = batch {
-            if batch.complete() {
-                report.note("t_batch_secs", batch.duration_secs);
-            }
-            report.note(
-                "arm_a_batch",
-                json!({
-                    "txs": batch.txs,
-                    "outputs_per_tx": params.s5_k,
-                    "duration_secs": batch.duration_secs,
-                    "fees": batch.fees,
-                    "fee_per_recipient": per_recipient(batch.fees),
-                    "blocks_consumed": batch.blocks_consumed,
-                    "tally": batch.tally,
-                }),
-            );
-        }
-        if individual.complete() {
-            report.note("t_individual_secs", individual.duration_secs);
-        }
-        report.note(
-            "arm_b_individual",
-            json!({
-                "txs": individual.txs,
-                "outputs_per_tx": 1,
-                "duration_secs": individual.duration_secs,
-                "fees": individual.fees,
-                "fee_per_recipient": per_recipient(individual.fees),
-                "blocks_consumed": individual.blocks_consumed,
-                "tally": individual.tally,
-            }),
-        );
-        // Both arms have to have paid every recipient before either headline means anything.
-        let comparable = batch.is_some_and(|b| b.complete()) && individual.complete();
-        if let Some(batch) = batch {
-            if comparable {
-                if batch.duration_secs > 0.0 {
-                    report.note(
-                        "throughput_multiplier",
-                        individual.duration_secs / batch.duration_secs,
-                    );
-                }
-                if batch.fees > 0 {
-                    report.note(
-                        "fee_multiplier",
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            individual.fees as f64 / batch.fees as f64
-                        },
-                    );
-                }
+        let arms = Arms {
+            batch,
+            individual,
+            recipients: params.s5_m,
+            outputs_per_batch_tx: params.s5_k,
+        };
+        publish_arm_notes(
+            &arms,
+            &mut report,
+            if self.fees_known_at_send {
+                fee_source::AT_SEND
             } else {
-                report.note(
-                    "comparison_withheld",
-                    format!(
-                        "batch confirmed {} of {} and individual {} of {}; a headline from an arm \
-                         that did not pay every recipient would be meaningless",
-                        batch.tally.confirmed,
-                        batch.txs,
-                        individual.tally.confirmed,
-                        individual.txs
-                    ),
-                );
-            }
-        }
-        report.note("recipients", params.s5_m);
-        report.note("outputs_per_batch_tx", params.s5_k);
+                fee_source::PENDING
+            },
+        );
+        self.arms = Some(arms);
         report.note("tally", tally);
 
         // Unlike the self-sends elsewhere, S5 pays strangers: both the amounts and the fees
@@ -205,6 +190,131 @@ impl Scenario for PaymentThroughput {
         report.note("amount_sent", spent.saturating_sub(report.fees_paid));
         report.reconcile(report.balance_start.saturating_sub(spent));
         Ok(report)
+    }
+
+    fn finalise(&mut self, report: &mut ScenarioReport) {
+        if self.fees_known_at_send {
+            return;
+        }
+        let Some(arms) = &mut self.arms else {
+            return;
+        };
+        // The whole point of the scenario for this mode: `fee_multiplier` is the answer to
+        // "does batching save fees", and until enrichment has read the fees off the chain
+        // both arms cost zero and the comparison is never published.
+        if let Some(batch) = &mut arms.batch {
+            batch.fees = fees_of(report.transactions.get(batch.range()).unwrap_or_default()).total;
+        }
+        arms.individual.fees = fees_of(
+            report
+                .transactions
+                .get(arms.individual.range())
+                .unwrap_or_default(),
+        )
+        .total;
+        publish_arm_notes(arms, report, fee_source::ENRICHMENT);
+    }
+}
+
+/// Writes both arms' notes and the two headline multipliers.
+///
+/// Called once while the scenario runs and, for a mode that could not price its own sends,
+/// again once enrichment has: every figure here is derived from the arms' fees, so the second
+/// call is what makes them mean anything for that mode.
+fn publish_arm_notes(arms: &Arms, report: &mut ScenarioReport, fees_source: &'static str) {
+    // Every note below is rewritten from scratch. On the second call the arms cost something
+    // they did not cost on the first, so a note the first pass wrote and this one will not —
+    // "no fee was recorded against the batch arm" — has to go, or the profile carries both a
+    // fee multiplier and the reason there is no fee multiplier.
+    for stale in [
+        "t_batch_secs",
+        "t_individual_secs",
+        "throughput_multiplier",
+        "fee_multiplier",
+        "comparison_withheld",
+        "fee_comparison_withheld",
+    ] {
+        report.notes.remove(stale);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let per_recipient = |fees: u64| fees as f64 / f64::from(arms.recipients);
+    let individual = &arms.individual;
+    report.note("recipients", arms.recipients);
+    report.note("outputs_per_batch_tx", arms.outputs_per_batch_tx);
+
+    if let Some(batch) = &arms.batch {
+        if batch.complete() {
+            report.note("t_batch_secs", batch.duration_secs);
+        }
+        report.note(
+            "arm_a_batch",
+            json!({
+                "txs": batch.txs,
+                "outputs_per_tx": arms.outputs_per_batch_tx,
+                "duration_secs": batch.duration_secs,
+                "fees": batch.fees,
+                "fees_source": fees_source,
+                "fee_per_recipient": per_recipient(batch.fees),
+                "blocks_consumed": batch.blocks_consumed,
+                "tally": batch.tally,
+            }),
+        );
+    }
+    if individual.complete() {
+        report.note("t_individual_secs", individual.duration_secs);
+    }
+    report.note(
+        "arm_b_individual",
+        json!({
+            "txs": individual.txs,
+            "outputs_per_tx": 1,
+            "duration_secs": individual.duration_secs,
+            "fees": individual.fees,
+            "fees_source": fees_source,
+            "fee_per_recipient": per_recipient(individual.fees),
+            "blocks_consumed": individual.blocks_consumed,
+            "tally": individual.tally,
+        }),
+    );
+
+    // Both arms have to have paid every recipient before either headline means anything.
+    let Some(batch) = &arms.batch else {
+        return;
+    };
+    if !(batch.complete() && individual.complete()) {
+        report.note(
+            "comparison_withheld",
+            format!(
+                "batch confirmed {} of {} and individual {} of {}; a headline from an arm that \
+                 did not pay every recipient would be meaningless",
+                batch.tally.confirmed, batch.txs, individual.tally.confirmed, individual.txs
+            ),
+        );
+        return;
+    }
+    if batch.duration_secs > 0.0 {
+        report.note(
+            "throughput_multiplier",
+            individual.duration_secs / batch.duration_secs,
+        );
+    }
+    if batch.fees > 0 {
+        report.note(
+            "fee_multiplier",
+            #[allow(clippy::cast_precision_loss)]
+            {
+                individual.fees as f64 / batch.fees as f64
+            },
+        );
+    } else {
+        // Zero here is "not known yet" for a mode whose fees arrive with enrichment, and "no
+        // transaction was priced" for one whose fees do not. Either way the ratio would be a
+        // division by zero, and the reason it is missing belongs in the profile.
+        report.note(
+            "fee_comparison_withheld",
+            format!("the batch arm has no fee recorded against it (fees_source {fees_source})"),
+        );
     }
 }
 
@@ -275,10 +385,12 @@ async fn run_arm(
     let metrics = &report.transactions[first_index..];
     let result = ArmResult {
         duration_secs,
-        fees: metrics.iter().map(|m| m.fee).sum(),
+        fees: fees_of(metrics).total,
         tally: TxTally::of(metrics),
         blocks_consumed: tip_end.saturating_sub(tip_start),
         txs: metrics.len(),
+        tx_index_start: first_index,
+        tx_index_end: first_index + metrics.len(),
     };
     let errors = distinct_errors(metrics, 5);
     if !errors.is_empty() {
@@ -289,7 +401,11 @@ async fn run_arm(
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmResult, TxTally};
+    use super::*;
+    use crate::{
+        metrics::{TxMetric, TxOutcome},
+        modes::PAYMENT_PROCESSOR,
+    };
 
     fn arm(txs: usize, confirmed: u32, failed: u32) -> ArmResult {
         ArmResult {
@@ -302,6 +418,8 @@ mod tests {
             },
             blocks_consumed: 0,
             txs,
+            tx_index_start: 0,
+            tx_index_end: txs,
         }
     }
 
@@ -320,5 +438,87 @@ mod tests {
     fn a_partly_completed_arm_is_not_comparable_either() {
         assert!(!arm(100, 6, 94).complete());
         assert!(!arm(0, 0, 0).complete());
+    }
+
+    fn confirmed(fee: u64) -> TxMetric {
+        TxMetric {
+            fee,
+            outcome: TxOutcome::Confirmed,
+            ..TxMetric::default()
+        }
+    }
+
+    /// Four recipients paid twice: two batch transactions of two, then four singles.
+    fn after_a_deferred_run() -> (PaymentThroughput, ScenarioReport) {
+        let mut batch = arm(2, 2, 0);
+        batch.tx_index_start = 0;
+        batch.tx_index_end = 2;
+        let mut individual = arm(4, 4, 0);
+        individual.tx_index_start = 2;
+        individual.tx_index_end = 6;
+
+        let scenario = PaymentThroughput {
+            arms: Some(Arms {
+                batch: Some(batch),
+                individual,
+                recipients: 4,
+                outputs_per_batch_tx: 2,
+            }),
+            fees_known_at_send: false,
+        };
+        let mut report = ScenarioReport::new("S5", PAYMENT_PROCESSOR);
+        report.transactions = vec![confirmed(0); 6];
+        publish_arm_notes(
+            scenario.arms.as_ref().unwrap(),
+            &mut report,
+            fee_source::PENDING,
+        );
+        (scenario, report)
+    }
+
+    #[test]
+    fn the_fee_comparison_only_exists_once_enrichment_has_supplied_the_fees() {
+        let (mut scenario, mut report) = after_a_deferred_run();
+        // What the mode looked like before: the headline S5 exists to compute was never
+        // published, because both arms cost zero.
+        assert_eq!(report.notes["arm_a_batch"]["fees"], 0);
+        assert!(!report.notes.contains_key("fee_multiplier"));
+        assert!(report.notes.contains_key("fee_comparison_withheld"));
+
+        // Two batch transactions at 50 µT each against four singles at 40 µT each.
+        for (index, metric) in report.transactions.iter_mut().enumerate() {
+            metric.fee = if index < 2 { 50 } else { 40 };
+        }
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["arm_a_batch"]["fees"], 100);
+        assert_eq!(report.notes["arm_a_batch"]["fee_per_recipient"], 25.0);
+        assert_eq!(
+            report.notes["arm_a_batch"]["fees_source"],
+            fee_source::ENRICHMENT
+        );
+        assert_eq!(report.notes["arm_b_individual"]["fees"], 160);
+        assert_eq!(report.notes["arm_b_individual"]["fee_per_recipient"], 40.0);
+        assert_eq!(report.notes["fee_multiplier"], 1.6);
+        assert!(!report.notes.contains_key("fee_comparison_withheld"));
+    }
+
+    #[test]
+    fn the_recipient_set_is_reported_even_when_no_headline_can_be() {
+        // These describe what was attempted, so they cannot depend on the comparison working.
+        let (_, report) = after_a_deferred_run();
+        assert_eq!(report.notes["recipients"], 4);
+        assert_eq!(report.notes["outputs_per_batch_tx"], 2);
+    }
+
+    #[test]
+    fn a_mode_that_prices_its_sends_keeps_the_comparison_it_already_published() {
+        let mut scenario = PaymentThroughput {
+            fees_known_at_send: true,
+            ..PaymentThroughput::default()
+        };
+        let mut report = ScenarioReport::new("S5", "new_wallet");
+        scenario.finalise(&mut report);
+        assert!(report.notes.is_empty(), "there is nothing to recompute");
     }
 }

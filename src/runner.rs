@@ -151,7 +151,7 @@ pub async fn run(
         let mut halted_by: Option<String> = None;
 
         for id in scenario_ids {
-            let Some(scenario) = scenarios::scenario(id) else {
+            let Some(mut scenario) = scenarios::scenario(id) else {
                 reports.push(ScenarioReport::skipped(
                     id,
                     mode_label,
@@ -186,6 +186,9 @@ pub async fn run(
                         );
                         report.note("enrichment_error", format!("{e:#}"));
                     }
+                    // After enrichment and before the verdict: a scenario whose fee-derived
+                    // checks had to wait for the chain still gets to fail on what it finds.
+                    scenario.finalise(&mut report);
                     let findings = mode.known_findings();
                     if !findings.is_empty() {
                         report.note("mode_findings", findings);
@@ -308,6 +311,29 @@ mod tests {
             let mode = build_mode(label, Arc::clone(&cfg), chain.clone())
                 .unwrap_or_else(|e| panic!("mode {label} could not be built: {e:#}"));
             assert_eq!(mode.name(), label);
+        }
+    }
+
+    #[test]
+    fn only_the_payment_processor_cannot_price_a_send_as_it_makes_it() {
+        std::env::set_var("HARNESS_WALLET_PW", "test-password");
+        std::env::set_var("HARNESS_SIGNER_PASSPHRASE", "test-passphrase");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(test_config(dir.path()));
+        let chain = ChainClient::new(&cfg.base_node_url).unwrap();
+        for (label, expected) in [
+            (OLD_WALLET, true),
+            (NEW_WALLET, true),
+            (PAYMENT_PROCESSOR, false),
+        ] {
+            let mode = build_mode(label, Arc::clone(&cfg), chain.clone()).unwrap();
+            assert_eq!(
+                mode.reports_fee_at_send(),
+                expected,
+                "{label} answers the wrong way, and every fee-derived figure in the profile turns \
+                 on this"
+            );
         }
     }
 

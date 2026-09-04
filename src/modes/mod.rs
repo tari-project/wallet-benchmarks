@@ -359,6 +359,20 @@ pub trait WalletMode: Send + Sync {
         true
     }
 
+    /// Whether a completed [`WalletMode::send`] already knows the fee its transaction pays.
+    ///
+    /// Both wallet modes build and sign inside the call, so the fee is settled by the time it
+    /// returns. `payment_processor` builds nothing during a send: it acknowledges the request
+    /// and a worker constructs the transaction later, so the fee does not exist yet and only
+    /// becomes readable once [`WalletMode::enrich`] has decoded the transaction off the chain.
+    ///
+    /// Scenarios use this to decide whether a fee-derived figure can be computed while they
+    /// run or has to wait. Reporting zero and checking against it would turn "this mode cannot
+    /// tell me the fee yet" into "this mode lost money", which is a different claim.
+    fn reports_fee_at_send(&self) -> bool {
+        true
+    }
+
     /// Results about this mode that belong in the profile whatever a scenario measured.
     ///
     /// These are findings, not defects to fix: things the wallet does not expose, or does by

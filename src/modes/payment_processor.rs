@@ -1444,6 +1444,12 @@ impl WalletMode for PaymentProcessor {
         false
     }
 
+    fn reports_fee_at_send(&self) -> bool {
+        // The fee belongs to a transaction that does not exist yet when the 202 comes back.
+        // `enrich` decodes it off the chain afterwards; until then there is no fee to report.
+        false
+    }
+
     fn resource_processes(&self) -> Vec<ProcessRole> {
         vec![
             ProcessRole::external(PROCESS_DAEMON),

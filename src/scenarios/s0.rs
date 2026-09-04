@@ -33,7 +33,7 @@ impl Scenario for FundingBaseline {
     }
 
     async fn run(
-        &self,
+        &mut self,
         mode: &Arc<dyn WalletMode>,
         ctx: &mut RunContext,
     ) -> Result<ScenarioReport> {

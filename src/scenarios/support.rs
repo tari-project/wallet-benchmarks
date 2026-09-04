@@ -264,6 +264,59 @@ pub fn max_terminal_state_gap(metrics: &[TxMetric]) -> f64 {
     settled.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max)
 }
 
+/// Where a fee figure came from.
+///
+/// Reported next to every fee-derived number, because it is what says whether the number was
+/// available while the scenario ran or had to be recovered from the chain afterwards — and,
+/// for S1's value conservation, whether the check is an assertion or a disclosure.
+pub mod fee_source {
+    /// The sends themselves reported it, so it was known as the scenario ran.
+    pub const AT_SEND: &str = "send";
+    /// The mode could not report it yet; it is filled in after enrichment.
+    pub const PENDING: &str = "pending_enrichment";
+    /// Recovered from the chain after the scenario, for every transaction it covers.
+    pub const ENRICHMENT: &str = "enrichment";
+    /// Recovered after the scenario, but not for every transaction it covers.
+    pub const ENRICHMENT_PARTIAL: &str = "enrichment_incomplete";
+}
+
+/// What a set of transactions paid in fees, and whether that is the whole bill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fees {
+    /// Sum of the recorded fees, in µT.
+    pub total: u64,
+    /// True when every transaction that reached the network has a fee against it.
+    ///
+    /// False means `total` is a floor, not a total, and nothing may be checked against it.
+    pub complete: bool,
+}
+
+/// Sums the fees a set of transactions paid.
+///
+/// A transaction that never reached the network paid nothing, so a failed send is not a
+/// missing fee. Everything else has to carry one: the fee rate is required to be non-zero, so
+/// a broadcast transaction recording a fee of zero is a fee this harness does not know yet
+/// rather than a free transaction. That is the ordinary state of `payment_processor` until
+/// enrichment has read the transaction back off the chain — see
+/// [`crate::modes::WalletMode::reports_fee_at_send`].
+pub fn fees_of(metrics: &[TxMetric]) -> Fees {
+    let mut fees = Fees {
+        total: 0,
+        complete: true,
+    };
+    for metric in metrics {
+        if metric.outcome == TxOutcome::Failed {
+            continue;
+        }
+        if metric.fee == 0 {
+            fees.complete = false;
+            continue;
+        }
+        fees.total += metric.fee;
+    }
+    fees
+}
+
 /// Counts of how the transactions ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TxTally {
@@ -633,5 +686,34 @@ mod tests {
         c.error = Some("no funds".to_string());
         let errors = distinct_errors(&[a, b, c], 5);
         assert_eq!(errors, vec!["locked".to_string(), "no funds".to_string()]);
+    }
+
+    #[test]
+    fn a_send_that_never_reached_the_network_is_not_a_missing_fee() {
+        let mut priced = metric(0.0, TxOutcome::Confirmed);
+        priced.fee = 100;
+        let mut failed = metric(0.0, TxOutcome::Failed);
+        failed.fee = 0;
+
+        let fees = fees_of(&[priced, failed]);
+        assert_eq!(fees.total, 100);
+        assert!(
+            fees.complete,
+            "a failed send paid nothing, and owes nothing"
+        );
+    }
+
+    #[test]
+    fn a_broadcast_transaction_with_no_fee_makes_the_total_a_floor() {
+        // What every `payment_processor` send looks like until enrichment has run: the
+        // transaction is on chain, and the harness does not know yet what it paid for it.
+        let mut priced = metric(0.0, TxOutcome::Confirmed);
+        priced.fee = 100;
+        let unpriced = metric(0.0, TxOutcome::Confirmed);
+
+        let fees = fees_of(&[priced, unpriced]);
+        assert_eq!(fees.total, 100);
+        assert!(!fees.complete);
+        assert!(fees_of(&[]).complete, "nothing owed, nothing missing");
     }
 }

@@ -40,8 +40,22 @@ pub trait Scenario: Send + Sync {
 
     /// Runs the scenario. Returning `Err` means the harness could not take a measurement at
     /// all; a wallet that misbehaved is reported inside the [`ScenarioReport`] instead.
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext)
-        -> Result<ScenarioReport>;
+    async fn run(
+        &mut self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport>;
+
+    /// Recomputes the figures that could not be known while the scenario was running.
+    ///
+    /// Called once, after [`WalletMode::enrich`] and before the run decides whether the
+    /// scenario passed, so a verdict reached here still stops the rest of the mode.
+    ///
+    /// Only fees need this so far, and only for `payment_processor`: it reports none at send
+    /// time, and every fee-derived number — S1's value conservation, S4's per-level cost, S5's
+    /// whole reason for existing — would otherwise be computed against zero. A mode that
+    /// answers [`WalletMode::reports_fee_at_send`] leaves this doing nothing.
+    fn finalise(&mut self, _report: &mut ScenarioReport) {}
 }
 
 /// Builds a scenario by id.
@@ -49,11 +63,11 @@ pub fn scenario(id: &str) -> Option<Box<dyn Scenario>> {
     match id.to_ascii_uppercase().as_str() {
         "B0" => Some(Box::new(b0::BaselineScan)),
         "S0" => Some(Box::new(s0::FundingBaseline)),
-        "S1" => Some(Box::new(s1::UtxoBuildUp)),
+        "S1" => Some(Box::new(s1::UtxoBuildUp::default())),
         "S2" => Some(Box::new(scan::ScanScenario::s2())),
         "S3" => Some(Box::new(scan::ScanScenario::s3())),
-        "S4" => Some(Box::new(s4::ConcurrentConstruction)),
-        "S5" => Some(Box::new(s5::PaymentThroughput)),
+        "S4" => Some(Box::new(s4::ConcurrentConstruction::default())),
+        "S5" => Some(Box::new(s5::PaymentThroughput::default())),
         "S6" => Some(Box::new(scan::ScanScenario::s6())),
         "S7" => Some(Box::new(scan::ScanScenario::s7())),
         _ => None,

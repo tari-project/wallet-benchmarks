@@ -4,11 +4,11 @@
 //! nothing is done to help them succeed: no retries, no backoff, no UTXO pre-partitioning.
 //! Locking, selection contention, stalls and rejections are the measurement.
 
-use std::{sync::Arc, time::Instant};
+use std::{ops::Range, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
+use serde::Serialize;
 
 use crate::{
     metrics::{count_infrastructure_failures, ScenarioReport, TxMetric, TxOutcome},
@@ -17,6 +17,8 @@ use crate::{
         support::{
             await_confirmations,
             distinct_errors,
+            fee_source,
+            fees_of,
             max_serialization_gap,
             max_terminal_state_gap,
             wait_until_spendable,
@@ -29,7 +31,66 @@ use crate::{
     },
 };
 
-pub struct ConcurrentConstruction;
+pub struct ConcurrentConstruction {
+    /// The ramp levels as they will be reported.
+    ///
+    /// Held rather than written straight into the report: a mode that cannot price its own
+    /// transaction until it is on chain has no per-level fee to give until enrichment has run.
+    levels: Vec<LevelNote>,
+    /// Whether the mode this ran against priced its own transactions as it sent them.
+    fees_known_at_send: bool,
+}
+
+impl Default for ConcurrentConstruction {
+    fn default() -> Self {
+        Self {
+            levels: Vec::new(),
+            // Until a run says otherwise: every mode but the payment processor does.
+            fees_known_at_send: true,
+        }
+    }
+}
+
+/// One ramp level's line in the `levels` note.
+#[derive(Debug, Clone, Serialize)]
+struct LevelNote {
+    n_concurrent: u32,
+    settle_secs: f64,
+    settled_before_start: bool,
+    spendable_utxos_at_start: u64,
+    utxos_before: u64,
+    utxos_after: u64,
+    batch_wall_clock_secs: f64,
+    construction_wall_clock_secs: f64,
+    max_serialization_gap_secs: f64,
+    max_serialization_gap_source: &'static str,
+    max_construction_gap_secs: f64,
+    max_terminal_state_gap_secs: f64,
+    success_rate: f64,
+    /// Failures that are the harness's plumbing rather than the wallet's behaviour. Anything
+    /// above zero makes this level's numbers suspect.
+    infrastructure_failures: u32,
+    fees: u64,
+    /// `send` when the wallet priced its transactions as it built them, `enrichment` when the
+    /// figure had to be recovered from the chain afterwards.
+    fees_source: &'static str,
+    budget_secs: u64,
+    /// True when construction alone used the level's whole budget, so nothing was left to wait
+    /// for confirmations and the outcomes below are truncated.
+    budget_exhausted: bool,
+    tally: TxTally,
+    errors: Vec<String>,
+    sync_error: Option<String>,
+    /// Half-open range of this level's transactions in the report.
+    tx_index_start: usize,
+    tx_index_end: usize,
+}
+
+impl LevelNote {
+    fn range(&self) -> Range<usize> {
+        self.tx_index_start..self.tx_index_end
+    }
+}
 
 #[async_trait]
 impl Scenario for ConcurrentConstruction {
@@ -42,7 +103,7 @@ impl Scenario for ConcurrentConstruction {
     }
 
     async fn run(
-        &self,
+        &mut self,
         mode: &Arc<dyn WalletMode>,
         ctx: &mut RunContext,
     ) -> Result<ScenarioReport> {
@@ -53,12 +114,11 @@ impl Scenario for ConcurrentConstruction {
         let started = Instant::now();
         // Whether the gaps between construction-complete events mean anything for this mode.
         let observes_construction = mode.observes_construction();
+        self.fees_known_at_send = mode.reports_fee_at_send();
         mode.sync_to_tip(params.scan_timeout()).await?;
         let address = mode.address().await?;
         report.balance_start = mode.balance().await?.total();
         report.utxos_start = mode.unspent_amounts().await?.len() as u64;
-
-        let mut level_notes = Vec::new();
 
         for level in &params.concurrent_batches {
             let level = *level;
@@ -136,13 +196,14 @@ impl Scenario for ConcurrentConstruction {
             )
             .await;
 
+            let tx_index_end = report.transactions.len();
             let (tally, construction_gap, terminal_gap, fees, errors, infrastructure_failures) = {
                 let metrics = &report.transactions[first_index..];
                 (
                     TxTally::of(metrics),
                     max_serialization_gap(metrics),
                     max_terminal_state_gap(metrics),
-                    metrics.iter().map(|m| m.fee).sum::<u64>(),
+                    fees_of(metrics).total,
                     distinct_errors(metrics, 5),
                     count_infrastructure_failures(metrics),
                 )
@@ -168,32 +229,35 @@ impl Scenario for ConcurrentConstruction {
                 .map(|e| e.to_string());
             let utxos_after = mode.unspent_amounts().await?.len() as u64;
 
-            level_notes.push(json!({
-                "n_concurrent": level,
-                "settle_secs": settled.secs,
-                "settled_before_start": settled.ready,
-                "spendable_utxos_at_start": settled.spendable_utxos,
-                "utxos_before": utxos_before,
-                "utxos_after": utxos_after,
-                "batch_wall_clock_secs": batch_started.elapsed().as_secs_f64(),
-                "construction_wall_clock_secs": construction_wall_clock,
-                "max_serialization_gap_secs": gap,
-                "max_serialization_gap_source": gap_source,
-                "max_construction_gap_secs": construction_gap,
-                "max_terminal_state_gap_secs": terminal_gap,
-                "success_rate": tally.success_rate(),
-                // Failures that are the harness's plumbing rather than the wallet's
-                // behaviour. Anything above zero makes this level's numbers suspect.
-                "infrastructure_failures": infrastructure_failures,
-                "fees": fees,
-                "budget_secs": params.s4_budget_secs,
-                // True when construction alone used the level's whole budget, so nothing was
-                // left to wait for confirmations and the outcomes below are truncated.
-                "budget_exhausted": budget_exhausted,
-                "tally": tally,
-                "errors": errors,
-                "sync_error": sync_error,
-            }));
+            self.levels.push(LevelNote {
+                n_concurrent: level,
+                settle_secs: settled.secs,
+                settled_before_start: settled.ready,
+                spendable_utxos_at_start: settled.spendable_utxos,
+                utxos_before,
+                utxos_after,
+                batch_wall_clock_secs: batch_started.elapsed().as_secs_f64(),
+                construction_wall_clock_secs: construction_wall_clock,
+                max_serialization_gap_secs: gap,
+                max_serialization_gap_source: gap_source,
+                max_construction_gap_secs: construction_gap,
+                max_terminal_state_gap_secs: terminal_gap,
+                success_rate: tally.success_rate(),
+                infrastructure_failures,
+                fees,
+                fees_source: if self.fees_known_at_send {
+                    fee_source::AT_SEND
+                } else {
+                    fee_source::PENDING
+                },
+                budget_secs: params.s4_budget_secs,
+                budget_exhausted,
+                tally,
+                errors,
+                sync_error,
+                tx_index_start: first_index,
+                tx_index_end,
+            });
         }
 
         let tally = TxTally::of(&report.transactions);
@@ -204,7 +268,7 @@ impl Scenario for ConcurrentConstruction {
         report.utxos_end = mode.unspent_amounts().await?.len() as u64;
         report.successes = tally.confirmed;
         report.failures = tally.unsuccessful();
-        report.note("levels", level_notes);
+        report.note("levels", &self.levels);
         report.note("construction_is_observable", observes_construction);
         if !observes_construction {
             report.note(
@@ -226,5 +290,100 @@ impl Scenario for ConcurrentConstruction {
         );
         report.reconcile(report.balance_start.saturating_sub(report.fees_paid));
         Ok(report)
+    }
+
+    fn finalise(&mut self, report: &mut ScenarioReport) {
+        if self.fees_known_at_send || self.levels.is_empty() {
+            return;
+        }
+        // The per-level cost of the ramp, which the sends themselves could not report: for
+        // this mode the fee belongs to a transaction a worker built after the 202 came back.
+        for level in &mut self.levels {
+            level.fees = fees_of(report.transactions.get(level.range()).unwrap_or_default()).total;
+            level.fees_source = fee_source::ENRICHMENT;
+        }
+        report.note("levels", &self.levels);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::PAYMENT_PROCESSOR;
+
+    fn level(tx_index_end: usize) -> LevelNote {
+        LevelNote {
+            n_concurrent: 8,
+            settle_secs: 1.0,
+            settled_before_start: true,
+            spendable_utxos_at_start: 8,
+            utxos_before: 8,
+            utxos_after: 8,
+            batch_wall_clock_secs: 30.0,
+            construction_wall_clock_secs: 2.0,
+            max_serialization_gap_secs: 0.5,
+            max_serialization_gap_source: "terminal_state",
+            max_construction_gap_secs: 0.1,
+            max_terminal_state_gap_secs: 0.5,
+            success_rate: 1.0,
+            infrastructure_failures: 0,
+            fees: 0,
+            fees_source: fee_source::PENDING,
+            budget_secs: 900,
+            budget_exhausted: false,
+            tally: TxTally {
+                confirmed: 2,
+                ..TxTally::default()
+            },
+            errors: Vec::new(),
+            sync_error: None,
+            tx_index_start: 0,
+            tx_index_end,
+        }
+    }
+
+    fn confirmed(fee: u64) -> TxMetric {
+        TxMetric {
+            label: "s4-n8-tx0".to_string(),
+            fee,
+            outcome: TxOutcome::Confirmed,
+            ..TxMetric::default()
+        }
+    }
+
+    #[test]
+    fn a_levels_cost_is_filled_in_from_enrichment() {
+        // `payment_processor` answers every send with fee 0, so without this the ramp reports
+        // that concurrency at every level was free.
+        let mut scenario = ConcurrentConstruction {
+            levels: vec![level(2)],
+            fees_known_at_send: false,
+        };
+        let mut report = ScenarioReport::new(scenario.id(), PAYMENT_PROCESSOR);
+        report.transactions = vec![confirmed(0), confirmed(0)];
+        report.note("levels", &scenario.levels);
+        assert_eq!(report.notes["levels"][0]["fees"], 0);
+
+        report.transactions[0].fee = 70;
+        report.transactions[1].fee = 30;
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["levels"][0]["fees"], 100);
+        assert_eq!(
+            report.notes["levels"][0]["fees_source"],
+            fee_source::ENRICHMENT
+        );
+    }
+
+    #[test]
+    fn a_mode_that_prices_its_sends_keeps_the_figures_it_already_published() {
+        let mut scenario = ConcurrentConstruction {
+            levels: vec![level(2)],
+            fees_known_at_send: true,
+        };
+        let mut report = ScenarioReport::new(scenario.id(), "new_wallet");
+        report.transactions = vec![confirmed(70), confirmed(30)];
+        scenario.finalise(&mut report);
+        assert!(report.notes.is_empty(), "there is nothing to recompute");
     }
 }

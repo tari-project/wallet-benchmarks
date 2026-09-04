@@ -27,7 +27,7 @@ impl Scenario for BaselineScan {
     }
 
     async fn run(
-        &self,
+        &mut self,
         mode: &Arc<dyn WalletMode>,
         ctx: &mut RunContext,
     ) -> Result<ScenarioReport> {

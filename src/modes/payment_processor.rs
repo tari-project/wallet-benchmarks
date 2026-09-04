@@ -94,7 +94,7 @@ pub const NO_BROADCAST_REASON: &str = "the payment processor emits no Transactio
                                        so broadcast time is not observable for this mode";
 
 /// Results about this mode that belong in the profile, recorded rather than worked around.
-pub const KNOWN_FINDINGS: [&str; 7] = [
+pub const KNOWN_FINDINGS: [&str; 8] = [
     "The processor emits no TransactionBroadcast or TransactionMempoolDetected event despite \
      declaring both in EventType, so broadcast-to-mempool time is not observable.",
     "The processor persists no per-state timestamps: payments and batches carry only created_at \
@@ -115,6 +115,12 @@ pub const KNOWN_FINDINGS: [&str; 7] = [
      stored copy of the transaction, which is only possible once the payment has confirmed.",
     "The payment processor repository carries no LICENSE file and no `license` field in \
      Cargo.toml, which blocks an external contributor from redistributing a patched build.",
+    "The minotari CLI takes the wallet password and the restore seed words only as command-line \
+     arguments: it declares no clap env fallback, and has no stdin prompt and no password file. \
+     Both therefore appear in the process table, where any other local user can read them — for \
+     `minotari daemon` that is the whole length of the run, not an instant. The harness cannot \
+     avoid this and does not try to; run this mode on a single-user host. The fix is upstream and \
+     is one clap attribute per argument, which minotari_offline_signer already carries.",
 ];
 
 // --------------------------------------------------------------------------------------
@@ -1020,6 +1026,12 @@ impl WalletMode for PaymentProcessor {
         let globals = self.minotari_globals(&daemon_config);
 
         // Create the account from the (possibly birthday-zeroed) mnemonic.
+        //
+        // The password and the mnemonic go on the command line because `minotari` accepts them
+        // nowhere else — no clap env fallback, no stdin, no password file — so unlike the
+        // signer above, this cannot be moved off the process table from here. It is recorded
+        // in `KNOWN_FINDINGS` rather than worked around: a wrapper script or a temp file would
+        // trade a disclosure for an injection surface.
         let mut create = globals.clone();
         create.extend([
             "create".to_string(),
@@ -1088,6 +1100,9 @@ impl WalletMode for PaymentProcessor {
         daemon_cmd
             .args(&globals)
             .arg("daemon")
+            // Same unavoidable argv password as `create` above, but held for the length of the
+            // run rather than for one short-lived call: this is the process an idle `ps` on a
+            // shared host is most likely to catch.
             .arg("--password")
             .arg(self.password.as_str())
             .arg("--base-url")
@@ -2196,13 +2211,17 @@ mod tests {
 
     #[test]
     fn the_findings_are_the_ones_this_mode_is_meant_to_disclose() {
-        assert_eq!(KNOWN_FINDINGS.len(), 7);
+        assert_eq!(KNOWN_FINDINGS.len(), 8);
         assert!(KNOWN_FINDINGS
             .iter()
             .any(|f| f.contains("TransactionBroadcast")));
         assert!(KNOWN_FINDINGS.iter().any(|f| f.contains("serial")));
         // Why every fee in this mode's profile is a post-run recovery.
         assert!(KNOWN_FINDINGS.iter().any(|f| f.contains("no fee column")));
+        // The one finding the harness cannot fix in code, so the profile has to carry it.
+        assert!(KNOWN_FINDINGS
+            .iter()
+            .any(|f| f.contains("process table") && f.contains("single-user host")));
         assert!(NO_BROADCAST_REASON.contains("TransactionBroadcast"));
     }
 

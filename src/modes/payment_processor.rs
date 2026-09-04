@@ -509,6 +509,23 @@ fn signer_is_initialised(status_output: &str) -> bool {
     text.contains("initialized") || text.contains("initialised")
 }
 
+/// The argv and environment for `minotari_offline_signer init seed-words`.
+///
+/// Both the mnemonic and the keystore passphrase go in the environment rather than in argv:
+/// argv is world-readable through the process table (`ps`, `/proc/<pid>/cmdline`), so any
+/// other local user could lift a whole wallet seed out of it. The signer declares clap `env`
+/// fallbacks for exactly this — `TARI_SEED_WORDS` and `TARI_PASSPHRASE` — and reads them when
+/// the flags are absent, so dropping the flags is the entire fix.
+fn signer_init_invocation<'a>(
+    passphrase: &'a str,
+    seed_words: &'a str,
+) -> (Vec<String>, Vec<(&'static str, &'a str)>) {
+    (vec!["init".to_string(), "seed-words".to_string()], vec![
+        ("TARI_PASSPHRASE", passphrase),
+        ("TARI_SEED_WORDS", seed_words),
+    ])
+}
+
 /// Splits a transaction's fee across the payments that shared its batch.
 ///
 /// Reporting the whole fee against each payment would multiply one fee by the batch width,
@@ -794,15 +811,11 @@ impl PaymentProcessor {
             )
             .await?;
         }
+        let (init_args, init_env) = signer_init_invocation(&passphrase, &seed.seed_words);
         Self::run_tool(
             &binary,
-            &[
-                "init".to_string(),
-                "seed-words".to_string(),
-                "--seed-words".to_string(),
-                seed.seed_words.clone(),
-            ],
-            &env,
+            &init_args,
+            &init_env,
             None,
             "minotari_offline_signer init seed-words",
         )
@@ -2191,5 +2204,50 @@ mod tests {
         // Why every fee in this mode's profile is a post-run recovery.
         assert!(KNOWN_FINDINGS.iter().any(|f| f.contains("no fee column")));
         assert!(NO_BROADCAST_REASON.contains("TransactionBroadcast"));
+    }
+
+    /// A stand-in for `minotari_offline_signer` that reports what it was actually handed.
+    #[cfg(unix)]
+    fn reporting_signer(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("reporting_signer");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"argv:$*\"\necho \"seed:$TARI_SEED_WORDS\"\necho \
+             \"passphrase:$TARI_PASSPHRASE\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_signer_is_handed_its_secrets_in_its_environment_and_not_in_its_argv() {
+        // argv is world-readable through the process table, so a mnemonic spelled as
+        // `--seed-words <words>` leaks a whole wallet to every other local user. Asserting on
+        // the child's own view of argv and environment is the only way to catch a regression
+        // here: both spellings work, and only one of them is safe.
+        let mnemonic =
+            "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        let passphrase = "keystore-passphrase";
+        let (args, env) = signer_init_invocation(passphrase, mnemonic);
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = reporting_signer(dir.path());
+        let output = PaymentProcessor::run_tool(&script, &args, &env, None, "signer init")
+            .await
+            .unwrap();
+
+        let line = |prefix: &str| {
+            output
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("`{prefix}` missing from:\n{output}"))
+        };
+        assert_eq!(line("argv:"), "init seed-words");
+        assert_eq!(line("seed:"), mnemonic);
+        assert_eq!(line("passphrase:"), passphrase);
     }
 }

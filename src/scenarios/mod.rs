@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// Scenario ids in protocol order.
-pub const ALL: [&str; 8] = ["B0", "S0", "S1", "S2", "S3", "S4", "S5", "S6"];
+pub const ALL: [&str; 9] = ["B0", "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"];
 
 /// One benchmark scenario, run against one wallet mode.
 #[async_trait]
@@ -55,6 +55,7 @@ pub fn scenario(id: &str) -> Option<Box<dyn Scenario>> {
         "S4" => Some(Box::new(s4::ConcurrentConstruction)),
         "S5" => Some(Box::new(s5::PaymentThroughput)),
         "S6" => Some(Box::new(scan::ScanScenario::s6())),
+        "S7" => Some(Box::new(scan::ScanScenario::s7())),
         _ => None,
     }
 }
@@ -113,6 +114,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_protocol_is_the_full_nine_scenarios_in_order() {
+        assert_eq!(ALL, ["B0", "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"]);
+    }
+
+    #[test]
     fn every_protocol_id_resolves_to_a_scenario() {
         for id in ALL {
             let scenario = scenario(id).unwrap_or_else(|| panic!("no scenario for {id}"));
@@ -124,10 +130,8 @@ mod tests {
     #[test]
     fn ids_are_case_insensitive_and_unknown_ids_are_rejected() {
         assert!(scenario("s1").is_some());
-        assert!(
-            scenario("S7").is_none(),
-            "S7 is out of scope for this harness"
-        );
+        assert!(scenario("s7").is_some(), "S7 is part of the protocol");
         assert!(scenario("nonsense").is_none());
+        assert!(scenario("S8").is_none());
     }
 }

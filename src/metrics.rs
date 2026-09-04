@@ -756,7 +756,9 @@ pub fn compute_deltas(reports: &[ScenarioReport]) -> Vec<Delta> {
 
         let b0 = scan_of("B0");
         let s2 = scan_of("S2");
+        let s3 = scan_of("S3");
         let s6 = scan_of("S6");
+        let s7 = scan_of("S7");
 
         if let (Some(b0), Some(s2)) = (b0, s2) {
             push(&mut deltas, "T_scan(S2) - T_scan(B0)", s2 - b0, "seconds");
@@ -767,6 +769,18 @@ pub fn compute_deltas(reports: &[ScenarioReport]) -> Vec<Delta> {
         if let (Some(b0), Some(s6)) = (b0, s6) {
             if b0 > 0.0 {
                 push(&mut deltas, "T_scan(S6) / T_scan(B0)", s6 / b0, "ratio");
+            }
+        }
+        // The birthday-scan pair of `T_scan(S6) - T_scan(S2)`: what S4 and S5 added to a scan
+        // that starts at the wallet's birthday rather than at genesis. Separating the two is
+        // the point of running both scans at each checkpoint — the genesis figure is dominated
+        // by the blocks before the wallet existed, which no amount of wallet history changes.
+        if let (Some(s3), Some(s7)) = (s3, s7) {
+            push(&mut deltas, "T_scan(S7) - T_scan(S3)", s7 - s3, "seconds");
+        }
+        if let (Some(s7), Some(s6)) = (s7, s6) {
+            if s7 > 0.0 {
+                push(&mut deltas, "T_scan(S6) / T_scan(S7)", s6 / s7, "ratio");
             }
         }
 
@@ -868,6 +882,34 @@ mod tests {
         assert!((by_name("T_scan(S2) - T_scan(B0)") - 15.0).abs() < f64::EPSILON);
         assert!((by_name("T_scan(S6) - T_scan(S2)") - 15.0).abs() < f64::EPSILON);
         assert!((by_name("T_scan(S6) / T_scan(B0)") - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_second_checkpoint_reports_its_birthday_scan_delta_too() {
+        let reports = vec![
+            scan_report("payment_processor", "S3", 20.0),
+            scan_report("payment_processor", "S6", 60.0),
+            scan_report("payment_processor", "S7", 30.0),
+        ];
+        let deltas = compute_deltas(&reports);
+        let by_name = |name: &str| {
+            deltas
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| d.value)
+                .unwrap_or_else(|| panic!("missing delta {name}"))
+        };
+        assert!((by_name("T_scan(S7) - T_scan(S3)") - 10.0).abs() < f64::EPSILON);
+        assert!((by_name("T_scan(S6) / T_scan(S7)") - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_checkpoint_missing_its_birthday_scan_publishes_no_birthday_delta() {
+        let deltas = compute_deltas(&[
+            scan_report("old_wallet", "S3", 20.0),
+            scan_report("old_wallet", "S6", 60.0),
+        ]);
+        assert!(!deltas.iter().any(|d| d.name.contains("S7")));
     }
 
     #[test]

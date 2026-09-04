@@ -8,7 +8,7 @@ against two wallet implementations and writes a structured result profile:
 | `old_wallet` | [`minotari_console_wallet`](https://github.com/tari-project/tari) | gRPC, with the harness owning the process lifecycle |
 | `new_wallet` | [`minotari-cli`](https://github.com/tari-project/minotari-cli) | the `minotari` crate as a library, signing offline with `sign_locked_transaction` |
 
-Scenarios implemented: **B0, S0, S1, S2, S3, S4, S5, S6**.
+Scenarios implemented: **B0, S0, S1, S2, S3, S4, S5, S6, S7**.
 
 ## How it is put together
 
@@ -104,7 +104,7 @@ Re-running `prepare` never rotates an existing seed, so the money stays where it
 
 ```bash
 cargo run --release -- plan                       # parameters and scenario list, no wallets touched
-cargo run --release -- run                        # both modes, B0 and S0-S6, in order
+cargo run --release -- run                        # every mode, B0 and S0-S7, in order
 cargo run --release -- run --modes new_wallet --scenarios B0,S0,S1
 ```
 
@@ -116,7 +116,7 @@ re-rendered from any saved profile without re-running:
 ```bash
 cargo run --release -- show results/profile-<timestamp>.json
 ``` The scenarios form a chain — S1 builds the UTXO set S2 and
-S3 rescan, S4 and S5 spend it, S6 rescans what they left — so when one fails, the rest of that
+S3 rescan, S4 and S5 spend it, S6 and S7 rescan what they left — so when one fails, the rest of that
 mode is skipped rather than run against a wallet state the protocol never asked for. The other
 mode still runs.
 
@@ -157,7 +157,8 @@ parameter used, so which is which is never in doubt.
   every individual transaction (construction time, broadcast time, confirmation time, fee,
   outcome).
 * **deltas** — `T_scan(S2) − T_scan(B0)`, `T_scan(S6) − T_scan(S2)`,
-  `T_scan(S6) / T_scan(B0)` and the S5 throughput multiplier, per mode.
+  `T_scan(S6) / T_scan(B0)`, `T_scan(S7) − T_scan(S3)`, `T_scan(S6) / T_scan(S7)` and the S5
+  throughput multiplier, per mode.
 
 ### Baseline profile
 
@@ -178,9 +179,12 @@ resulting `results/profile-<timestamp>.json` together with the environment it wa
 | S4 | 8/16/32/64/128 concurrent construct-and-broadcast calls | per-tx timings, success rate, max serialisation gap |
 | S5 | Pays the same 100 recipients as 10 batch txs and as 100 individual txs | `T_batch`, `T_individual`, multiplier and fee per recipient — the multiplier only when both arms paid every recipient |
 | S6 | Wipe, rescan from genesis after S4 and S5 | rediscovers the post-S5 state |
+| S7 | Wipe, rescan from the seed birthday after S4 and S5 | same, from `H_birth` |
 
-S7 (birthday rescan at checkpoint 2) and the payment processor mode are out of scope for this
-harness.
+Each checkpoint is rescanned twice, from genesis and from the birthday: S2/S3 after the
+build-up, S6/S7 after the concurrency and throughput scenarios. The genesis figure is dominated
+by the blocks that predate the wallet, which no amount of wallet history changes, so
+`T_scan(S7) - T_scan(S3)` is what actually says what S4 and S5 cost a rescan.
 
 Notes on what the numbers mean:
 

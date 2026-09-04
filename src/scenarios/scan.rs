@@ -1,4 +1,4 @@
-//! S2, S3 and S6 — rescans of a populated wallet.
+//! S2, S3, S6 and S7 — rescans of a populated wallet.
 //!
 //! All three have the same shape: snapshot what the wallet holds, wipe its data directory,
 //! bring it back up from a birthday and check that the scan rediscovers exactly what was
@@ -46,6 +46,21 @@ impl ScanScenario {
             id: "S6",
             description: "Rescan from genesis after the concurrency and throughput scenarios",
             birthday: Birthday::Genesis,
+        }
+    }
+
+    /// Scan from the seed birthday, checkpoint 2.
+    ///
+    /// S6 is to S7 what S2 is to S3: the same wallet state rescanned from genesis and from the
+    /// birthday, so the cost of the blocks before the wallet existed can be separated from the
+    /// cost of its own history. Pairing it with S3 also shows what S4 and S5 added to a
+    /// birthday scan, which is the delta `T_scan(S7) - T_scan(S3)`.
+    pub fn s7() -> Self {
+        Self {
+            id: "S7",
+            description: "Rescan from the wallet birthday after the concurrency and throughput \
+                          scenarios",
+            birthday: Birthday::FromSeed,
         }
     }
 }
@@ -150,5 +165,32 @@ impl Scenario for ScanScenario {
             report.reconcile(before.total());
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_checkpoint_pairs_a_genesis_scan_with_a_birthday_scan() {
+        // Checkpoint 1 is S2/S3, checkpoint 2 is S6/S7. Without S7 the second checkpoint has
+        // only a genesis scan, and there is nothing to attribute the pre-birthday blocks to.
+        assert_eq!(ScanScenario::s2().birthday, Birthday::Genesis);
+        assert_eq!(ScanScenario::s3().birthday, Birthday::FromSeed);
+        assert_eq!(ScanScenario::s6().birthday, Birthday::Genesis);
+        assert_eq!(ScanScenario::s7().birthday, Birthday::FromSeed);
+    }
+
+    #[test]
+    fn s7_is_the_second_birthday_rescan_and_says_so() {
+        let s7 = ScanScenario::s7();
+        assert_eq!(s7.id(), "S7");
+        assert!(s7.description().contains("birthday"));
+        assert!(
+            s7.description().contains("concurrency and throughput"),
+            "S7 has to name the checkpoint it runs at: {}",
+            s7.description()
+        );
     }
 }

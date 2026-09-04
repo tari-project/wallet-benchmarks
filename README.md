@@ -263,9 +263,13 @@ These are findings, recorded in every mode 3 scenario report under `mode_finding
    history, and it is what the profile's per-transaction `enrichment.timeline` comes from.
 3. It exposes no transaction id. Live polling goes by `payment_id`; on-chain identity is
    reachable only through `payref`, and only once a payment has confirmed. So fees, kernel
-   excesses and confirmation heights are recovered after each scenario rather than at send time,
-   and the fee is read off the transaction the daemon stored, because neither service reports
-   one.
+   excesses and confirmation heights are recovered after each scenario rather than at send time.
+   The fee is read off the transaction the daemon stored, because neither service reports one,
+   and that same stored transaction is the only source of the kernel's excess *signature* — the
+   daemon's API reports the excess and nothing else, and the base node's transaction query is
+   keyed on the signature, so without it the chain cannot be asked about the transaction at all.
+   Fees that arrive this late are folded back into the scenario's balance reconciliation, which
+   would otherwise report mode 3's whole fee spend as an unexplained shortfall.
 4. The daemon has no unspent-output endpoint — `lock_funds` is the only place raw UTXOs appear
    in its API, and calling that to read a balance would reserve funds. The harness reads the
    daemon's `outputs` table directly instead (SQLite in WAL mode, read-only connection).

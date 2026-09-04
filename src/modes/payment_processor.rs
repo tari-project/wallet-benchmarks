@@ -53,6 +53,7 @@ use async_trait::async_trait;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tari_transaction_components::transaction_components::Transaction;
+use tari_utilities::ByteArray;
 use tokio::{io::AsyncWriteExt, process::Child, sync::Mutex};
 use zeroize::Zeroizing;
 
@@ -502,22 +503,39 @@ fn fee_per_recipient(transaction_fee: u64, recipients: usize) -> Option<f64> {
     Some(transaction_fee as f64 / recipients as f64)
 }
 
-/// The fee a completed transaction actually paid, from its kernels.
+/// What the daemon's stored copy of a transaction says about it.
+struct DecodedTransaction {
+    /// Fee actually paid, summed over the kernels.
+    fee: u64,
+    /// Public nonce of the first kernel's excess signature.
+    excess_sig_nonce: Vec<u8>,
+    /// Signature component of the first kernel's excess signature.
+    excess_sig: Vec<u8>,
+}
+
+/// Reads a completed transaction back out of the daemon's database.
 ///
 /// The daemon stores the whole signed transaction as JSON in
 /// `completed_transactions.serialized_transaction`, and this harness links the same
-/// `tari_transaction_components` version the daemon does, so it reads back. This is the only
-/// authoritative fee available for this mode: the processor never reports one, and the
-/// daemon's API does not expose the kernel.
-fn transaction_fee(serialized: &[u8]) -> Result<u64> {
+/// `tari_transaction_components` version the daemon does, so it reads back.
+///
+/// This is the only place two facts about a mode 3 transaction exist. The fee: the processor
+/// never reports one and the daemon's API does not expose the kernel. And the excess
+/// *signature*, which is what the base node's transaction query is keyed on — the daemon
+/// reports the excess and nothing else, so without decoding this there is no way to ask the
+/// chain about the transaction at all.
+fn decode_transaction(serialized: &[u8]) -> Result<DecodedTransaction> {
     let transaction: Transaction = serde_json::from_slice(serialized)
         .context("Could not decode the daemon's stored transaction")?;
-    Ok(transaction
-        .body()
-        .kernels()
-        .iter()
-        .map(|kernel| kernel.fee.as_u64())
-        .sum())
+    let kernels = transaction.body().kernels();
+    let first = kernels
+        .first()
+        .ok_or_else(|| anyhow!("the daemon stored a transaction with no kernels"))?;
+    Ok(DecodedTransaction {
+        fee: kernels.iter().map(|kernel| kernel.fee.as_u64()).sum(),
+        excess_sig_nonce: first.excess_sig.get_compressed_public_nonce().to_vec(),
+        excess_sig: first.excess_sig.get_signature().to_vec(),
+    })
 }
 
 // --------------------------------------------------------------------------------------
@@ -1412,12 +1430,44 @@ impl WalletMode for PaymentProcessor {
                         if let Ok(Some(serialized)) =
                             self.stored_transaction(&tx.kernel_excess_hex).await
                         {
-                            if let Ok(fee) = transaction_fee(&serialized) {
-                                enrichment.transaction_fee = Some(fee);
-                                enrichment.fee_per_recipient =
-                                    fee_per_recipient(fee, metric.payment_ids.len());
-                                metric.fee = fee;
-                                fees += fee;
+                            match decode_transaction(&serialized) {
+                                Ok(decoded) => {
+                                    enrichment.transaction_fee = Some(decoded.fee);
+                                    enrichment.fee_per_recipient =
+                                        fee_per_recipient(decoded.fee, metric.payment_ids.len());
+                                    metric.fee = decoded.fee;
+                                    fees += decoded.fee;
+
+                                    // The authoritative confirmation, from the chain rather
+                                    // than from either service. Keyed on the excess
+                                    // *signature*, which is why the transaction had to be
+                                    // decoded: the daemon reports the excess and nothing else.
+                                    match self
+                                        .chain
+                                        .transaction_location(
+                                            &decoded.excess_sig_nonce,
+                                            &decoded.excess_sig,
+                                        )
+                                        .await
+                                    {
+                                        Ok(location) => {
+                                            enrichment.base_node_location =
+                                                Some(format!("{:?}", location.location));
+                                            enrichment.base_node_mined_height =
+                                                location.mined_height;
+                                        },
+                                        Err(e) => warn!(
+                                            "[{PAYMENT_PROCESSOR}] base node did not answer for \
+                                             kernel {}: {e:#}",
+                                            tx.kernel_excess_hex
+                                        ),
+                                    }
+                                },
+                                Err(e) => warn!(
+                                    "[{PAYMENT_PROCESSOR}] could not decode the stored \
+                                     transaction for kernel {}: {e:#}",
+                                    tx.kernel_excess_hex
+                                ),
                             }
                         }
                     },
@@ -1979,7 +2029,7 @@ mod tests {
     fn a_garbled_transaction_blob_is_an_error_rather_than_a_zero_fee() {
         // A zero fee would be indistinguishable from a free transaction and would quietly
         // break every balance reconciliation that follows.
-        assert!(transaction_fee(b"not json").is_err());
+        assert!(decode_transaction(b"not json").is_err());
     }
 
     #[test]

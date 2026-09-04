@@ -109,6 +109,13 @@ pub struct TxEnrichment {
     /// Fee of the whole transaction, in µT, as read back from the chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_fee: Option<u64>,
+    /// Where the base node says the transaction is: `Mined`, `InMempool`, `NotStored` or
+    /// `None`. The authoritative answer, as opposed to the wallet's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_node_location: Option<String>,
+    /// The height the base node says it was mined at, which need not agree with the wallet's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_node_mined_height: Option<u64>,
     /// `transaction_fee` divided across the payments that shared the batch. Reporting the
     /// whole fee against each payment would multiply one fee by the batch width.
     #[serde(default, skip_serializing_if = "Option::is_none")]

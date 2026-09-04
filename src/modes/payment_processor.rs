@@ -347,9 +347,12 @@ fn render_pp_env(cfg: &HarnessConfig, ctx: &PpEnvContext) -> Vec<(String, String
         // The processor ignores any per-request fee: this is where its fee comes from, which
         // is why `params.fee_rate` has to be one value across all three modes.
         ("FEE_PER_GRAM".to_string(), cfg.params.fee_rate.to_string()),
+        // The effective value, not the configured one: anything above the processor's ceiling
+        // is clamped by it without a word, and a `.env` a reader reproduces the run from has
+        // to say what the processor actually ran at.
         (
             "MAX_INPUT_COUNT_PER_TX".to_string(),
-            pp.max_input_count_per_tx.to_string(),
+            pp.effective_max_input_count().to_string(),
         ),
         // The processor's own default is 10. Matching the harness's confirmation depth is
         // what makes this mode's "confirmed" mean the same thing as the other two modes'.
@@ -1666,7 +1669,7 @@ fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Params;
+    use crate::config::{Params, PP_MAX_INPUT_COUNT_CLAMP};
 
     fn payment(status: PaymentStatus, mined_height: Option<i64>) -> PaymentResponse {
         PaymentResponse {
@@ -2006,6 +2009,20 @@ mod tests {
         assert_eq!(env["TRANSACTION_SIGNER_SLEEP_SECS"], "1");
         assert_eq!(env["BROADCASTER_SLEEP_SECS"], "1");
         assert_eq!(env["CONFIRMATION_CHECKER_SLEEP_SECS"], "1");
+    }
+
+    #[test]
+    fn the_input_count_rendered_is_the_one_the_processor_will_honour() {
+        let mut cfg = test_config();
+        assert_eq!(env_of(&cfg)["MAX_INPUT_COUNT_PER_TX"], "400");
+
+        // The processor's own config ends in `.min(400)` and logs nothing, so a `.env`
+        // carrying 5000 would describe a run that never happened.
+        cfg.payment_processor.max_input_count_per_tx = 5_000;
+        assert_eq!(
+            env_of(&cfg)["MAX_INPUT_COUNT_PER_TX"],
+            PP_MAX_INPUT_COUNT_CLAMP.to_string()
+        );
     }
 
     #[test]

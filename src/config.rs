@@ -8,6 +8,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
+use log::warn;
 use serde::{Deserialize, Serialize};
 
 /// Top level harness configuration, normally read from `benchmark.toml`.
@@ -64,9 +65,10 @@ pub const PP_MAX_BATCH_SIZE: usize = 100;
 
 /// Ceiling the payment processor silently applies to `MAX_INPUT_COUNT_PER_TX`.
 ///
-/// `MAX_INPUT_COUNT_PER_TX_LIMIT` in the processor: a configured value above this is clamped
-/// without a warning, so a harness that recorded the configured number would be recording a
-/// setting the processor never used. The clamped value is what the profile reports and what S1
+/// The processor's `Config::try_from` ends in `raw.max_input_count_per_tx.unwrap_or(400).min(400)`
+/// — a bare literal, not a named limit, and no warning when it bites. A harness that recorded
+/// the configured number would be recording a setting the processor never used, so the clamped
+/// value is what reaches the processor's environment, what the profile reports and what S1
 /// compares its UTXO count against.
 pub const PP_MAX_INPUT_COUNT_CLAMP: usize = 400;
 
@@ -509,6 +511,19 @@ impl HarnessConfig {
         if self.new_wallet.db_pool_size == 0 {
             self.new_wallet.db_pool_size = self.required_db_pool_size();
         }
+        // The profile is copied verbatim from this struct, so a configured input count the
+        // processor is about to clamp would be a profile claiming a setting no run ever used.
+        // Lowered here, once, and said out loud rather than left for a reader to discover.
+        let effective = self.payment_processor.effective_max_input_count();
+        if effective != self.payment_processor.max_input_count_per_tx {
+            warn!(
+                "payment_processor.max_input_count_per_tx is {}, above the \
+                 {PP_MAX_INPUT_COUNT_CLAMP} the processor silently clamps to; the run and the \
+                 profile use {effective}",
+                self.payment_processor.max_input_count_per_tx
+            );
+            self.payment_processor.max_input_count_per_tx = effective;
+        }
     }
 
     /// Rejects parameter combinations that cannot produce a meaningful run.
@@ -744,6 +759,30 @@ mod tests {
         cfg.new_wallet.db_pool_size = 64;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("deadlocks"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_configured_input_count_above_the_processors_ceiling_is_recorded_as_what_it_will_be() {
+        let mut cfg = HarnessConfig::default();
+        cfg.payment_processor.max_input_count_per_tx = 5_000;
+        assert_eq!(
+            cfg.payment_processor.effective_max_input_count(),
+            PP_MAX_INPUT_COUNT_CLAMP
+        );
+
+        // The profile is this struct verbatim, so 5000 in it would be a claim about a run the
+        // processor never made: it clamps to 400 and says nothing.
+        cfg.resolve_derived();
+        assert_eq!(
+            cfg.payment_processor.max_input_count_per_tx,
+            PP_MAX_INPUT_COUNT_CLAMP
+        );
+        cfg.validate().unwrap();
+
+        // Anything the processor will honour is left exactly as configured.
+        cfg.payment_processor.max_input_count_per_tx = 25;
+        cfg.resolve_derived();
+        assert_eq!(cfg.payment_processor.max_input_count_per_tx, 25);
     }
 
     #[test]

@@ -32,7 +32,16 @@ pub enum Outcome {
 pub struct TxMetric {
     /// Where this transaction came from, e.g. `s1-round-3-tx-2`.
     pub label: String,
+    /// The wallet's own transaction id, when the mode exposes one. `payment_processor` does
+    /// not; `payment_ids` carries its handle instead.
     pub tx_id: Option<u64>,
+    /// The payment processor's handles for this send: the batch id and the payment ids it
+    /// created. Empty for the modes that own the transaction outright.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payment_ids: Vec<String>,
+    /// The payment processor batch this send became. `None` for the other modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
     /// Payment outputs requested (change excluded).
     pub outputs: u32,
     /// Total amount sent, in µT.
@@ -42,7 +51,15 @@ pub struct TxMetric {
     /// Time spent building and signing.
     pub construction_secs: f64,
     /// Time from the end of construction to the node accepting the transaction.
-    pub broadcast_secs: f64,
+    ///
+    /// `None` when the wallet gives the harness no way to observe the broadcast at all;
+    /// `broadcast_unavailable` then says why. Deliberately not zero — zero is a claim that
+    /// the broadcast was instantaneous, which is a different (and false) statement.
+    #[serde(default)]
+    pub broadcast_secs: Option<f64>,
+    /// Why `broadcast_secs` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast_unavailable: Option<String>,
     /// Offset from the batch start at which the send was submitted.
     pub submitted_at_secs: f64,
     /// Offset from the batch start at which construction completed. S4 uses the gaps between
@@ -52,6 +69,46 @@ pub struct TxMetric {
     pub confirmed_at_secs: Option<f64>,
     pub outcome: TxOutcome,
     pub error: Option<String>,
+    /// Post-run enrichment: what the chain and the wallet said about this transaction once it
+    /// had settled. Only `payment_processor` fills this in — the other modes know all of it
+    /// at send time and record it in the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment: Option<TxEnrichment>,
+}
+
+/// What a post-run lookup added to a transaction that the send itself could not report.
+///
+/// The payment processor exposes no transaction id and persists no per-state timestamps, so
+/// everything here has to be recovered afterwards: the on-chain identity through the
+/// `payref` the daemon records at confirmation, and the transition timeline through the
+/// processor's `events` table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TxEnrichment {
+    /// Reference the payment processor assigns at confirmation; the only handle that reaches
+    /// the chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payrefs: Vec<String>,
+    /// The daemon's own transaction id, looked up by `payref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_tx_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_excess_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mined_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast_attempts: Option<i64>,
+    /// Fee of the whole transaction, in µT, as read back from the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_fee: Option<u64>,
+    /// `transaction_fee` divided across the payments that shared the batch. Reporting the
+    /// whole fee against each payment would multiply one fee by the batch width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_per_recipient: Option<f64>,
+    /// `(event_type, timestamp)` in the order the processor recorded them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<(String, String)>,
 }
 
 /// Terminal state of a single transaction.
@@ -129,13 +186,45 @@ pub struct ScanMetrics {
     /// over. Only the library wallet reports it; the console wallet's gRPC exposes no
     /// equivalent signal, and leaves it at zero.
     pub rollbacks_detected: u64,
+    /// Peak RSS of the headline process.
+    pub peak_rss_bytes: u64,
+    /// Peak CPU of the headline process.
+    pub peak_cpu_percent: f32,
+    /// Label of the process the two figures above describe.
+    #[serde(default)]
+    pub headline_process: String,
+    /// Every process this mode attributes resource usage to, headline first.
+    ///
+    /// A single-process mode reports one entry. `payment_processor` reports the daemon as the
+    /// headline — it is the wallet — with the payment processor alongside it, because a
+    /// single number for a three-process mode would describe neither.
+    #[serde(default)]
+    pub processes: Vec<ProcessSample>,
+}
+
+/// Peak resource usage of one named process over a measurement window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProcessSample {
+    /// Stable label, e.g. `console_wallet`, `harness`, `daemon`, `payment_processor`.
+    pub process: String,
     pub peak_rss_bytes: u64,
     pub peak_cpu_percent: f32,
-    /// True when the sampled process also runs the harness (the library wallet).
-    pub resource_sample_includes_harness: bool,
+    /// True when this process also runs the harness, so its figures include it.
+    pub includes_harness: bool,
 }
 
 impl ScanMetrics {
+    /// Records the per-process peaks and promotes the first one to the headline figures.
+    pub fn with_processes(mut self, processes: Vec<ProcessSample>) -> Self {
+        if let Some(headline) = processes.first() {
+            self.headline_process = headline.process.clone();
+            self.peak_rss_bytes = headline.peak_rss_bytes;
+            self.peak_cpu_percent = headline.peak_cpu_percent;
+        }
+        self.processes = processes;
+        self
+    }
+
     /// Fills in the derived rate. Call once the durations and block counts are known.
     pub fn finish(mut self) -> Self {
         self.blocks_per_sec = if self.duration_secs > 0.0 {
@@ -456,7 +545,7 @@ impl ResultProfile {
         let _ = writeln!(out, "SCANS\n");
         let _ = writeln!(
             out,
-            "{:<12}{:<4}{:>10}{:>12}{:>10}{:>9}{:>9}{:>10}{:>9}",
+            "{:<12}{:<4}{:>10}{:>12}{:>10}{:>9}{:>9}{:>10}{:>9}  measured on",
             "mode",
             "id",
             "T_scan",
@@ -468,14 +557,16 @@ impl ResultProfile {
             "peak CPU"
         );
         let mut last_mode = "";
+        let mut multi_process = false;
         for (report, scan) in scans {
             if !last_mode.is_empty() && last_mode != report.mode {
                 let _ = writeln!(out);
             }
             last_mode = &report.mode;
+            multi_process |= scan.processes.len() > 1;
             let _ = writeln!(
                 out,
-                "{:<12}{:<4}{:>9.1}s{:>11.1}s{:>10}{:>9.0}{:>9}{:>9.0}M{:>8.0}%",
+                "{:<12}{:<4}{:>9.1}s{:>11.1}s{:>10}{:>9.0}{:>9}{:>9.0}M{:>8.0}%  {}",
                 report.mode,
                 report.scenario,
                 scan.duration_secs,
@@ -485,6 +576,14 @@ impl ResultProfile {
                 scan.outputs_found,
                 scan.peak_rss_bytes as f64 / 1e6,
                 scan.peak_cpu_percent,
+                describe_processes(scan),
+            );
+        }
+        if multi_process {
+            let _ = writeln!(
+                out,
+                "\n  peak RSS and peak CPU are the headline process only; the rest of the \
+                 breakdown is in\n  the profile's `scan.processes`."
             );
         }
         let _ = writeln!(out);
@@ -576,6 +675,28 @@ impl ResultProfile {
         }
         let _ = writeln!(out);
     }
+}
+
+/// The processes a scan's resource figures were attributed to, headline first.
+fn describe_processes(scan: &ScanMetrics) -> String {
+    if scan.processes.is_empty() {
+        return if scan.headline_process.is_empty() {
+            "-".to_string()
+        } else {
+            scan.headline_process.clone()
+        };
+    }
+    scan.processes
+        .iter()
+        .map(|p| {
+            if p.includes_harness {
+                format!("{} (+harness)", p.process)
+            } else {
+                p.process.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `old_wallet` -> `old`, for a column header that has to fit.
@@ -763,6 +884,68 @@ mod tests {
         s5.note("t_individual_secs", 360.0);
         s5.note("comparison_withheld", "batch confirmed 0 of 10");
         assert!(compute_deltas(&[s5]).is_empty());
+    }
+
+    #[test]
+    fn the_headline_resource_figures_come_from_the_first_process() {
+        let scan = ScanMetrics::default().with_processes(vec![
+            ProcessSample {
+                process: "daemon".to_string(),
+                peak_rss_bytes: 900,
+                peak_cpu_percent: 80.0,
+                includes_harness: false,
+            },
+            ProcessSample {
+                process: "payment_processor".to_string(),
+                peak_rss_bytes: 100,
+                peak_cpu_percent: 5.0,
+                includes_harness: false,
+            },
+        ]);
+        assert_eq!(scan.headline_process, "daemon");
+        assert_eq!(scan.peak_rss_bytes, 900);
+        assert!((scan.peak_cpu_percent - 80.0).abs() < f32::EPSILON);
+        assert_eq!(scan.processes.len(), 2);
+        assert_eq!(
+            describe_processes(&scan),
+            "daemon, payment_processor",
+            "a three-process mode has to say which process the headline describes"
+        );
+    }
+
+    #[test]
+    fn a_harness_inclusive_sample_is_labelled_as_one() {
+        let scan = ScanMetrics::default().with_processes(vec![ProcessSample {
+            process: "harness".to_string(),
+            peak_rss_bytes: 5,
+            peak_cpu_percent: 1.0,
+            includes_harness: true,
+        }]);
+        assert_eq!(describe_processes(&scan), "harness (+harness)");
+    }
+
+    #[test]
+    fn an_unobservable_broadcast_is_null_with_a_reason_rather_than_zero() {
+        let metric = TxMetric {
+            broadcast_secs: None,
+            broadcast_unavailable: Some("the payment processor emits no event".to_string()),
+            ..TxMetric::default()
+        };
+        let json = serde_json::to_value(&metric).unwrap();
+        assert!(json["broadcast_secs"].is_null());
+        assert_eq!(
+            json["broadcast_unavailable"],
+            "the payment processor emits no event"
+        );
+
+        // A mode that can time its broadcast still reports a number.
+        let timed = TxMetric {
+            broadcast_secs: Some(0.25),
+            ..TxMetric::default()
+        };
+        let json = serde_json::to_value(&timed).unwrap();
+        assert!((json["broadcast_secs"].as_f64().unwrap() - 0.25).abs() < f64::EPSILON);
+        assert!(json.get("broadcast_unavailable").is_none());
     }
 
     #[test]

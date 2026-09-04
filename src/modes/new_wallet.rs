@@ -53,10 +53,11 @@ use zeroize::Zeroizing;
 use crate::{
     chain::ChainClient,
     config::HarnessConfig,
-    metrics::ScanMetrics,
+    metrics::{ProcessSample, ScanMetrics},
     modes::{
         Balance,
         Birthday,
+        ProcessRole,
         SendReceipt,
         SendRequest,
         TxState,
@@ -70,6 +71,10 @@ use crate::{
 
 /// Account name inside the wallet database. One account per wallet database is enough here.
 const ACCOUNT: &str = "benchmark";
+
+/// Label this mode's resource samples are reported under. The wallet runs inside the harness
+/// process, so there is no separate process to attribute anything to.
+const PROCESS_HARNESS: &str = "harness";
 
 /// Days the scanner steps back from the account birthday before resolving a start height
 /// (`DEFAULT_SCANNING_OFFSET_DAYS` in `minotari-cli`, which is private, so it is repeated
@@ -444,7 +449,7 @@ fn open_pool(
 /// (Nothing releases it in a harness run: expiry is the daemon's `tasks::unlocker`, which
 /// only runs inside the daemon. A send whose transaction never confirms therefore leaves its
 /// input locked for the rest of the run.)
-fn held_output_values(
+pub(crate) fn held_output_values(
     conn: &rusqlite::Connection,
     account_id: i64,
     height: u64,
@@ -664,10 +669,17 @@ impl WalletMode for NewWallet {
             validation_secs: 0.0,
             validation_completed: true,
             rollbacks_detected: rollbacks,
+            peak_rss_bytes: 0,
+            peak_cpu_percent: 0.0,
+            headline_process: String::new(),
+            processes: Vec::new(),
+        }
+        .with_processes(vec![ProcessSample {
+            process: PROCESS_HARNESS.to_string(),
             peak_rss_bytes: usage.peak_rss_bytes,
             peak_cpu_percent: usage.peak_cpu_percent,
-            resource_sample_includes_harness: true,
-        }
+            includes_harness: true,
+        }])
         .finish())
     }
 
@@ -794,11 +806,12 @@ impl WalletMode for NewWallet {
                 .finalize_transaction_and_broadcast(signed, self.cfg.base_node_url.clone())
                 .await?;
             return Ok(SendReceipt {
-                tx_id,
+                tx_id: Some(tx_id),
                 fee,
                 construction,
-                broadcast: broadcast_start.elapsed(),
-                tracker: TxTracker(tx_id),
+                broadcast: Some(broadcast_start.elapsed()),
+                broadcast_unavailable: None,
+                tracker: TxTracker::wallet_tx_id(tx_id),
             });
         }
 
@@ -816,11 +829,12 @@ impl WalletMode for NewWallet {
         self.broadcast_batch(&handles.pool, signed, &idempotency_key)
             .await?;
         Ok(SendReceipt {
-            tx_id,
+            tx_id: Some(tx_id),
             fee,
             construction,
-            broadcast: broadcast_start.elapsed(),
-            tracker: TxTracker(tx_id),
+            broadcast: Some(broadcast_start.elapsed()),
+            broadcast_unavailable: None,
+            tracker: TxTracker::wallet_tx_id(tx_id),
         })
     }
 
@@ -832,7 +846,7 @@ impl WalletMode for NewWallet {
             let inner = self.inner.lock().await;
             inner
                 .watched_outputs
-                .get(&tracker.0)
+                .get(&tracker.expect_wallet_tx_id()?)
                 .cloned()
                 .unwrap_or_default()
         };
@@ -869,7 +883,9 @@ impl WalletMode for NewWallet {
         // Fall back to the wallet's own transaction record, tolerating a read failure: this
         // row has the same unmappable timestamp columns as the outputs table, and a broken
         // fallback should not turn a pending transaction into a hard error.
-        let Ok(Some(tx)) = db::get_completed_transaction_by_id(&conn, TxId::from(tracker.0)) else {
+        let Ok(Some(tx)) =
+            db::get_completed_transaction_by_id(&conn, TxId::from(tracker.expect_wallet_tx_id()?))
+        else {
             return Ok(TxState::Mempool);
         };
 
@@ -911,8 +927,9 @@ impl WalletMode for NewWallet {
         }
     }
 
-    fn samples_include_harness(&self) -> bool {
-        true
+    fn resource_processes(&self) -> Vec<ProcessRole> {
+        // The wallet is the harness process, so there is nothing separate to sample.
+        vec![ProcessRole::with_harness(PROCESS_HARNESS)]
     }
 }
 

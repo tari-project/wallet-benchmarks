@@ -110,23 +110,98 @@ impl SendRequest {
 
 /// Handle used to follow a broadcast transaction to confirmation.
 ///
-/// Both modes track by the wallet's own transaction id, because both are asked about
-/// confirmation in the wallet's terms. Whether a transaction has reached `C_min` is a
-/// question about what the wallet believes, not about what the base node knows: a wallet that
-/// will not spend against a transaction it has not finished processing has not confirmed it,
-/// whatever the chain says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TxTracker(pub u64);
+/// Whether a transaction has reached `C_min` is a question about what the *wallet* believes,
+/// not about what the base node knows: a wallet that will not spend against a transaction it
+/// has not finished processing has not confirmed it, whatever the chain says. So every mode
+/// tracks in its own terms, and the shape of "its own terms" differs:
+///
+/// * `old_wallet` and `new_wallet` own the transaction and answer for its `TxId`, a `u64`.
+/// * `payment_processor` never exposes a transaction id at all. It hands back a batch id and one
+///   uuid `payment_id` per requested output, and on-chain identity only becomes reachable (via
+///   `payref`) once the payment has confirmed. One harness send is therefore one batch, and its
+///   state is the aggregate of the payments in it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TxTracker {
+    /// The wallet's own transaction id.
+    WalletTxId(u64),
+    /// One payment processor batch: the id of the batch and the payments it created.
+    PaymentBatch {
+        batch_id: String,
+        payment_ids: Vec<String>,
+    },
+}
+
+impl TxTracker {
+    /// Tracker for a mode that owns the transaction and knows its id.
+    pub fn wallet_tx_id(tx_id: u64) -> Self {
+        Self::WalletTxId(tx_id)
+    }
+
+    /// Tracker for one payment processor batch.
+    pub fn payment_batch(batch_id: impl Into<String>, payment_ids: Vec<String>) -> Self {
+        Self::PaymentBatch {
+            batch_id: batch_id.into(),
+            payment_ids,
+        }
+    }
+
+    /// The wallet transaction id, for a mode that has one.
+    ///
+    /// Returns an error rather than `None` so a mode handed a tracker it did not issue fails
+    /// with a message that says which mode it belongs to instead of silently reporting the
+    /// transaction as unknown.
+    pub fn expect_wallet_tx_id(&self) -> Result<u64> {
+        match self {
+            Self::WalletTxId(id) => Ok(*id),
+            Self::PaymentBatch { batch_id, .. } => Err(anyhow::anyhow!(
+                "tracker for payment processor batch {batch_id} was handed to a mode that tracks \
+                 by wallet transaction id"
+            )),
+        }
+    }
+
+    /// The payment ids of a payment processor batch.
+    pub fn expect_payment_ids(&self) -> Result<&[String]> {
+        match self {
+            Self::PaymentBatch { payment_ids, .. } => Ok(payment_ids),
+            Self::WalletTxId(id) => Err(anyhow::anyhow!(
+                "tracker for wallet transaction {id} was handed to the payment processor mode"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for TxTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WalletTxId(id) => write!(f, "tx {id}"),
+            Self::PaymentBatch {
+                batch_id,
+                payment_ids,
+            } => write!(f, "batch {batch_id} ({} payments)", payment_ids.len()),
+        }
+    }
+}
 
 /// Result of a successful construct-and-broadcast.
 #[derive(Debug, Clone)]
 pub struct SendReceipt {
-    pub tx_id: u64,
+    /// The wallet's transaction id, when the mode has one. `payment_processor` does not: it
+    /// exposes no transaction id, only a `payment_id` that reaches the chain via `payref`
+    /// after confirmation.
+    pub tx_id: Option<u64>,
     pub fee: u64,
     /// Time spent selecting inputs, building and signing.
     pub construction: Duration,
-    /// Time from the end of construction to the network accepting the transaction.
-    pub broadcast: Duration,
+    /// Time from the end of construction to the network accepting the transaction, when the
+    /// mode can observe it separately from construction.
+    ///
+    /// `None` is a disclosure, not a zero: it means the wallet gives the harness no way to
+    /// see the broadcast, and [`SendReceipt::broadcast_unavailable`] says why. Reporting zero
+    /// would be a claim that the broadcast was instantaneous.
+    pub broadcast: Option<Duration>,
+    /// Why `broadcast` is absent. Ignored when `broadcast` is `Some`.
+    pub broadcast_unavailable: Option<String>,
     pub tracker: TxTracker,
 }
 
@@ -257,9 +332,43 @@ pub trait WalletMode: Send + Sync {
         usize::MAX
     }
 
-    /// True when the resource samples cover the harness process as well.
-    fn samples_include_harness(&self) -> bool {
-        false
+    /// The processes this mode's resource samples are attributed to, headline first.
+    ///
+    /// Replaces the old `samples_include_harness()` flag, which could say nothing useful
+    /// about a mode that spans three processes: `payment_processor` runs a wallet daemon, a
+    /// payment processor and a signer subprocess, and "does this number include the harness"
+    /// is not the question a reader of that profile has. The headline entry is the one the
+    /// scan table's `peak RSS` and `peak CPU` columns describe; the rest are reported
+    /// alongside it.
+    fn resource_processes(&self) -> Vec<ProcessRole> {
+        vec![ProcessRole::external(self.name())]
+    }
+}
+
+/// One process a mode attributes resource measurements to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessRole {
+    /// Stable label used in the profile, e.g. `console_wallet`, `harness` or `daemon`.
+    pub label: &'static str,
+    /// True when the sampled process also runs the harness, so its figures include it.
+    pub includes_harness: bool,
+}
+
+impl ProcessRole {
+    /// A separate process, sampled on its own.
+    pub const fn external(label: &'static str) -> Self {
+        Self {
+            label,
+            includes_harness: false,
+        }
+    }
+
+    /// A process that is also the harness, so its figures include the harness.
+    pub const fn with_harness(label: &'static str) -> Self {
+        Self {
+            label,
+            includes_harness: true,
+        }
     }
 }
 
@@ -344,6 +453,55 @@ mod tests {
         assert!(cap_to_available(vec![10, 20], 0).is_empty());
         assert!(cap_to_available(vec![100], 99).is_empty());
         assert!(cap_to_available(Vec::new(), 500).is_empty());
+    }
+
+    #[test]
+    fn a_wallet_tracker_answers_for_its_transaction_id_and_nothing_else() {
+        let tracker = TxTracker::wallet_tx_id(42);
+        assert_eq!(tracker.expect_wallet_tx_id().unwrap(), 42);
+
+        let err = tracker.expect_payment_ids().unwrap_err().to_string();
+        assert!(err.contains("42"), "unexpected error: {err}");
+        assert!(
+            err.contains("payment processor"),
+            "the error has to name the mode that was handed the wrong tracker: {err}"
+        );
+    }
+
+    #[test]
+    fn a_payment_batch_tracker_carries_every_payment_in_the_batch() {
+        // One harness send is one `POST /v1/payment-batches`, and the processor answers with
+        // one payment id per requested output. All of them have to be followed, because the
+        // batch is only settled when every payment in it is.
+        let tracker = TxTracker::payment_batch("batch-1", vec![
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            "22222222-2222-4222-8222-222222222222".to_string(),
+        ]);
+        assert_eq!(tracker.expect_payment_ids().unwrap().len(), 2);
+        assert_eq!(
+            tracker.expect_payment_ids().unwrap()[0],
+            "11111111-1111-4111-8111-111111111111"
+        );
+
+        let err = tracker.expect_wallet_tx_id().unwrap_err().to_string();
+        assert!(err.contains("batch-1"), "unexpected error: {err}");
+        assert_eq!(tracker.to_string(), "batch batch-1 (2 payments)");
+        assert_eq!(TxTracker::wallet_tx_id(7).to_string(), "tx 7");
+    }
+
+    #[test]
+    fn trackers_are_comparable_so_a_scenario_can_key_on_them() {
+        let a = TxTracker::payment_batch("b", vec!["p".to_string()]);
+        assert_eq!(a.clone(), a);
+        assert_ne!(a, TxTracker::payment_batch("b", Vec::new()));
+        assert_ne!(TxTracker::wallet_tx_id(1), TxTracker::wallet_tx_id(2));
+    }
+
+    #[test]
+    fn a_process_role_says_whether_the_harness_is_in_the_numbers() {
+        assert!(!ProcessRole::external("daemon").includes_harness);
+        assert!(ProcessRole::with_harness("harness").includes_harness);
+        assert_eq!(ProcessRole::external("daemon").label, "daemon");
     }
 
     #[test]

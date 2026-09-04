@@ -26,10 +26,11 @@ use tonic::transport::Channel;
 use crate::{
     chain::ChainClient,
     config::HarnessConfig,
-    metrics::ScanMetrics,
+    metrics::{ProcessSample, ScanMetrics},
     modes::{
         Balance,
         Birthday,
+        ProcessRole,
         SendReceipt,
         SendRequest,
         TxState,
@@ -55,6 +56,9 @@ const STATUS_COINBASE_UNCONFIRMED: i32 = 12;
 /// Not mined.
 const STATUS_REJECTED: i32 = 7;
 const STATUS_NOT_FOUND: i32 = 11;
+
+/// Label the console wallet process is reported under in the profile's resource breakdown.
+const PROCESS_CONSOLE_WALLET: &str = "console_wallet";
 
 /// Days the console wallet steps back from the seed birthday before it starts scanning
 /// (`wallet.birthday_offset`, default 2 in tari). Only used to report where the scan began.
@@ -447,10 +451,17 @@ impl WalletMode for OldWallet {
             validation_completed,
             // The console wallet logs its rollbacks but does not report them over gRPC.
             rollbacks_detected: 0,
+            peak_rss_bytes: 0,
+            peak_cpu_percent: 0.0,
+            headline_process: String::new(),
+            processes: Vec::new(),
+        }
+        .with_processes(vec![ProcessSample {
+            process: PROCESS_CONSOLE_WALLET.to_string(),
             peak_rss_bytes: usage.peak_rss_bytes,
             peak_cpu_percent: usage.peak_cpu_percent,
-            resource_sample_includes_harness: false,
-        }
+            includes_harness: false,
+        }])
         .finish())
     }
 
@@ -573,16 +584,30 @@ impl WalletMode for OldWallet {
         }
 
         Ok(SendReceipt {
-            tx_id: result.transaction_id,
+            tx_id: Some(result.transaction_id),
             fee,
             construction,
-            broadcast: Duration::ZERO,
-            tracker: TxTracker(result.transaction_id),
+            // The console wallet builds, signs and broadcasts inside one `Transfer` call and
+            // reports nothing in between, so there is no broadcast to time. Recording zero
+            // would claim the broadcast was instantaneous, which is a different statement.
+            broadcast: None,
+            broadcast_unavailable: Some(
+                "the console wallet builds and broadcasts inside a single Transfer call"
+                    .to_string(),
+            ),
+            tracker: TxTracker::wallet_tx_id(result.transaction_id),
         })
     }
 
+    fn resource_processes(&self) -> Vec<ProcessRole> {
+        vec![ProcessRole::external(PROCESS_CONSOLE_WALLET)]
+    }
+
     async fn tx_state(&self, tracker: &TxTracker) -> Result<TxState> {
-        let Some(info) = self.transaction_info(tracker.0).await? else {
+        let Some(info) = self
+            .transaction_info(tracker.expect_wallet_tx_id()?)
+            .await?
+        else {
             return Ok(TxState::Unknown);
         };
         if info.is_cancelled || info.status == STATUS_REJECTED {

@@ -40,19 +40,30 @@ pub async fn send_recorded(
     match mode.send(request).await {
         Ok(receipt) => {
             let construction_secs = receipt.construction.as_secs_f64();
+            let (batch_id, payment_ids) = match &receipt.tracker {
+                TxTracker::PaymentBatch {
+                    batch_id,
+                    payment_ids,
+                } => (Some(batch_id.clone()), payment_ids.clone()),
+                TxTracker::WalletTxId(_) => (None, Vec::new()),
+            };
             let metric = TxMetric {
                 label,
-                tx_id: Some(receipt.tx_id),
+                tx_id: receipt.tx_id,
+                payment_ids,
+                batch_id,
                 outputs,
                 amount,
                 fee: receipt.fee,
                 construction_secs,
-                broadcast_secs: receipt.broadcast.as_secs_f64(),
+                broadcast_secs: receipt.broadcast.map(|d| d.as_secs_f64()),
+                broadcast_unavailable: receipt.broadcast_unavailable.clone(),
                 submitted_at_secs: submitted_at,
                 construction_done_secs: submitted_at + construction_secs,
                 confirmed_at_secs: None,
                 outcome: TxOutcome::Broadcast,
                 error: None,
+                enrichment: None,
             };
             (metric, Some(receipt.tracker))
         },
@@ -60,16 +71,22 @@ pub async fn send_recorded(
             let metric = TxMetric {
                 label,
                 tx_id: None,
+                payment_ids: Vec::new(),
+                batch_id: None,
                 outputs,
                 amount,
                 fee: 0,
                 construction_secs: 0.0,
-                broadcast_secs: 0.0,
+                // Nothing was broadcast, so there is no broadcast duration to report — as
+                // opposed to a broadcast that happened and could not be timed.
+                broadcast_secs: None,
+                broadcast_unavailable: Some("the send never reached broadcast".to_string()),
                 submitted_at_secs: submitted_at,
                 construction_done_secs: origin.elapsed().as_secs_f64(),
                 confirmed_at_secs: None,
                 outcome: TxOutcome::Failed,
                 error: Some(e.to_string()),
+                enrichment: None,
             };
             (metric, None)
         },
@@ -161,8 +178,10 @@ pub async fn await_confirmations(
     poll: Duration,
     origin: Instant,
 ) {
-    let mut outstanding: HashMap<usize, TxTracker> =
-        pending.iter().map(|p| (p.index, p.tracker)).collect();
+    let mut outstanding: HashMap<usize, TxTracker> = pending
+        .iter()
+        .map(|p| (p.index, p.tracker.clone()))
+        .collect();
     let deadline = Instant::now() + budget;
 
     while !outstanding.is_empty() {
@@ -451,7 +470,7 @@ mod tests {
             &mode,
             &[Pending {
                 index: 0,
-                tracker: TxTracker(7),
+                tracker: TxTracker::wallet_tx_id(7),
             }],
             &mut metrics,
             3,
@@ -472,7 +491,7 @@ mod tests {
             &mode,
             &[Pending {
                 index: 0,
-                tracker: TxTracker(7),
+                tracker: TxTracker::wallet_tx_id(7),
             }],
             &mut metrics,
             3,

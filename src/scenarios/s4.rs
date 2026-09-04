@@ -72,7 +72,8 @@ struct LevelNote {
     infrastructure_failures: u32,
     fees: u64,
     /// `send` when the wallet priced its transactions as it built them, `enrichment` when the
-    /// figure had to be recovered from the chain afterwards.
+    /// figure had to be recovered from the chain afterwards, and `enrichment_incomplete` when
+    /// that recovery came back short — `fees` is then a floor for the level, not its cost.
     fees_source: &'static str,
     budget_secs: u64,
     /// True when construction alone used the level's whole budget, so nothing was left to wait
@@ -298,11 +299,35 @@ impl Scenario for ConcurrentConstruction {
         }
         // The per-level cost of the ramp, which the sends themselves could not report: for
         // this mode the fee belongs to a transaction a worker built after the 202 came back.
+        let mut incomplete = Vec::new();
         for level in &mut self.levels {
-            level.fees = fees_of(report.transactions.get(level.range()).unwrap_or_default()).total;
-            level.fees_source = fee_source::ENRICHMENT;
+            let fees = fees_of(report.transactions.get(level.range()).unwrap_or_default());
+            level.fees = fees.total;
+            level.fees_source = if fees.complete {
+                fee_source::ENRICHMENT
+            } else {
+                fee_source::ENRICHMENT_PARTIAL
+            };
+            if !fees.complete {
+                incomplete.push(level.n_concurrent);
+            }
         }
         report.note("levels", &self.levels);
+        if !incomplete.is_empty() {
+            // Expected at the top of the ramp rather than a fault: enrichment prices a
+            // transaction through a payref it only gets once the payment confirmed, and S4
+            // runs a fixed budget with no retries precisely so that some sends do not. Said
+            // out loud because a level's cost is otherwise indistinguishable from a level
+            // that happened to be cheap.
+            report.note(
+                "fees_incomplete",
+                serde_json::json!({
+                    "levels": incomplete,
+                    "reason": "not every transaction at these levels has a fee against it, so \
+                               their fees are a floor rather than what the level cost",
+                }),
+            );
+        }
     }
 }
 
@@ -373,6 +398,66 @@ mod tests {
             report.notes["levels"][0]["fees_source"],
             fee_source::ENRICHMENT
         );
+    }
+
+    #[test]
+    fn a_level_enrichment_could_not_fully_price_says_so() {
+        // One of the two transactions came back without a fee — an unconfirmed send at the top
+        // of the ramp has no payref to price it through. 70 µT is then the least this level
+        // cost, and calling it `enrichment` would publish it as the whole bill.
+        let mut timed_out = level(2);
+        timed_out.tally = TxTally {
+            confirmed: 1,
+            timed_out: 1,
+            ..TxTally::default()
+        };
+        let mut scenario = ConcurrentConstruction {
+            levels: vec![timed_out],
+            fees_known_at_send: false,
+        };
+        let mut report = ScenarioReport::new(scenario.id(), PAYMENT_PROCESSOR);
+        report.transactions = vec![confirmed(70), TxMetric {
+            label: "s4-n8-tx1".to_string(),
+            outcome: TxOutcome::TimedOut,
+            ..TxMetric::default()
+        }];
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["levels"][0]["fees"], 70);
+        assert_eq!(
+            report.notes["levels"][0]["fees_source"],
+            fee_source::ENRICHMENT_PARTIAL
+        );
+        assert_eq!(report.notes["fees_incomplete"]["levels"][0], 8);
+    }
+
+    #[test]
+    fn a_send_that_never_reached_the_network_is_not_a_missing_fee() {
+        // A failed send paid nothing, so the level is fully priced despite its zero.
+        let mut failed_one = level(2);
+        failed_one.tally = TxTally {
+            confirmed: 1,
+            failed: 1,
+            ..TxTally::default()
+        };
+        let mut scenario = ConcurrentConstruction {
+            levels: vec![failed_one],
+            fees_known_at_send: false,
+        };
+        let mut report = ScenarioReport::new(scenario.id(), PAYMENT_PROCESSOR);
+        report.transactions = vec![confirmed(70), TxMetric {
+            label: "s4-n8-tx1".to_string(),
+            outcome: TxOutcome::Failed,
+            ..TxMetric::default()
+        }];
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["levels"][0]["fees"], 70);
+        assert_eq!(
+            report.notes["levels"][0]["fees_source"],
+            fee_source::ENRICHMENT
+        );
+        assert!(!report.notes.contains_key("fees_incomplete"));
     }
 
     #[test]

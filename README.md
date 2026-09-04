@@ -276,6 +276,11 @@ These are findings, recorded in every mode 3 scenario report under `mode_finding
    from, and where S5's `fee_multiplier` — the answer to "does batching save fees", and the
    reason the scenario exists — is computed. Checked against the fee reported at send time they
    would all be zero, and S1 would fail every round of the one mode the comparison is about.
+   A `payref` only exists once a payment has confirmed, so a scenario that ended with a payment
+   still in flight gets some of its fees back and not others. Every figure derived from a fee
+   therefore carries a `fees_source`, and `enrichment_incomplete` means the total beside it is a
+   floor: S1 skips value conservation for that round, S4 names the levels it applies to, and S5
+   withholds `fee_multiplier` rather than divide one floor by another.
 4. The daemon has no unspent-output endpoint — `lock_funds` is the only place raw UTXOs appear
    in its API, and calling that to read a balance would reserve funds. The harness reads the
    daemon's `outputs` table directly instead (SQLite in WAL mode, read-only connection).

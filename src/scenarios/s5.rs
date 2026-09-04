@@ -21,6 +21,7 @@ use crate::{
             fees_of,
             send_recorded,
             wait_until_spendable,
+            Fees,
             Pending,
             SpendRequirement,
             TxTally,
@@ -35,6 +36,9 @@ use crate::{
 struct ArmResult {
     duration_secs: f64,
     fees: u64,
+    /// False when a transaction this arm broadcast has no fee against it, which makes `fees` a
+    /// floor: the arm cost at least that, and nothing may be divided by it.
+    fees_complete: bool,
     tally: TxTally,
     blocks_consumed: u64,
     txs: usize,
@@ -58,6 +62,13 @@ impl ArmResult {
 
     fn range(&self) -> std::ops::Range<usize> {
         self.tx_index_start..self.tx_index_end
+    }
+
+    /// Takes both halves of a fee figure, so a total can never be stored without what says
+    /// whether it is one.
+    fn record_fees(&mut self, fees: Fees) {
+        self.fees = fees.total;
+        self.fees_complete = fees.complete;
     }
 }
 
@@ -203,15 +214,17 @@ impl Scenario for PaymentThroughput {
         // "does batching save fees", and until enrichment has read the fees off the chain
         // both arms cost zero and the comparison is never published.
         if let Some(batch) = &mut arms.batch {
-            batch.fees = fees_of(report.transactions.get(batch.range()).unwrap_or_default()).total;
+            batch.record_fees(fees_of(
+                report.transactions.get(batch.range()).unwrap_or_default(),
+            ));
         }
-        arms.individual.fees = fees_of(
+        let individual = fees_of(
             report
                 .transactions
                 .get(arms.individual.range())
                 .unwrap_or_default(),
-        )
-        .total;
+        );
+        arms.individual.record_fees(individual);
         publish_arm_notes(arms, report, fee_source::ENRICHMENT);
     }
 }
@@ -239,6 +252,16 @@ fn publish_arm_notes(arms: &Arms, report: &mut ScenarioReport, fees_source: &'st
 
     #[allow(clippy::cast_precision_loss)]
     let per_recipient = |fees: u64| fees as f64 / f64::from(arms.recipients);
+    // "Recovered from the chain" is a claim about every transaction in the arm. An arm that
+    // enrichment could only price part of gets the label that says so, exactly as S1's rounds
+    // do, so `fees` and `fee_per_recipient` next to it read as the floors they are.
+    let source_of = |arm: &ArmResult| {
+        if fees_source == fee_source::ENRICHMENT && !arm.fees_complete {
+            fee_source::ENRICHMENT_PARTIAL
+        } else {
+            fees_source
+        }
+    };
     let individual = &arms.individual;
     report.note("recipients", arms.recipients);
     report.note("outputs_per_batch_tx", arms.outputs_per_batch_tx);
@@ -254,7 +277,8 @@ fn publish_arm_notes(arms: &Arms, report: &mut ScenarioReport, fees_source: &'st
                 "outputs_per_tx": arms.outputs_per_batch_tx,
                 "duration_secs": batch.duration_secs,
                 "fees": batch.fees,
-                "fees_source": fees_source,
+                "fees_source": source_of(batch),
+                "fees_complete": batch.fees_complete,
                 "fee_per_recipient": per_recipient(batch.fees),
                 "blocks_consumed": batch.blocks_consumed,
                 "tally": batch.tally,
@@ -271,7 +295,8 @@ fn publish_arm_notes(arms: &Arms, report: &mut ScenarioReport, fees_source: &'st
             "outputs_per_tx": 1,
             "duration_secs": individual.duration_secs,
             "fees": individual.fees,
-            "fees_source": fees_source,
+            "fees_source": source_of(individual),
+            "fees_complete": individual.fees_complete,
             "fee_per_recipient": per_recipient(individual.fees),
             "blocks_consumed": individual.blocks_consumed,
             "tally": individual.tally,
@@ -299,21 +324,41 @@ fn publish_arm_notes(arms: &Arms, report: &mut ScenarioReport, fees_source: &'st
             individual.duration_secs / batch.duration_secs,
         );
     }
-    if batch.fees > 0 {
-        report.note(
-            "fee_multiplier",
-            #[allow(clippy::cast_precision_loss)]
-            {
-                individual.fees as f64 / batch.fees as f64
-            },
-        );
-    } else {
+    if batch.fees == 0 {
         // Zero here is "not known yet" for a mode whose fees arrive with enrichment, and "no
         // transaction was priced" for one whose fees do not. Either way the ratio would be a
         // division by zero, and the reason it is missing belongs in the profile.
         report.note(
             "fee_comparison_withheld",
             format!("the batch arm has no fee recorded against it (fees_source {fees_source})"),
+        );
+    } else if !(batch.fees_complete && individual.fees_complete) {
+        // A floor divided by a floor is not a ratio, and this ratio is the number the whole
+        // scenario exists to produce. Which way it would be wrong is not even knowable: a
+        // missing batch fee overstates the saving and a missing individual fee understates it,
+        // so the ratio is withheld rather than published with a caveat. Checked whatever the
+        // fees' source, because a fee the sends themselves failed to report is as much a floor
+        // as one enrichment could not recover.
+        report.note(
+            "fee_comparison_withheld",
+            format!(
+                "{} has a transaction with no fee against it, so that arm's total is a floor \
+                 rather than what it cost; a ratio of floors would not say whether batching is \
+                 cheaper (fees_source {fees_source})",
+                match (batch.fees_complete, individual.fees_complete) {
+                    (false, false) => "neither arm",
+                    (false, true) => "the batch arm",
+                    _ => "the individual arm",
+                }
+            ),
+        );
+    } else {
+        report.note(
+            "fee_multiplier",
+            #[allow(clippy::cast_precision_loss)]
+            {
+                individual.fees as f64 / batch.fees as f64
+            },
         );
     }
 }
@@ -383,9 +428,11 @@ async fn run_arm(
     let duration_secs = arm_started.elapsed().as_secs_f64();
     let tip_end = ctx.chain.tip_height().await.unwrap_or(tip_start);
     let metrics = &report.transactions[first_index..];
+    let fees = fees_of(metrics);
     let result = ArmResult {
         duration_secs,
-        fees: fees_of(metrics).total,
+        fees: fees.total,
+        fees_complete: fees.complete,
         tally: TxTally::of(metrics),
         blocks_consumed: tip_end.saturating_sub(tip_start),
         txs: metrics.len(),
@@ -411,6 +458,7 @@ mod tests {
         ArmResult {
             duration_secs: 1.0,
             fees: 0,
+            fees_complete: false,
             tally: TxTally {
                 confirmed,
                 failed,
@@ -500,7 +548,70 @@ mod tests {
         assert_eq!(report.notes["arm_b_individual"]["fees"], 160);
         assert_eq!(report.notes["arm_b_individual"]["fee_per_recipient"], 40.0);
         assert_eq!(report.notes["fee_multiplier"], 1.6);
+        assert_eq!(report.notes["arm_a_batch"]["fees_complete"], true);
         assert!(!report.notes.contains_key("fee_comparison_withheld"));
+    }
+
+    #[test]
+    fn a_multiplier_is_not_computed_from_a_fee_enrichment_could_only_partly_recover() {
+        let (mut scenario, mut report) = after_a_deferred_run();
+        // Everything priced except one of the four individual sends. Taken at face value that
+        // reads as batching being 1.2x cheaper; the real ratio, once the missing 40 µT is
+        // counted, is 1.6x. The undercount is the whole finding.
+        for (index, metric) in report.transactions.iter_mut().enumerate() {
+            metric.fee = match index {
+                0 | 1 => 50,
+                5 => 0,
+                _ => 40,
+            };
+        }
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["arm_b_individual"]["fees"], 120);
+        assert_eq!(
+            report.notes["arm_b_individual"]["fees_source"],
+            fee_source::ENRICHMENT_PARTIAL
+        );
+        assert_eq!(report.notes["arm_b_individual"]["fees_complete"], false);
+        // The batch arm was priced in full, so it keeps the label that says so.
+        assert_eq!(
+            report.notes["arm_a_batch"]["fees_source"],
+            fee_source::ENRICHMENT
+        );
+        assert!(
+            !report.notes.contains_key("fee_multiplier"),
+            "1.2x is not the answer, and neither is any other number derived from a floor"
+        );
+        let withheld = report.notes["fee_comparison_withheld"].as_str().unwrap();
+        assert!(
+            withheld.contains("the individual arm"),
+            "the profile has to name the arm that is short: {withheld}"
+        );
+    }
+
+    #[test]
+    fn an_arm_missing_a_fee_is_still_reported_as_the_floor_it_is() {
+        // Withholding the ratio is not the same as withholding the arm: what was recovered is
+        // still worth having, as long as nothing reads it as the total.
+        let (mut scenario, mut report) = after_a_deferred_run();
+        report.transactions[0].fee = 50;
+        for metric in report.transactions.iter_mut().skip(2) {
+            metric.fee = 40;
+        }
+        scenario.finalise(&mut report);
+
+        assert_eq!(report.notes["arm_a_batch"]["fees"], 50);
+        assert_eq!(report.notes["arm_a_batch"]["fee_per_recipient"], 12.5);
+        assert_eq!(report.notes["arm_a_batch"]["fees_complete"], false);
+        assert_eq!(
+            report.notes["arm_a_batch"]["fees_source"],
+            fee_source::ENRICHMENT_PARTIAL
+        );
+        assert!(!report.notes.contains_key("fee_multiplier"));
+        assert!(report.notes["fee_comparison_withheld"]
+            .as_str()
+            .unwrap()
+            .contains("the batch arm"));
     }
 
     #[test]

@@ -1363,6 +1363,9 @@ impl WalletMode for PaymentProcessor {
     }
 
     async fn enrich(&self, report: &mut ScenarioReport) -> Result<()> {
+        // What the scenario reconciled against. Every fee found below is one it could not
+        // have known, so the expectation has to move with them.
+        let fees_before = report.fees_paid;
         let mut enriched = 0u32;
         let mut fees = 0u64;
         for metric in &mut report.transactions {
@@ -1445,7 +1448,7 @@ impl WalletMode for PaymentProcessor {
         }
 
         if enriched > 0 {
-            report.fees_paid = report.total_recorded_fees();
+            report.account_for_late_fees(fees_before);
             report.note("enriched_transactions", enriched);
             report.note("enriched_fees", fees);
             report.note(

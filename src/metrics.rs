@@ -331,6 +331,29 @@ impl ScenarioReport {
         self.balance_delta = Some(i128::from(expected) - i128::from(self.balance_end));
     }
 
+    /// Re-reconciles after fees that were not knowable while the scenario ran.
+    ///
+    /// Every scenario reconciles its closing balance against `something - fees`, and does so
+    /// before it returns. `payment_processor` does not know a single fee at that point: the
+    /// processor reports none, and the transaction only becomes readable off the chain once
+    /// its payment has confirmed and a `payref` exists. Without this the whole of that mode's
+    /// fee spend would show up as an unexplained balance shortfall in every sending scenario.
+    ///
+    /// `fees_before` is what `fees_paid` held when the scenario reconciled. The expectation
+    /// moves down by whatever the enrichment discovered on top of that, and the delta is
+    /// recomputed against the balance that was already read.
+    pub fn account_for_late_fees(&mut self, fees_before: u64) {
+        let discovered = self.total_recorded_fees();
+        self.fees_paid = discovered;
+        let extra = discovered.saturating_sub(fees_before);
+        if extra == 0 {
+            return;
+        }
+        if let Some(expected) = self.expected_balance_end {
+            self.reconcile(expected.saturating_sub(extra));
+        }
+    }
+
     /// Sum of fees over the recorded transactions.
     pub fn total_recorded_fees(&self) -> u64 {
         self.transactions.iter().map(|t| t.fee).sum()
@@ -672,6 +695,16 @@ impl ResultProfile {
             "\n  infra = failures from the harness's own plumbing (database pool, locks). Any \
              above zero\n  make that row's numbers suspect."
         );
+        // A mode that acknowledges a send before it builds anything has no construction time
+        // to report, and the column would otherwise read as one.
+        if self.reports.iter().any(construction_unobservable) {
+            let _ = writeln!(
+                out,
+                "  median build = time to accept the work, not to construct a transaction, for \
+                 any mode that\n  acknowledges a send before it builds it (see \
+                 `construction_is_observable` in the notes)."
+            );
+        }
         let _ = writeln!(out);
     }
 
@@ -689,6 +722,15 @@ impl ResultProfile {
         }
         let _ = writeln!(out);
     }
+}
+
+/// Whether a report came from a mode that cannot see when construction finished.
+fn construction_unobservable(report: &ScenarioReport) -> bool {
+    report
+        .notes
+        .get("construction_is_observable")
+        .and_then(Value::as_bool)
+        .is_some_and(|observable| !observable)
 }
 
 /// The processes a scan's resource figures were attributed to, headline first.
@@ -940,6 +982,78 @@ mod tests {
         s5.note("t_individual_secs", 360.0);
         s5.note("comparison_withheld", "batch confirmed 0 of 10");
         assert!(compute_deltas(&[s5]).is_empty());
+    }
+
+    #[test]
+    fn fees_discovered_after_the_scenario_move_the_expectation_rather_than_the_balance() {
+        // What a payment processor scenario looks like when it returns: the transactions
+        // confirmed, but not one fee is known, so the scenario reconciled against a spend of
+        // zero fees and the closing balance looks short by exactly the fees.
+        let mut report = ScenarioReport::new("S1", "payment_processor");
+        report.balance_start = 10_000;
+        report.balance_end = 9_700;
+        report.reconcile(10_000);
+        assert_eq!(
+            report.balance_delta,
+            Some(300),
+            "the fees look like a shortfall"
+        );
+
+        report.transactions.push(TxMetric {
+            fee: 200,
+            ..TxMetric::default()
+        });
+        report.transactions.push(TxMetric {
+            fee: 100,
+            ..TxMetric::default()
+        });
+        report.account_for_late_fees(0);
+
+        assert_eq!(report.fees_paid, 300);
+        assert_eq!(report.expected_balance_end, Some(9_700));
+        assert_eq!(report.balance_delta, Some(0), "the shortfall was the fees");
+    }
+
+    #[test]
+    fn a_mode_that_already_knew_its_fees_is_left_alone() {
+        let mut report = ScenarioReport::new("S1", "new_wallet");
+        report.transactions.push(TxMetric {
+            fee: 300,
+            ..TxMetric::default()
+        });
+        report.fees_paid = 300;
+        report.balance_end = 9_700;
+        report.reconcile(9_700);
+        report.account_for_late_fees(300);
+        assert_eq!(report.expected_balance_end, Some(9_700));
+        assert_eq!(report.balance_delta, Some(0));
+    }
+
+    #[test]
+    fn late_fees_on_a_scenario_that_never_reconciled_only_update_the_total() {
+        let mut report = ScenarioReport::new("B0", "payment_processor");
+        report.transactions.push(TxMetric {
+            fee: 42,
+            ..TxMetric::default()
+        });
+        report.account_for_late_fees(0);
+        assert_eq!(report.fees_paid, 42);
+        assert_eq!(report.expected_balance_end, None);
+        assert_eq!(report.balance_delta, None);
+    }
+
+    #[test]
+    fn a_mode_that_cannot_time_construction_is_flagged_in_the_transaction_table() {
+        let mut report = ScenarioReport::new("S4", "payment_processor");
+        report.transactions.push(TxMetric::default());
+        assert!(
+            !construction_unobservable(&report),
+            "no note means the usual case"
+        );
+        report.note("construction_is_observable", false);
+        assert!(construction_unobservable(&report));
+        report.note("construction_is_observable", true);
+        assert!(!construction_unobservable(&report));
     }
 
     #[test]

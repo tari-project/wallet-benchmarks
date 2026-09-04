@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use log::{info, warn};
 
 use crate::{
+    binaries::{BinaryVersion, PinnedBinary},
     chain::ChainClient,
     config::HarnessConfig,
     metrics::{Outcome, ResultProfile, ScenarioReport, Versions, MINOTARI_CLI_REV},
@@ -34,6 +35,46 @@ pub fn build_mode(
     }
 }
 
+/// The binaries a mode spawns, and the version each has to report.
+///
+/// `new_wallet` spawns nothing: it is the `minotari` crate linked into this process, and the
+/// git revision recorded in [`MINOTARI_CLI_REV`] is what identifies it. `payment_processor`'s
+/// own binary is missing from this list on purpose — it takes no arguments at all, so the
+/// only way to ask it for its version is `GET /health/version` once it is running, which the
+/// mode does at spawn.
+pub fn pinned_binaries(label: &str, cfg: &HarnessConfig) -> Vec<PinnedBinary> {
+    match label {
+        OLD_WALLET => vec![PinnedBinary::new(
+            "minotari_console_wallet",
+            cfg.old_wallet.binary.clone(),
+            &cfg.pins.console_wallet,
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// Checks every binary the requested modes will spawn before anything is measured.
+///
+/// Deliberately up front rather than at the point of use: finding out an hour into a genesis
+/// scan that the payment processor's signer is the wrong build wastes the run, and a profile
+/// that names a version it never verified is worse than no profile.
+pub fn verify_pinned_binaries(cfg: &HarnessConfig, modes: &[String]) -> Result<Vec<BinaryVersion>> {
+    let mut observed = Vec::new();
+    for mode in modes {
+        for binary in pinned_binaries(mode, cfg) {
+            let version = binary.verify()?;
+            info!("[{mode}] {} reports `{}`", version.label, version.reported);
+            if !observed
+                .iter()
+                .any(|v: &BinaryVersion| v.label == version.label)
+            {
+                observed.push(version);
+            }
+        }
+    }
+    Ok(observed)
+}
+
 /// Creates any missing seeds for the requested modes and returns the book.
 pub fn prepare_seeds(cfg: &HarnessConfig, modes: &[String]) -> Result<SeedBook> {
     let network = cfg.tari_network()?;
@@ -53,6 +94,10 @@ pub async fn run(
     modes: &[String],
     scenario_ids: &[String],
 ) -> Result<ResultProfile> {
+    // Before anything is measured: every binary the run will spawn has to be the one the
+    // profile is about to claim it was.
+    let mut binaries = verify_pinned_binaries(&cfg, modes)?;
+
     let chain = ChainClient::new(&cfg.base_node_url)?;
     let tip = chain
         .tip_height()
@@ -139,6 +184,13 @@ pub async fn run(
         if mode_label == OLD_WALLET {
             console_wallet_version = mode.version().await.ok().flatten();
         }
+        // Versions that could only be read from a running process — the payment processor
+        // takes no `--version` flag — are collected here rather than up front.
+        for version in mode.runtime_versions().await {
+            if !binaries.iter().any(|v| v.label == version.label) {
+                binaries.push(version);
+            }
+        }
         if let Err(e) = mode.shutdown().await {
             warn!("[{mode_label}] shutdown reported: {e:#}");
         }
@@ -148,6 +200,7 @@ pub async fn run(
         harness: env!("CARGO_PKG_VERSION").to_string(),
         console_wallet: console_wallet_version,
         minotari_cli_rev: MINOTARI_CLI_REV.to_string(),
+        binaries,
         base_node_url: cfg.base_node_url.clone(),
         base_node_synced: synced,
     };
@@ -227,6 +280,7 @@ mod tests {
                 harness: "test".to_string(),
                 console_wallet: None,
                 minotari_cli_rev: MINOTARI_CLI_REV.to_string(),
+                binaries: Vec::new(),
                 base_node_url: cfg.base_node_url.clone(),
                 base_node_synced: Some(true),
             },

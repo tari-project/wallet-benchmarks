@@ -37,7 +37,7 @@ minotari_app_grpc = { version = "5.6.0-pre.1", default-features = false }
 tonic = { version = "0.13.1", features = ["tls-ring"] }
 
 # --- new wallet (minotari-cli) : library ------------------------------------
-minotari = { git = "https://github.com/tari-project/minotari-cli", rev = "84c79e9c0f322746ad089e6f09241dced3198aa2" }
+minotari = { git = "https://github.com/tari-project/minotari-cli", rev = "60fde7b39e20a9d92c3b987a25eb636bf4da2722" }
 # Same version the wallet library uses, so the pooled connections are the same type. Needed
 # for one narrow query the library cannot answer; see `modes::new_wallet::output_depth`.
 rusqlite = { version = "0.37", features = ["bundled"] }

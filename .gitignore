@@ -3,3 +3,12 @@
 /benchmark.toml
 *.log
 .DS_Store
+# Wallet binaries are built, not committed. `tools/fetch.sh` builds each one at its pinned
+# revision and the harness asserts the version it reports before a run starts, which is a
+# guard a committed 46 MB blob never was: a blob says nothing about which revision produced
+# it and cannot be rebuilt from this repository.
+/tools/*
+!/tools/*.sh
+!/tools/README.md
+# Checkouts fetch.sh clones to build from.
+/tools/src

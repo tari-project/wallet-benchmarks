@@ -267,6 +267,16 @@ pub trait WalletMode: Send + Sync {
     /// Version of the wallet under test, if it can report one.
     async fn version(&self) -> Result<Option<String>>;
 
+    /// Versions that could only be read from a process while it was running.
+    ///
+    /// Most binaries answer `--version` and are checked before the run starts
+    /// ([`crate::binaries`]). The payment processor takes no arguments at all, so its version
+    /// is only reachable over HTTP once it is up, and it is collected here instead. Returns
+    /// an empty list for a mode with nothing extra to add.
+    async fn runtime_versions(&self) -> Vec<crate::binaries::BinaryVersion> {
+        Vec::new()
+    }
+
     /// Wipes the wallet data directory and starts the wallet on `seed` from `birthday`.
     ///
     /// This does not wait for the scan to finish; [`WalletMode::sync_to_tip`] does. The old

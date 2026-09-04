@@ -13,6 +13,7 @@
 //! Stalls, lock contention and construction failures are results, not problems to engineer
 //! around.
 
+pub mod binaries;
 pub mod chain;
 pub mod config;
 pub mod metrics;

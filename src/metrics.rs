@@ -13,7 +13,14 @@ use serde_json::Value;
 use crate::{config::HarnessConfig, sysprobe::EnvironmentInfo};
 
 /// Git revision of `minotari-cli` this harness is pinned to. Keep in step with `Cargo.toml`.
-pub const MINOTARI_CLI_REV: &str = "84c79e9c0f322746ad089e6f09241dced3198aa2";
+///
+/// Bumped from `84c79e9c` to current main. The five intervening commits are all
+/// transaction-reservation and idempotency fixes — atomic send idempotency, replayed sends no
+/// longer tearing down or double-spending a reservation, teardown guarded on the reservation
+/// still being pending, and the unlocker kept off claimed rows. That is exactly the ground S4
+/// stresses, so `new_wallet`'s S4 numbers are expected to move against any profile taken on
+/// the old pin.
+pub const MINOTARI_CLI_REV: &str = "60fde7b39e20a9d92c3b987a25eb636bf4da2722";
 
 /// How a scenario ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +349,13 @@ pub struct Versions {
     pub console_wallet: Option<String>,
     /// Git revision of `minotari-cli` linked into this harness.
     pub minotari_cli_rev: String,
+    /// Every spawned binary, the version it reported and the pin it was checked against.
+    ///
+    /// This is what makes the profile reproducible: a reader can rebuild each binary at the
+    /// recorded version and get the same software back. An entry with `pinned: false` is one
+    /// the operator switched the assertion off for.
+    #[serde(default)]
+    pub binaries: Vec<crate::binaries::BinaryVersion>,
     pub base_node_url: String,
     pub base_node_synced: Option<bool>,
 }

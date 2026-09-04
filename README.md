@@ -41,8 +41,17 @@ locks itself out or rejects a transaction under load is measured doing so.
   protobuf-compiler`) — the gRPC client is generated at build time.
 * A synced Tari base node reachable over HTTP RPC. The public Esmeralda gateway
   (`https://rpc.esmeralda.tari.com`) works; a local node gives much less noisy scan numbers.
-* A `minotari_console_wallet` binary for `old_wallet`. Build it from
-  [tari](https://github.com/tari-project/tari) or use a release binary, and record which.
+* The wallet binaries, built at their pinned revisions by `tools/fetch.sh`:
+
+  ```bash
+  ./tools/fetch.sh                    # all of them
+  ./tools/fetch.sh console_wallet     # or one at a time
+  ```
+
+  Nothing is committed. Each binary's version is asserted against the `[pins]` section of
+  `benchmark.toml` before a run starts, and every version observed is recorded in the profile,
+  so a profile always names the software that produced it. A binary reporting the wrong version
+  refuses the run rather than quietly producing a profile that claims a pin it never had.
 * Funds on Esmeralda: one UTXO of at least `A_fund` (10,000 tXTM by default) per mode.
 
 ## Running it
@@ -258,7 +267,15 @@ cargo clippy --all-targets
 ```
 
 The `minotari-cli` dependency is pinned to a git revision in `Cargo.toml`;
-`metrics::MINOTARI_CLI_REV` records the same revision in every profile. Change both together.
+`metrics::MINOTARI_CLI_REV` and `tools/fetch.sh` record the same revision, and every profile
+carries it. Change all three together.
+
+The pin is currently `60fde7b3`, bumped from `84c79e9c`. The five intervening commits are all
+transaction-reservation and idempotency fixes — atomic send idempotency, a replayed send no
+longer tearing down or double-spending a reservation, teardown guarded on the reservation still
+being pending, and the unlocker kept off claimed rows. That is precisely the ground S4 stresses
+under concurrency, so **expect `new_wallet`'s S4 numbers to move** against any profile taken on
+the old pin. The two are not comparable.
 
 ## Licence
 

@@ -30,6 +30,8 @@ pub struct HarnessConfig {
     pub old_wallet: OldWalletConfig,
     /// New wallet (`minotari-cli` library) settings.
     pub new_wallet: NewWalletConfig,
+    /// Versions every spawned binary has to report before a run starts.
+    pub pins: Pins,
     /// Test protocol parameters. These are the knobs the issue specifies.
     pub params: Params,
 }
@@ -45,7 +47,44 @@ impl Default for HarnessConfig {
             password_env: "HARNESS_WALLET_PW".to_string(),
             old_wallet: OldWalletConfig::default(),
             new_wallet: NewWalletConfig::default(),
+            pins: Pins::default(),
             params: Params::default(),
+        }
+    }
+}
+
+/// The version string each spawned binary has to report before a run starts.
+///
+/// The reproducibility criterion needs a real guard. Checking the version at start-up, and
+/// recording what every binary reported, is what makes a profile say which software produced
+/// it; `tools/fetch.sh` builds each binary at the revision these versions correspond to.
+///
+/// The check is a substring match, and an empty string switches it off for that binary — the
+/// profile then records `pinned: false` against it rather than claiming a pin that was never
+/// checked. See [`crate::binaries`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pins {
+    /// `minotari_console_wallet --version`, for `old_wallet`.
+    pub console_wallet: String,
+    /// `minotari --version`, the payment receiver daemon `payment_processor` drives. Prints
+    /// `tari <version>`, because its clap command is named `tari`.
+    pub minotari: String,
+    /// `GET /health/version` on the payment processor. The binary takes no arguments at all,
+    /// so this one can only be checked once the process is up.
+    pub payment_processor: String,
+    /// `minotari_offline_signer --version`. Must stay on a tari revision that speaks
+    /// offline-signing payload format 4.0.0; see the README's mode 3 section.
+    pub offline_signer: String,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Self {
+            console_wallet: "5.6.0-pre.1".to_string(),
+            minotari: "0.2.0".to_string(),
+            payment_processor: "0.1.0".to_string(),
+            offline_signer: "5.3.0-pre.3".to_string(),
         }
     }
 }
@@ -153,7 +192,17 @@ pub struct Params {
     pub s5_m: u32,
     /// Outputs per batch transaction in S5.
     pub s5_k: u32,
-    /// Fee rate (µT per gram) passed explicitly to every mode.
+    /// Fee rate (µT per gram) every mode is run at.
+    ///
+    /// One value for all three, or the modes cannot be compared. It is 5 rather than the
+    /// protocol minimum of 1 because 5 is what the `minotari` daemon and the payment
+    /// processor both default to (`FEE_PER_GRAM`), and because a fee of 1 has been measured
+    /// taking about an hour to mine on Esmeralda against minutes at 5 — a scenario budget
+    /// spent waiting for a miner is not a measurement of a wallet.
+    ///
+    /// `old_wallet` and `new_wallet` are handed this per request. `payment_processor` is not:
+    /// the processor takes its fee from `FEE_PER_GRAM` in its own environment, so the harness
+    /// sets that variable from this value at spawn and refuses to start if the two disagree.
     pub fee_rate: u64,
     /// Amount sent per output in S4, in µT.
     pub s4_amount: u64,
@@ -574,6 +623,46 @@ mod tests {
         assert_eq!(cfg.params.c_min, 3);
         assert_eq!(cfg.params.expected_utxos_after_s1(), 64);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_version_pins_round_trip_and_default_to_the_shipped_revisions() {
+        let cfg = HarnessConfig::default();
+        assert_eq!(cfg.pins.console_wallet, "5.6.0-pre.1");
+        assert_eq!(cfg.pins.minotari, "0.2.0");
+        assert_eq!(cfg.pins.offline_signer, "5.3.0-pre.3");
+        assert_eq!(cfg.pins.payment_processor, "0.1.0");
+
+        // A pin may be switched off, one binary at a time.
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+            network = "esmeralda"
+
+            [pins]
+            minotari = ""
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.pins.minotari.is_empty());
+        assert_eq!(
+            cfg.pins.console_wallet, "5.6.0-pre.1",
+            "switching one pin off must not clear the others"
+        );
+    }
+
+    #[test]
+    fn the_example_config_is_the_one_the_harness_defaults_to() {
+        // The committed template is what a third party copies to reproduce a run, so it may
+        // not drift from the reference defaults.
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark.example.toml"),
+        )
+        .unwrap();
+        let mut cfg: HarnessConfig = toml::from_str(&text).unwrap();
+        cfg.resolve_derived();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.params.fee_rate, 5);
+        assert_eq!(cfg.pins, Pins::default());
     }
 
     #[test]

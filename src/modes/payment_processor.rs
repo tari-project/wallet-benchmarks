@@ -836,6 +836,12 @@ impl PaymentProcessor {
     }
 
     /// Waits for a URL to answer with a body this harness can parse.
+    ///
+    /// Also watches the two child processes. A daemon that could not bind its port, or a
+    /// processor whose `.env` it rejected, exits within a second and then never answers —
+    /// waiting the whole start-up budget out and reporting a timeout would hide the reason
+    /// behind five minutes of silence, so the exit is detected and the process's own last
+    /// words are quoted instead.
     async fn wait_for<T: serde::de::DeserializeOwned>(&self, url: &str, what: &str) -> Result<T> {
         let deadline =
             Instant::now() + Duration::from_secs(self.cfg.payment_processor.startup_timeout_secs);
@@ -844,6 +850,11 @@ impl PaymentProcessor {
                 Ok(value) => return Ok(value),
                 Err(e) => format!("{e:#}"),
             };
+            if let Some(died) = self.exited_process().await? {
+                return Err(anyhow!(
+                    "{what} could not be started: {died}\nThe last request said: {last_error}"
+                ));
+            }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "Timed out after {}s waiting for {what} on {url}: {last_error}",
@@ -852,6 +863,37 @@ impl PaymentProcessor {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+    }
+
+    /// Describes whichever managed process has exited, with the tail of its log.
+    async fn exited_process(&self) -> Result<Option<String>> {
+        let mut inner = self.inner.lock().await;
+        let work_dir = inner.work_dir.clone();
+        // Checked one at a time: two `as_mut()` borrows of `inner` cannot be alive together,
+        // and the daemon is checked first because the processor cannot outlive it usefully.
+        let exited = match inner
+            .daemon
+            .as_mut()
+            .map(Child::try_wait)
+            .transpose()?
+            .flatten()
+        {
+            Some(status) => Some((PROCESS_DAEMON, "daemon.log", status)),
+            None => inner
+                .processor
+                .as_mut()
+                .map(Child::try_wait)
+                .transpose()?
+                .flatten()
+                .map(|status| (PROCESS_PAYMENT_PROCESSOR, "payment_processor.log", status)),
+        };
+        Ok(exited.map(|(label, log, status)| {
+            let tail = work_dir
+                .as_ref()
+                .map(|dir| tail_of(&dir.join(log), 15))
+                .unwrap_or_else(|| "No log was captured.".to_string());
+            format!("the {label} process exited with {status}.\n{tail}")
+        }))
     }
 
     /// Peak usage of both processes since the last time this was called, headline first.
@@ -1567,6 +1609,21 @@ impl PaymentProcessor {
     }
 }
 
+/// The last `lines` lines of a log file, for an error message that explains itself.
+fn tail_of(path: &Path, lines: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let tail: Vec<&str> = text.lines().rev().take(lines).collect();
+            format!(
+                "Last lines of {}:\n{}",
+                path.display(),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            )
+        },
+        Err(e) => format!("Could not read {}: {e}", path.display()),
+    }
+}
+
 /// Consecutive failed `scan_status` polls that mean the daemon is gone rather than busy.
 const DAEMON_UNRESPONSIVE_POLLS: u32 = 10;
 
@@ -2049,6 +2106,20 @@ mod tests {
         // A zero fee would be indistinguishable from a free transaction and would quietly
         // break every balance reconciliation that follows.
         assert!(decode_transaction(b"not json").is_err());
+    }
+
+    #[test]
+    fn a_log_tail_quotes_the_end_of_the_file_and_survives_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let tail = tail_of(&path, 2);
+        assert!(tail.contains("three\nfour"), "{tail}");
+        assert!(!tail.contains("one"), "{tail}");
+
+        // A process that died before it opened its log still has to produce a message.
+        let missing = tail_of(&dir.path().join("nope.log"), 5);
+        assert!(missing.contains("nope.log"), "{missing}");
     }
 
     #[test]

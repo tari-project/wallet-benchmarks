@@ -418,6 +418,17 @@ fn render_env_file(env: &[(String, String)]) -> String {
     out
 }
 
+/// Writes the `.env` and narrows it to its owner before anything else can read it.
+///
+/// This file carries the offline signer's keystore passphrase and the benchmark account's
+/// view key: whoever can read it can watch the account and sign for it. The seed book is
+/// already treated this way, and the `.env` holds the same class of secret.
+fn write_env_file(path: &Path, env: &[(String, String)]) -> Result<()> {
+    std::fs::write(path, render_env_file(env))
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    crate::secrets::restrict_file(path)
+}
+
 /// The network name the processor's `TARI_NETWORK` expects.
 ///
 /// It parses with `tari_common`'s `Network::from_str`, which is case-insensitive, so the
@@ -983,6 +994,9 @@ impl WalletMode for PaymentProcessor {
         }
         std::fs::create_dir_all(&work_dir)
             .with_context(|| format!("Could not create {}", work_dir.display()))?;
+        // The `.env`, the daemon's database and the signer's working files all land in here,
+        // and only this harness and the processes it spawns as the same user ever read them.
+        crate::secrets::restrict_dir(&work_dir)?;
         // The processor's embedded log4rs default writes a rolling appender to `logs/` under
         // its working directory, and log4rs does not create that directory itself.
         std::fs::create_dir_all(work_dir.join("logs"))?;
@@ -1056,7 +1070,7 @@ impl WalletMode for PaymentProcessor {
                 self.cfg.params.fee_rate
             ));
         }
-        std::fs::write(work_dir.join(".env"), render_env_file(&env))?;
+        write_env_file(&work_dir.join(".env"), &env)?;
 
         // --- daemon ---------------------------------------------------------------------
         let daemon_log = std::fs::File::create(work_dir.join("daemon.log"))?;
@@ -2018,6 +2032,35 @@ mod tests {
         let text = render_env_file(&[("FEE_PER_GRAM".to_string(), "5".to_string())]);
         assert!(text.contains("FEE_PER_GRAM=\"5\""));
         assert!(text.starts_with('#'), "the file has to explain itself");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_env_file_is_not_left_readable_by_the_rest_of_the_host() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let env: Vec<(String, String)> = render_pp_env(&test_config(), &PpEnvContext {
+            payments_db: PathBuf::from("/work/payments.db"),
+            daemon_url: "http://127.0.0.1:9000".to_string(),
+            offline_signer: PathBuf::from("tools/minotari_offline_signer"),
+            signer_passphrase: "the-signer-passphrase".to_string(),
+            view_key: "aa".to_string(),
+            public_spend_key: "bb".to_string(),
+        });
+        write_env_file(&path, &env).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The point of the mode: this file spends money and watches an account.
+        assert!(text.contains("the-signer-passphrase"));
+        assert!(text.contains("ACCOUNTS__BENCH__VIEW_KEY"));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the seed file is 0600 and this is the same secret"
+        );
     }
 
     #[test]

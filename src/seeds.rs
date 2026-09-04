@@ -150,7 +150,7 @@ impl SeedBook {
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(path, text)
             .with_context(|| format!("Could not write seed file {}", path.display()))?;
-        restrict_permissions(path)?;
+        crate::secrets::restrict_file(path)?;
         Ok(())
     }
 
@@ -266,18 +266,6 @@ pub fn generate_recipient_addresses(count: usize, network: Network) -> Result<Ve
             Ok(derive_one_sided_address(&words, network)?.to_base58())
         })
         .collect()
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

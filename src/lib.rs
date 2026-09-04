@@ -20,5 +20,6 @@ pub mod metrics;
 pub mod modes;
 pub mod runner;
 pub mod scenarios;
+pub mod secrets;
 pub mod seeds;
 pub mod sysprobe;

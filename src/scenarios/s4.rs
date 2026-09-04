@@ -15,10 +15,16 @@ use crate::{
     modes::{SendRequest, WalletMode},
     scenarios::{
         support::{
-            await_confirmations, distinct_errors, max_serialization_gap, wait_until_spendable, Pending,
-            SpendRequirement, TxTally,
+            await_confirmations,
+            distinct_errors,
+            max_serialization_gap,
+            wait_until_spendable,
+            Pending,
+            SpendRequirement,
+            TxTally,
         },
-        RunContext, Scenario,
+        RunContext,
+        Scenario,
     },
 };
 
@@ -34,7 +40,11 @@ impl Scenario for ConcurrentConstruction {
         "Fire N concurrent construct-and-broadcast calls per ramp level, with no retries"
     }
 
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let params = ctx.cfg.params.clone();
         let mut report = ScenarioReport::new(self.id(), mode.name());
         report.tip_height_start = ctx.chain.tip_height().await.unwrap_or(0);
@@ -136,7 +146,11 @@ impl Scenario for ConcurrentConstruction {
 
             // Let the wallet catch up before the next level, otherwise the ramp measures a
             // shrinking UTXO pool rather than concurrency.
-            let sync_error = mode.sync_to_tip(params.scan_timeout()).await.err().map(|e| e.to_string());
+            let sync_error = mode
+                .sync_to_tip(params.scan_timeout())
+                .await
+                .err()
+                .map(|e| e.to_string());
             let utxos_after = mode.unspent_amounts().await?.len() as u64;
 
             level_notes.push(json!({

@@ -150,7 +150,9 @@ pub enum TxState {
         /// heights. A round waits for both.
         wallet_confirmed: bool,
     },
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
 impl TxState {
@@ -279,8 +281,8 @@ mod tests {
         assert_eq!(
             balance.total(),
             3_999_852,
-            "value conservation is checked against the total, so a lagging `available` is not \
-             a missing balance"
+            "value conservation is checked against the total, so a lagging `available` is not a \
+             missing balance"
         );
     }
 

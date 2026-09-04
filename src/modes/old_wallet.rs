@@ -16,7 +16,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use minotari_app_grpc::tari_rpc::{
-    self as grpc, payment_recipient::PaymentType, wallet_client::WalletClient,
+    self as grpc,
+    payment_recipient::PaymentType,
+    wallet_client::WalletClient,
 };
 use tokio::{process::Child, sync::Mutex};
 use tonic::transport::Channel;
@@ -25,7 +27,16 @@ use crate::{
     chain::ChainClient,
     config::HarnessConfig,
     metrics::ScanMetrics,
-    modes::{Balance, Birthday, SendReceipt, SendRequest, TxState, TxTracker, WalletMode, OLD_WALLET},
+    modes::{
+        Balance,
+        Birthday,
+        SendReceipt,
+        SendRequest,
+        TxState,
+        TxTracker,
+        WalletMode,
+        OLD_WALLET,
+    },
     seeds::SeedEntry,
     sysprobe::ResourceSampler,
 };
@@ -114,7 +125,8 @@ impl OldWallet {
         if let Some(client) = &inner.client {
             return Ok(client.clone());
         }
-        let deadline = Instant::now() + Duration::from_secs(self.cfg.old_wallet.startup_timeout_secs);
+        let deadline =
+            Instant::now() + Duration::from_secs(self.cfg.old_wallet.startup_timeout_secs);
         let mut last_error = None;
         while Instant::now() < deadline {
             if let Some(child) = inner.child.as_mut() {
@@ -189,7 +201,11 @@ impl OldWallet {
     ///
     /// Returns whether it settled inside the deadline. A wallet that never stops moving is a
     /// result, not an error.
-    async fn wait_for_stable_utxo_set(&self, deadline: Instant, stable_for: Duration) -> Result<bool> {
+    async fn wait_for_stable_utxo_set(
+        &self,
+        deadline: Instant,
+        stable_for: Duration,
+    ) -> Result<bool> {
         let mut previous: Option<(usize, u64)> = None;
         let mut last_change = Instant::now();
         loop {
@@ -338,7 +354,8 @@ impl WalletMode for OldWallet {
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
-                    "Timed out waiting for the console wallet to reach the tip (wallet at {}, tip {})",
+                    "Timed out waiting for the console wallet to reach the tip (wallet at {}, tip \
+                     {})",
                     scanned_height,
                     tip
                 ));
@@ -397,13 +414,21 @@ impl WalletMode for OldWallet {
         let duration = started_at.elapsed();
         let validation_secs = duration.saturating_sub(scan_only).as_secs_f64();
         let tip_end = self.chain.tip_height().await?;
-        let outputs_found = self.unspent_amounts().await.map(|a| a.len() as u64).unwrap_or(0);
+        let outputs_found = self
+            .unspent_amounts()
+            .await
+            .map(|a| a.len() as u64)
+            .unwrap_or(0);
 
         let usage = {
             let mut inner = self.inner.lock().await;
             // Stop sampling here so the peaks describe the scan, not the idle wallet, and
             // start a fresh sampler so later scenarios still get numbers.
-            let usage = inner.sampler.take().map(ResourceSampler::stop).unwrap_or_default();
+            let usage = inner
+                .sampler
+                .take()
+                .map(ResourceSampler::stop)
+                .unwrap_or_default();
             let pid = inner.child.as_ref().and_then(Child::id);
             inner.sampler = Some(ResourceSampler::start(pid));
             usage
@@ -462,9 +487,9 @@ impl WalletMode for OldWallet {
             // inputs committed to unconfirmed outbound transactions, and the change from
             // those already shows up in `pending_incoming`, so adding it would double count
             // a transaction that is still in flight.
-            total: response.available_balance
-                + response.pending_incoming_balance
-                + response.timelocked_balance,
+            total: response.available_balance +
+                response.pending_incoming_balance +
+                response.timelocked_balance,
             available: response.available_balance,
             pending_incoming: response.pending_incoming_balance,
             pending_outgoing: response.pending_outgoing_balance,
@@ -576,17 +601,19 @@ impl WalletMode for OldWallet {
         // its confirmation rule.
         let wallet_confirmed = matches!(
             info.status,
-            STATUS_MINED_CONFIRMED
-                | STATUS_ONE_SIDED_CONFIRMED
-                | STATUS_MINED_CONFIRMED_LOCKED
-                | STATUS_ONE_SIDED_CONFIRMED_LOCKED
-                | STATUS_COINBASE_CONFIRMED
-                | STATUS_COINBASE_CONFIRMED_LOCKED
+            STATUS_MINED_CONFIRMED |
+                STATUS_ONE_SIDED_CONFIRMED |
+                STATUS_MINED_CONFIRMED_LOCKED |
+                STATUS_ONE_SIDED_CONFIRMED_LOCKED |
+                STATUS_COINBASE_CONFIRMED |
+                STATUS_COINBASE_CONFIRMED_LOCKED
         );
-        let mined = wallet_confirmed
-            || matches!(
+        let mined = wallet_confirmed ||
+            matches!(
                 info.status,
-                STATUS_MINED_UNCONFIRMED | STATUS_ONE_SIDED_UNCONFIRMED | STATUS_COINBASE_UNCONFIRMED
+                STATUS_MINED_UNCONFIRMED |
+                    STATUS_ONE_SIDED_UNCONFIRMED |
+                    STATUS_COINBASE_UNCONFIRMED
             );
         if !mined || info.mined_in_block_height == 0 {
             return Ok(TxState::Mempool);
@@ -610,7 +637,10 @@ mod tests {
     #[test]
     fn status_constants_match_the_wallet_proto() {
         // Guards against a silent renumbering of `TransactionStatus` in wallet.proto.
-        assert_eq!(grpc::TransactionStatus::MinedConfirmed as i32, STATUS_MINED_CONFIRMED);
+        assert_eq!(
+            grpc::TransactionStatus::MinedConfirmed as i32,
+            STATUS_MINED_CONFIRMED
+        );
         assert_eq!(
             grpc::TransactionStatus::OneSidedConfirmed as i32,
             STATUS_ONE_SIDED_CONFIRMED

@@ -18,10 +18,17 @@ use crate::{
     modes::{OutputSpec, SendRequest, WalletMode},
     scenarios::{
         support::{
-            await_confirmations, distinct_errors, send_recorded, split_value, wait_until_spendable,
-            Pending, SpendRequirement, TxTally,
+            await_confirmations,
+            distinct_errors,
+            send_recorded,
+            split_value,
+            wait_until_spendable,
+            Pending,
+            SpendRequirement,
+            TxTally,
         },
-        RunContext, Scenario,
+        RunContext,
+        Scenario,
     },
 };
 
@@ -38,7 +45,11 @@ impl Scenario for UtxoBuildUp {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let params = ctx.cfg.params.clone();
         let mut report = ScenarioReport::new(self.id(), mode.name());
         report.tip_height_start = ctx.chain.tip_height().await.unwrap_or(0);
@@ -90,7 +101,11 @@ impl Scenario for UtxoBuildUp {
                 halt = Some(format!(
                     "round {} needs {} spendable UTXOs; after {:.0}s the wallet offered {} \
                      (available {} µT)",
-                    round.round, round.txs, settled.secs, settled.spendable_utxos, settled.available
+                    round.round,
+                    round.txs,
+                    settled.secs,
+                    settled.spendable_utxos,
+                    settled.available
                 ));
                 break;
             }
@@ -162,7 +177,10 @@ impl Scenario for UtxoBuildUp {
 
             // Tip refresh, not a full rescan: the wallet only needs to see this round land.
             if let Err(e) = mode.sync_to_tip(params.scan_timeout()).await {
-                halt = Some(format!("round {} could not refresh wallet state: {e}", round.round));
+                halt = Some(format!(
+                    "round {} could not refresh wallet state: {e}",
+                    round.round
+                ));
                 break;
             }
 
@@ -212,9 +230,7 @@ impl Scenario for UtxoBuildUp {
             if tally.unsuccessful() > 0 {
                 halt = Some(format!(
                     "round {} did not land in full: {} of {} transactions confirmed",
-                    round.round,
-                    tally.confirmed,
-                    round.txs
+                    round.round, tally.confirmed, round.txs
                 ));
                 break;
             }

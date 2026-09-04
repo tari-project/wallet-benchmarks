@@ -374,13 +374,17 @@ impl HarnessConfig {
             ));
         }
         if p.concurrent_batches.is_empty() {
-            return Err(anyhow!("params.concurrent_batches must list at least one level"));
+            return Err(anyhow!(
+                "params.concurrent_batches must list at least one level"
+            ));
         }
         if p.concurrent_batches.contains(&0) {
             return Err(anyhow!("params.concurrent_batches may not contain zero"));
         }
         if p.s5_k == 0 || p.s5_m == 0 {
-            return Err(anyhow!("params.s5_m and params.s5_k must be greater than zero"));
+            return Err(anyhow!(
+                "params.s5_m and params.s5_k must be greater than zero"
+            ));
         }
         if !p.s5_m.is_multiple_of(p.s5_k) {
             return Err(anyhow!(
@@ -395,10 +399,15 @@ impl HarnessConfig {
             return Err(anyhow!(
                 "new_wallet.db_pool_size ({}) is below the {required_pool} needed for a peak \
                  concurrency of {} ({CONNECTIONS_PER_SEND} connections per send plus \
-                 {POOL_HEADROOM} spare); a pool this size deadlocks rather than queues. Set 0 \
-                 to derive it.",
+                 {POOL_HEADROOM} spare); a pool this size deadlocks rather than queues. Set 0 to \
+                 derive it.",
                 self.new_wallet.db_pool_size,
-                self.params.concurrent_batches.iter().copied().max().unwrap_or(1),
+                self.params
+                    .concurrent_batches
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(1),
             ));
         }
         // A send that queues for a connection longer than this fails with a pool error, so a
@@ -522,7 +531,10 @@ mod tests {
         cfg.params.s4_budget_secs = 5_400;
         cfg.new_wallet.db_checkout_timeout_secs = 1_200;
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("db_checkout_timeout_secs"), "unexpected error: {err}");
+        assert!(
+            err.contains("db_checkout_timeout_secs"),
+            "unexpected error: {err}"
+        );
 
         // Raising the pool's patience to match makes it valid again.
         cfg.new_wallet.db_checkout_timeout_secs = 6_000;

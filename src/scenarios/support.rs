@@ -122,7 +122,10 @@ pub async fn wait_until_spendable(
     loop {
         // Drive the wallet's own view forward; a library wallet does not move on its own.
         let _ = mode.refresh().await;
-        spendable_utxos = mode.spendable_amounts().await.map_or(spendable_utxos, |a| a.len() as u64);
+        spendable_utxos = mode
+            .spendable_amounts()
+            .await
+            .map_or(spendable_utxos, |a| a.len() as u64);
         available = mode.balance().await.map_or(available, |b| b.available);
 
         if spendable_utxos >= requirement.utxos && available >= requirement.amount {
@@ -158,7 +161,8 @@ pub async fn await_confirmations(
     poll: Duration,
     origin: Instant,
 ) {
-    let mut outstanding: HashMap<usize, TxTracker> = pending.iter().map(|p| (p.index, p.tracker)).collect();
+    let mut outstanding: HashMap<usize, TxTracker> =
+        pending.iter().map(|p| (p.index, p.tracker)).collect();
     let deadline = Instant::now() + budget;
 
     while !outstanding.is_empty() {
@@ -292,16 +296,17 @@ pub fn distinct_errors(metrics: &[TxMetric], n: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+
     use super::*;
     use crate::{
-        metrics::ScanMetrics,
+        metrics::{count_infrastructure_failures, ScanMetrics},
         modes::{Balance, Birthday, SendReceipt, WalletMode},
         seeds::SeedEntry,
     };
-    use crate::metrics::count_infrastructure_failures;
-    use anyhow::{anyhow, Result};
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A wallet whose view only moves when it is refreshed, and which will not spend or admit
     /// a confirmation until it has moved far enough. This is the shape of both real wallets:
@@ -376,7 +381,11 @@ mod tests {
         }
 
         async fn spendable_amounts(&self) -> Result<Vec<u64>> {
-            Ok(if self.ready() { vec![1_000, 1_000] } else { Vec::new() })
+            Ok(if self.ready() {
+                vec![1_000, 1_000]
+            } else {
+                Vec::new()
+            })
         }
 
         async fn send(&self, _request: SendRequest) -> Result<SendReceipt> {
@@ -505,7 +514,10 @@ mod tests {
 
     #[test]
     fn a_single_transaction_has_no_gap() {
-        assert_eq!(max_serialization_gap(&[metric(1.0, TxOutcome::Confirmed)]), 0.0);
+        assert_eq!(
+            max_serialization_gap(&[metric(1.0, TxOutcome::Confirmed)]),
+            0.0
+        );
         assert_eq!(max_serialization_gap(&[]), 0.0);
     }
 

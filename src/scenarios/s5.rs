@@ -15,10 +15,16 @@ use crate::{
     modes::{OutputSpec, SendRequest, WalletMode},
     scenarios::{
         support::{
-            await_confirmations, distinct_errors, send_recorded, wait_until_spendable, Pending,
-            SpendRequirement, TxTally,
+            await_confirmations,
+            distinct_errors,
+            send_recorded,
+            wait_until_spendable,
+            Pending,
+            SpendRequirement,
+            TxTally,
         },
-        RunContext, Scenario,
+        RunContext,
+        Scenario,
     },
 };
 
@@ -57,7 +63,11 @@ impl Scenario for PaymentThroughput {
         "Pay M recipients twice: once as M/K batch transactions, once as M individual sends"
     }
 
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let params = ctx.cfg.params.clone();
         let network = ctx.cfg.tari_network()?;
         let mut report = ScenarioReport::new(self.id(), mode.name());
@@ -170,9 +180,12 @@ impl Scenario for PaymentThroughput {
                 report.note(
                     "comparison_withheld",
                     format!(
-                        "batch confirmed {} of {} and individual {} of {}; a headline from an \
-                         arm that did not pay every recipient would be meaningless",
-                        batch.tally.confirmed, batch.txs, individual.tally.confirmed, individual.txs
+                        "batch confirmed {} of {} and individual {} of {}; a headline from an arm \
+                         that did not pay every recipient would be meaningless",
+                        batch.tally.confirmed,
+                        batch.txs,
+                        individual.tally.confirmed,
+                        individual.txs
                     ),
                 );
             }

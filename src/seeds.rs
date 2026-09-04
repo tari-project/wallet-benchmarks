@@ -28,7 +28,8 @@ use tari_common_types::{
 use tari_crypto::compressed_key::CompressedKey;
 use tari_transaction_components::key_manager::{
     wallet_types::{SeedWordsWallet, WalletType},
-    KeyManager, TransactionKeyManagerInterface,
+    KeyManager,
+    TransactionKeyManagerInterface,
 };
 
 /// Suffix of the never-funded wallet each mode uses for the B0 baseline scan.
@@ -61,8 +62,8 @@ impl SeedEntry {
     /// to a height, so this is not the same as [`SeedEntry::birthday_epoch_secs`] and using
     /// the latter would under-report `blocks_scanned` by the offset.
     pub fn scan_start_epoch_secs(&self, offset_days: u64) -> u64 {
-        BIRTHDAY_GENESIS_FROM_UNIX_EPOCH
-            + u64::from(self.birthday).saturating_sub(offset_days) * SECONDS_PER_DAY
+        BIRTHDAY_GENESIS_FROM_UNIX_EPOCH +
+            u64::from(self.birthday).saturating_sub(offset_days) * SECONDS_PER_DAY
     }
 
     /// The `CipherSeed` this wallet should be started from for the given birthday policy.
@@ -120,8 +121,8 @@ impl SeedBook {
             .with_context(|| format!("Could not parse seed file {}", path.display()))?;
         if book.network != network {
             return Err(anyhow!(
-                "Seed file {} was created for network `{}` but the harness is configured for `{}`. Point \
-                 `seed_file` at a different path or delete it.",
+                "Seed file {} was created for network `{}` but the harness is configured for \
+                 `{}`. Point `seed_file` at a different path or delete it.",
                 path.display(),
                 book.network,
                 network
@@ -165,7 +166,12 @@ impl SeedBook {
 
     /// Adds a wallet if it is not present yet. Existing entries are never regenerated: the
     /// funded seed must survive across runs.
-    pub fn ensure(&mut self, label: &str, network: Network, needs_funding: bool) -> Result<&SeedEntry> {
+    pub fn ensure(
+        &mut self,
+        label: &str,
+        network: Network,
+        needs_funding: bool,
+    ) -> Result<&SeedEntry> {
         if self.get(label).is_none() {
             let seed_words = generate_seed_words()?;
             let entry = describe_seed(label, &seed_words, network, needs_funding)?;
@@ -294,10 +300,17 @@ mod tests {
         let words = generate_seed_words().unwrap();
         let genesis_words = words_with_birthday(&words, 0).unwrap();
         assert_ne!(words, genesis_words, "the encoded birthday changed");
-        assert_eq!(cipher_seed_from_words(&genesis_words).unwrap().birthday(), 0);
         assert_eq!(
-            derive_one_sided_address(&words, NETWORK).unwrap().to_base58(),
-            derive_one_sided_address(&genesis_words, NETWORK).unwrap().to_base58(),
+            cipher_seed_from_words(&genesis_words).unwrap().birthday(),
+            0
+        );
+        assert_eq!(
+            derive_one_sided_address(&words, NETWORK)
+                .unwrap()
+                .to_base58(),
+            derive_one_sided_address(&genesis_words, NETWORK)
+                .unwrap()
+                .to_base58(),
             "the same wallet must be recovered by the re-encoded seed"
         );
     }
@@ -326,7 +339,10 @@ mod tests {
 
         let birthday_seed = entry.cipher_seed_for(Birthday::FromSeed).unwrap();
         assert_eq!(birthday_seed.birthday(), entry.birthday);
-        assert!(birthday_seed.birthday() > 0, "a funded seed has a real birthday");
+        assert!(
+            birthday_seed.birthday() > 0,
+            "a funded seed has a real birthday"
+        );
 
         // Same wallet either way: only the birthday field moved.
         assert_eq!(genesis_seed.entropy(), birthday_seed.entropy());
@@ -341,13 +357,21 @@ mod tests {
         // The console wallet only accepts seed words, so the birthday has to survive the
         // round trip through the mnemonic.
         let genesis_words = entry.words_for(Birthday::Genesis).unwrap();
-        assert_eq!(cipher_seed_from_words(&genesis_words).unwrap().birthday(), 0);
+        assert_eq!(
+            cipher_seed_from_words(&genesis_words).unwrap().birthday(),
+            0
+        );
         assert_ne!(genesis_words, words, "the encoded birthday changed");
 
         let birthday_words = entry.words_for(Birthday::FromSeed).unwrap();
-        assert_eq!(birthday_words, words, "an unmodified birthday re-encodes identically");
         assert_eq!(
-            derive_one_sided_address(&genesis_words, NETWORK).unwrap().to_base58(),
+            birthday_words, words,
+            "an unmodified birthday re-encodes identically"
+        );
+        assert_eq!(
+            derive_one_sided_address(&genesis_words, NETWORK)
+                .unwrap()
+                .to_base58(),
             entry.address,
             "the genesis-birthday seed must recover the funded wallet"
         );
@@ -392,7 +416,8 @@ mod tests {
         let first = book.ensure("old_wallet", NETWORK, true).unwrap().clone();
         let again = book.ensure("old_wallet", NETWORK, true).unwrap().clone();
         assert_eq!(first, again, "an existing seed is never regenerated");
-        book.ensure(&baseline_label("old_wallet"), NETWORK, false).unwrap();
+        book.ensure(&baseline_label("old_wallet"), NETWORK, false)
+            .unwrap();
         book.save(&path).unwrap();
 
         let loaded = SeedBook::load(&path, "esmeralda").unwrap();

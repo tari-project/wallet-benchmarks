@@ -40,7 +40,8 @@ pub trait Scenario: Send + Sync {
 
     /// Runs the scenario. Returning `Err` means the harness could not take a measurement at
     /// all; a wallet that misbehaved is reported inside the [`ScenarioReport`] instead.
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport>;
+    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext)
+        -> Result<ScenarioReport>;
 }
 
 /// Builds a scenario by id.
@@ -78,7 +79,12 @@ pub struct RunContext {
 }
 
 impl RunContext {
-    pub fn new(cfg: Arc<HarnessConfig>, chain: ChainClient, seeds: SeedBook, mode_label: &str) -> Self {
+    pub fn new(
+        cfg: Arc<HarnessConfig>,
+        chain: ChainClient,
+        seeds: SeedBook,
+        mode_label: &str,
+    ) -> Self {
         Self {
             cfg,
             chain,
@@ -95,7 +101,10 @@ impl RunContext {
 
     /// The never-funded seed B0 runs against.
     pub fn baseline_seed(&self) -> Result<SeedEntry> {
-        Ok(self.seeds.require(&baseline_label(&self.mode_label))?.clone())
+        Ok(self
+            .seeds
+            .require(&baseline_label(&self.mode_label))?
+            .clone())
     }
 }
 
@@ -115,7 +124,10 @@ mod tests {
     #[test]
     fn ids_are_case_insensitive_and_unknown_ids_are_rejected() {
         assert!(scenario("s1").is_some());
-        assert!(scenario("S7").is_none(), "S7 is out of scope for this harness");
+        assert!(
+            scenario("S7").is_none(),
+            "S7 is out of scope for this harness"
+        );
         assert!(scenario("nonsense").is_none());
     }
 }

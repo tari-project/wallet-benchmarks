@@ -21,7 +21,11 @@ use wallet_benchmarks::{
 };
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Reproducible benchmark harness for the Tari wallets")]
+#[command(
+    author,
+    version,
+    about = "Reproducible benchmark harness for the Tari wallets"
+)]
 struct Cli {
     /// Path to the harness configuration file.
     #[arg(long, short, default_value = "benchmark.toml", global = true)]

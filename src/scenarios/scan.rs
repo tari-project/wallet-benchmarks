@@ -60,7 +60,11 @@ impl Scenario for ScanScenario {
         self.description
     }
 
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let params = ctx.cfg.params.clone();
         let mut report = ScenarioReport::new(self.id, mode.name());
         let seed = ctx.funded_seed()?;
@@ -126,7 +130,8 @@ impl Scenario for ScanScenario {
             )),
             Some(_) => {},
             None => report.fail(
-                "the wallet state before the wipe could not be read, so the rescan cannot be verified",
+                "the wallet state before the wipe could not be read, so the rescan cannot be \
+                 verified",
             ),
         }
         if let Some(before) = before_balance {

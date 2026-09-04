@@ -8,9 +8,9 @@
 //!
 //! * single output — [`TransactionSender`], which selects, locks, builds and broadcasts;
 //! * several outputs — [`FundLocker::lock`] to reserve the inputs, then
-//!   [`OneSidedTransaction::create_unsigned_transaction`] to build. `TransactionSender` takes
-//!   one recipient per call, so the S1 fan-out and the S5 batch arm go through the same
-//!   lock-then-build pair the CLI's `create-unsigned-transaction` and the REST endpoint use.
+//!   [`OneSidedTransaction::create_unsigned_transaction`] to build. `TransactionSender` takes one
+//!   recipient per call, so the S1 fan-out and the S5 batch arm go through the same lock-then-build
+//!   pair the CLI's `create-unsigned-transaction` and the REST endpoint use.
 //!
 //! Signing and broadcasting are identical for both: `sign_locked_transaction`, then the
 //! completed transaction is recorded and submitted through [`WalletHttpClient`].
@@ -37,6 +37,7 @@ use minotari::{
     },
     utils::init_wallet::init_with_seed_words,
 };
+use rusqlite::OptionalExtension;
 use tari_common::configuration::Network;
 use tari_common_types::{tari_address::TariAddress, transaction::TxId, types::FixedHash};
 use tari_transaction_components::{
@@ -45,7 +46,6 @@ use tari_transaction_components::{
     rpc::models::TxSubmissionRejectionReason,
     MicroMinotari,
 };
-use rusqlite::OptionalExtension;
 use tari_utilities::ByteArray;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -54,7 +54,16 @@ use crate::{
     chain::ChainClient,
     config::HarnessConfig,
     metrics::ScanMetrics,
-    modes::{Balance, Birthday, SendReceipt, SendRequest, TxState, TxTracker, WalletMode, NEW_WALLET},
+    modes::{
+        Balance,
+        Birthday,
+        SendReceipt,
+        SendRequest,
+        TxState,
+        TxTracker,
+        WalletMode,
+        NEW_WALLET,
+    },
     seeds::SeedEntry,
     sysprobe::ResourceSampler,
 };
@@ -132,7 +141,11 @@ impl NewWallet {
     /// Records the outputs a broadcast transaction will create for this wallet, so
     /// [`WalletMode::tx_state`] can ask the wallet whether it has seen them.
     async fn watch_outputs(&self, tx_id: u64, hashes: Vec<FixedHash>) {
-        self.inner.lock().await.watched_outputs.insert(tx_id, hashes);
+        self.inner
+            .lock()
+            .await
+            .watched_outputs
+            .insert(tx_id, hashes);
     }
 
     fn account_id(pool: &SqlitePool) -> Result<i64> {
@@ -146,9 +159,11 @@ impl NewWallet {
     /// against what has been scanned, not against what the node knows.
     fn wallet_tip(pool: &SqlitePool, account_id: i64) -> Result<u64> {
         let conn = pool.get()?;
-        Ok(db::get_latest_scanned_tip_block_by_account(&conn, account_id)?
-            .map(|b| b.height)
-            .unwrap_or(0))
+        Ok(
+            db::get_latest_scanned_tip_block_by_account(&conn, account_id)?
+                .map(|b| b.height)
+                .unwrap_or(0),
+        )
     }
 
     /// Runs one full scan pass to the chain tip, returning the outputs it detected, the
@@ -165,7 +180,10 @@ impl NewWallet {
         .mode(ScanMode::Full)
         .processing_threads(self.cfg.new_wallet.scan_threads);
 
-        let (events, more_blocks) = scanner.run().await.map_err(|e| anyhow!("Scan failed: {e}"))?;
+        let (events, more_blocks) = scanner
+            .run()
+            .await
+            .map_err(|e| anyhow!("Scan failed: {e}"))?;
         Ok(ScanPass {
             outputs_found: events
                 .iter()
@@ -242,8 +260,14 @@ impl NewWallet {
             .map_err(|e| anyhow!("Failed to lock funds: {e}"))?;
 
         let build = (|| -> Result<SignedOneSidedTransactionResult> {
-            let unsigned = OneSidedTransaction::new(pool.clone(), self.network, self.password.clone())
-                .create_unsigned_transaction(&account, locked_funds, recipients, fee_per_gram)?;
+            let unsigned =
+                OneSidedTransaction::new(pool.clone(), self.network, self.password.clone())
+                    .create_unsigned_transaction(
+                        &account,
+                        locked_funds,
+                        recipients,
+                        fee_per_gram,
+                    )?;
             let key_manager = account.get_key_manager(&self.password)?;
             let consensus_constants = ConsensusConstantsBuilder::new(self.network).build();
             let signed =
@@ -257,9 +281,11 @@ impl NewWallet {
                 // Nothing was broadcast, so release the reservation the same way the
                 // library's single-recipient path does when construction fails.
                 if let Ok(conn) = pool.get() {
-                    if let Ok(Some(pending)) =
-                        db::find_pending_transaction_by_idempotency_key(&conn, &idempotency_key, account.id)
-                    {
+                    if let Ok(Some(pending)) = db::find_pending_transaction_by_idempotency_key(
+                        &conn,
+                        &idempotency_key,
+                        account.id,
+                    ) {
                         let pending_id = pending.id.to_string();
                         let _ = db::update_pending_transaction_status(
                             &conn,
@@ -285,10 +311,11 @@ impl NewWallet {
     ) -> Result<()> {
         let conn = pool.get()?;
         let account_id = Self::account_id(pool)?;
-        let pending_id = db::find_pending_transaction_by_idempotency_key(&conn, idempotency_key, account_id)?
-            .ok_or_else(|| anyhow!("The UTXO reservation for `{idempotency_key}` is gone"))?
-            .id
-            .to_string();
+        let pending_id =
+            db::find_pending_transaction_by_idempotency_key(&conn, idempotency_key, account_id)?
+                .ok_or_else(|| anyhow!("The UTXO reservation for `{idempotency_key}` is gone"))?
+                .id
+                .to_string();
         let pending_id = pending_id.as_str();
         let tx_id = signed.signed_transaction.tx_id;
         let kernel_excess = signed
@@ -300,9 +327,17 @@ impl NewWallet {
             .map(|k| k.excess.as_bytes().to_vec())
             .unwrap_or_default();
         let serialized = serde_json::to_vec(&signed.signed_transaction.transaction)?;
-        let sent_output_hash = signed.signed_transaction.sent_hashes.first().map(hex::encode);
+        let sent_output_hash = signed
+            .signed_transaction
+            .sent_hashes
+            .first()
+            .map(hex::encode);
 
-        db::update_pending_transaction_status(&conn, pending_id, PendingTransactionStatus::Completed)?;
+        db::update_pending_transaction_status(
+            &conn,
+            pending_id,
+            PendingTransactionStatus::Completed,
+        )?;
         db::create_completed_transaction(
             &conn,
             account_id,
@@ -319,14 +354,24 @@ impl NewWallet {
             .await;
 
         match response {
-            Ok(r) if r.accepted || r.rejection_reason == TxSubmissionRejectionReason::AlreadyMined => {
+            Ok(r)
+                if r.accepted ||
+                    r.rejection_reason == TxSubmissionRejectionReason::AlreadyMined =>
+            {
                 db::mark_completed_transaction_as_broadcasted(&conn, tx_id, 1)?;
                 Ok(())
             },
             Ok(r) => {
-                db::mark_completed_transaction_as_rejected(&conn, tx_id, &r.rejection_reason.to_string())?;
+                db::mark_completed_transaction_as_rejected(
+                    &conn,
+                    tx_id,
+                    &r.rejection_reason.to_string(),
+                )?;
                 let _ = db::unlock_outputs_for_request(&conn, pending_id);
-                Err(anyhow!("Transaction rejected by the network: {}", r.rejection_reason))
+                Err(anyhow!(
+                    "Transaction rejected by the network: {}",
+                    r.rejection_reason
+                ))
             },
             Err(e) => {
                 db::mark_completed_transaction_as_rejected(&conn, tx_id, &e.to_string())?;
@@ -365,7 +410,11 @@ fn wallet_owned_hashes(signed: &SignedOneSidedTransactionResult) -> Vec<FixedHas
 /// enough that a contended send waits instead of failing. Waiting is the point: S4 exists to
 /// expose serialisation, and a stall that shows up as a delay is a measurement, while one that
 /// shows up as an infrastructure error is noise. Both figures are in the recorded config.
-fn open_pool(db_path: &std::path::Path, max_size: u32, checkout_timeout: Duration) -> Result<SqlitePool> {
+fn open_pool(
+    db_path: &std::path::Path,
+    max_size: u32,
+    checkout_timeout: Duration,
+) -> Result<SqlitePool> {
     let manager = r2d2_sqlite::SqliteConnectionManager::file(db_path).with_init(|c| {
         // Identical to `connect_and_migrate`: WAL for concurrent readers, and a busy_timeout
         // so contention on the write lock waits rather than erroring.
@@ -403,13 +452,8 @@ fn held_output_values(
     #[allow(clippy::cast_possible_wrap)]
     let height = height.min(i64::MAX as u64) as i64;
     let mut statement = conn.prepare_cached(
-        "SELECT value FROM outputs \
-         WHERE account_id = ?1 \
-           AND status IN ('UNSPENT', 'LOCKED') \
-           AND mined_in_block_height <= ?2 \
-           AND maturity <= ?2 \
-           AND deleted_at IS NULL \
-           AND is_burn = 0",
+        "SELECT value FROM outputs WHERE account_id = ?1 AND status IN ('UNSPENT', 'LOCKED') AND \
+         mined_in_block_height <= ?2 AND maturity <= ?2 AND deleted_at IS NULL AND is_burn = 0",
     )?;
     let values = statement
         .query_map(rusqlite::params![account_id, height], |row| {
@@ -434,9 +478,8 @@ fn output_depth(
     hash: &FixedHash,
 ) -> Result<Option<(u64, Option<u64>)>> {
     let mut statement = conn.prepare_cached(
-        "SELECT mined_in_block_height, confirmed_height \
-         FROM outputs \
-         WHERE account_id = ?1 AND output_hash = ?2 AND deleted_at IS NULL",
+        "SELECT mined_in_block_height, confirmed_height FROM outputs WHERE account_id = ?1 AND \
+         output_hash = ?2 AND deleted_at IS NULL",
     )?;
     let row = statement
         .query_row(rusqlite::params![account_id, hash.as_slice()], |row| {
@@ -518,7 +561,8 @@ impl WalletMode for NewWallet {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("Could not wipe {}", dir.display()))?;
         }
-        std::fs::create_dir_all(&dir).with_context(|| format!("Could not create {}", dir.display()))?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Could not create {}", dir.display()))?;
         let db_path = dir.join("wallet.db");
 
         // `init_db` creates the file and runs the migrations; the pool it returns is then
@@ -598,7 +642,11 @@ impl WalletMode for NewWallet {
 
         let usage = {
             let mut inner = self.inner.lock().await;
-            let usage = inner.sampler.take().map(ResourceSampler::stop).unwrap_or_default();
+            let usage = inner
+                .sampler
+                .take()
+                .map(ResourceSampler::stop)
+                .unwrap_or_default();
             inner.sampler = Some(ResourceSampler::start(None));
             usage
         };
@@ -634,7 +682,9 @@ impl WalletMode for NewWallet {
         let conn = handles.pool.get()?;
         let account = db::get_account_by_name(&conn, ACCOUNT)?
             .ok_or_else(|| anyhow!("Account `{ACCOUNT}` is missing from the wallet database"))?;
-        Ok(account.get_address(self.network, &self.password)?.to_base58())
+        Ok(account
+            .get_address(self.network, &self.password)?
+            .to_base58())
     }
 
     async fn balance(&self) -> Result<Balance> {
@@ -736,7 +786,8 @@ impl WalletMode for NewWallet {
             let tx_id = u64::from(signed.signed_transaction.tx_id);
             // Remember what the scanner should find once this lands; that is how the wallet
             // is asked whether it confirmed.
-            self.watch_outputs(tx_id, wallet_owned_hashes(&signed)).await;
+            self.watch_outputs(tx_id, wallet_owned_hashes(&signed))
+                .await;
 
             let broadcast_start = Instant::now();
             sender
@@ -758,10 +809,12 @@ impl WalletMode for NewWallet {
 
         let fee = signed_fee(&signed);
         let tx_id = u64::from(signed.signed_transaction.tx_id);
-        self.watch_outputs(tx_id, wallet_owned_hashes(&signed)).await;
+        self.watch_outputs(tx_id, wallet_owned_hashes(&signed))
+            .await;
 
         let broadcast_start = Instant::now();
-        self.broadcast_batch(&handles.pool, signed, &idempotency_key).await?;
+        self.broadcast_batch(&handles.pool, signed, &idempotency_key)
+            .await?;
         Ok(SendReceipt {
             tx_id,
             fee,
@@ -777,7 +830,11 @@ impl WalletMode for NewWallet {
         let tip = Self::wallet_tip(&handles.pool, account_id)?;
         let watched = {
             let inner = self.inner.lock().await;
-            inner.watched_outputs.get(&tracker.0).cloned().unwrap_or_default()
+            inner
+                .watched_outputs
+                .get(&tracker.0)
+                .cloned()
+                .unwrap_or_default()
         };
         let conn = handles.pool.get()?;
 
@@ -824,19 +881,18 @@ impl WalletMode for NewWallet {
                         .unwrap_or_else(|| tx.status.to_string()),
                 }
             },
-            CompletedTransactionStatus::MinedConfirmed | CompletedTransactionStatus::MinedUnconfirmed => {
-                match tx.mined_height {
-                    Some(height) if height > 0 => {
-                        #[allow(clippy::cast_sign_loss)]
-                        let height = height as u64;
-                        TxState::Mined {
-                            height,
-                            confirmations: tip.saturating_sub(height) + 1,
-                            wallet_confirmed: tx.status == CompletedTransactionStatus::MinedConfirmed,
-                        }
-                    },
-                    _ => TxState::Mempool,
-                }
+            CompletedTransactionStatus::MinedConfirmed |
+            CompletedTransactionStatus::MinedUnconfirmed => match tx.mined_height {
+                Some(height) if height > 0 => {
+                    #[allow(clippy::cast_sign_loss)]
+                    let height = height as u64;
+                    TxState::Mined {
+                        height,
+                        confirmations: tip.saturating_sub(height) + 1,
+                        wallet_confirmed: tx.status == CompletedTransactionStatus::MinedConfirmed,
+                    }
+                },
+                _ => TxState::Mempool,
             },
             CompletedTransactionStatus::Completed | CompletedTransactionStatus::Broadcast => {
                 TxState::Mempool
@@ -969,6 +1025,10 @@ mod tests {
 
         let missing = FixedHash::from([9u8; 32]);
         assert_eq!(output_depth(&conn, 1, &missing).unwrap(), None);
-        assert_eq!(output_depth(&conn, 2, &hash).unwrap(), None, "another account's output");
+        assert_eq!(
+            output_depth(&conn, 2, &hash).unwrap(),
+            None,
+            "another account's output"
+        );
     }
 }

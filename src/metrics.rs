@@ -87,7 +87,11 @@ pub fn count_infrastructure_failures(metrics: &[TxMetric]) -> u32 {
         .iter()
         .filter(|m| m.outcome == TxOutcome::Failed)
         .filter_map(|m| m.error.as_deref())
-        .filter(|error| INFRASTRUCTURE_MARKERS.iter().any(|marker| error.contains(marker)))
+        .filter(|error| {
+            INFRASTRUCTURE_MARKERS
+                .iter()
+                .any(|marker| error.contains(marker))
+        })
         .count() as u32
 }
 
@@ -453,7 +457,15 @@ impl ResultProfile {
         let _ = writeln!(
             out,
             "{:<12}{:<4}{:>10}{:>12}{:>10}{:>9}{:>9}{:>10}{:>9}",
-            "mode", "id", "T_scan", "validation", "blocks", "blk/s", "outputs", "peak RSS", "peak CPU"
+            "mode",
+            "id",
+            "T_scan",
+            "validation",
+            "blocks",
+            "blk/s",
+            "outputs",
+            "peak RSS",
+            "peak CPU"
         );
         let mut last_mode = "";
         for (report, scan) in scans {
@@ -492,7 +504,16 @@ impl ResultProfile {
         let _ = writeln!(
             out,
             "{:<12}{:<4}{:>10}{:>6}{:>6}{:>7}{:>7}{:>11}{:>13}{:>15}",
-            "mode", "id", "wall", "txs", "ok", "failed", "infra", "fees µT", "median build", "median confirm"
+            "mode",
+            "id",
+            "wall",
+            "txs",
+            "ok",
+            "failed",
+            "infra",
+            "fees µT",
+            "median build",
+            "median confirm"
         );
         let mut last_mode = "";
         for report in sending {
@@ -614,7 +635,10 @@ pub fn compute_deltas(reports: &[ScenarioReport]) -> Vec<Delta> {
             }
         }
 
-        if let Some(s5) = reports.iter().find(|r| r.mode == mode && r.scenario == "S5") {
+        if let Some(s5) = reports
+            .iter()
+            .find(|r| r.mode == mode && r.scenario == "S5")
+        {
             let batch = s5.notes.get("t_batch_secs").and_then(Value::as_f64);
             let individual = s5.notes.get("t_individual_secs").and_then(Value::as_f64);
             if let (Some(batch), Some(individual)) = (batch, individual) {

@@ -32,7 +32,11 @@ impl Scenario for FundingBaseline {
         "Fresh wallet on the funded seed; wait for one A_fund UTXO at depth C_min"
     }
 
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let params = ctx.cfg.params.clone();
         let mut report = ScenarioReport::new(self.id(), mode.name());
         let seed = ctx.funded_seed()?;
@@ -102,7 +106,8 @@ impl Scenario for FundingBaseline {
 
         if spendable_at.is_none() {
             report.fail(format!(
-                "the funding UTXO was not spendable after {:.0}s: available {} µT of the {} µT required",
+                "the funding UTXO was not spendable after {:.0}s: available {} µT of the {} µT \
+                 required",
                 params.fund_timeout().as_secs_f64(),
                 balance.available,
                 params.a_fund

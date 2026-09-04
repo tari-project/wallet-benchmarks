@@ -26,7 +26,11 @@ impl Scenario for BaselineScan {
         "Baseline scan from genesis on a fresh, never-funded wallet"
     }
 
-    async fn run(&self, mode: &Arc<dyn WalletMode>, ctx: &mut RunContext) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        mode: &Arc<dyn WalletMode>,
+        ctx: &mut RunContext,
+    ) -> Result<ScenarioReport> {
         let mut report = ScenarioReport::new(self.id(), mode.name());
         let seed = ctx.baseline_seed()?;
         report.tip_height_start = ctx.chain.tip_height().await.unwrap_or(0);

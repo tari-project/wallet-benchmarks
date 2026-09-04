@@ -11,7 +11,6 @@ use anyhow::{anyhow, Result};
 use minotari::http::WalletHttpClient;
 use url::Url;
 
-
 /// Thin wrapper over the `minotari` base node HTTP client.
 #[derive(Clone)]
 pub struct ChainClient {
@@ -50,5 +49,4 @@ impl ChainClient {
     pub async fn height_at_time(&self, epoch_secs: u64) -> Result<u64> {
         self.client.get_height_at_time(epoch_secs).await
     }
-
 }

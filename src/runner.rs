@@ -59,7 +59,10 @@ pub async fn run(
         .await
         .with_context(|| format!("Base node {} is not reachable", cfg.base_node_url))?;
     let synced = chain.is_synced().await.ok();
-    info!("Base node {} is at height {tip} (synced: {synced:?})", cfg.base_node_url);
+    info!(
+        "Base node {} is at height {tip} (synced: {synced:?})",
+        cfg.base_node_url
+    );
 
     let seeds = SeedBook::load(&cfg.seed_file, &cfg.network)?;
     for mode in modes {
@@ -72,12 +75,7 @@ pub async fn run(
 
     for mode_label in modes {
         let mode = build_mode(mode_label, Arc::clone(&cfg), chain.clone())?;
-        let mut ctx = RunContext::new(
-            Arc::clone(&cfg),
-            chain.clone(),
-            seeds.clone(),
-            mode_label,
-        );
+        let mut ctx = RunContext::new(Arc::clone(&cfg), chain.clone(), seeds.clone(), mode_label);
 
         // The scenarios are a chain: S1 builds the UTXO set S2 and S3 rescan, S4 and S5 spend
         // it, S6 rescans what they left. Once one link breaks, everything after it measures a
@@ -87,7 +85,11 @@ pub async fn run(
 
         for id in scenario_ids {
             let Some(scenario) = scenarios::scenario(id) else {
-                reports.push(ScenarioReport::skipped(id, mode_label, "unknown scenario id"));
+                reports.push(ScenarioReport::skipped(
+                    id,
+                    mode_label,
+                    "unknown scenario id",
+                ));
                 continue;
             };
             if let Some(failed) = &halted_by {
@@ -99,7 +101,11 @@ pub async fn run(
                 continue;
             }
 
-            info!("[{mode_label}] {} — {}", scenario.id(), scenario.description());
+            info!(
+                "[{mode_label}] {} — {}",
+                scenario.id(),
+                scenario.description()
+            );
             let started = std::time::Instant::now();
             match scenario.run(&mode, &mut ctx).await {
                 Ok(report) => {

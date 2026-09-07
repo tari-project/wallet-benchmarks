@@ -1,0 +1,6 @@
+# The alias tari's CI runs, kept in the repository so `cargo ci-clippy` means the same thing
+# here as it does there. Without it the command depends on whatever alias happens to be in the
+# developer's `~/.cargo/config.toml`, which is not something a contributor can be expected to
+# have.
+[alias]
+ci-clippy = "clippy --all-targets --all-features --locked -- -D warnings"

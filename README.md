@@ -459,8 +459,14 @@ Notes on what the numbers mean:
 
 ```bash
 cargo test        # unit tests, no network and no wallets required
-cargo clippy --all-targets
+cargo ci-clippy   # the alias tari's CI runs, defined in .cargo/config.toml
+cargo +nightly fmt --all
 ```
+
+`ci-clippy` is `clippy --all-targets --all-features --locked -- -D warnings`, kept in the
+repository's own `.cargo/config.toml` so it means the same thing here as it does in CI rather
+than depending on whatever alias a developer happens to have in `~/.cargo/config.toml`.
+`rustfmt.toml` uses nightly-only options, so formatting needs the nightly toolchain.
 
 The `minotari-cli` dependency is pinned to a git revision in `Cargo.toml`;
 `metrics::MINOTARI_CLI_REV` and `tools/fetch.sh` record the same revision, and every profile

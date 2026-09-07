@@ -451,14 +451,49 @@ const ENV_FILE_HEADER: &str = "# Written by wallet-benchmarks. Every variable he
                                file has no effect on a running\n# harness; it is here so a run \
                                can be reproduced by hand.\n";
 
+/// How one character of a value is written inside the quotes of a `.env` entry, or `None` when
+/// it is written as itself.
+///
+/// Values are not all harness-generated: `OFFLINE_SIGNER_PASSPHRASE` is whatever the operator
+/// put in their environment, and a passphrase may legitimately contain a quote, a backslash or
+/// a newline. Unescaped, a quote ends the entry early and a newline splits it across two lines
+/// and corrupts every entry after it — and this file is read back, because the processor is
+/// spawned with the working directory it is written into and `dotenv` searches from there. The
+/// escapes are the ones a dotenv parser reads back as the original bytes.
+///
+/// This is the single definition [`escaped_value_len`] and [`render_env_file`] both go through,
+/// so the length a buffer is sized to cannot drift from the bytes written into it. Keys are
+/// harness constants and are never escaped.
+fn env_value_escape(c: char) -> Option<&'static str> {
+    match c {
+        '\\' => Some("\\\\"),
+        '"' => Some("\\\""),
+        '\n' => Some("\\n"),
+        '\r' => Some("\\r"),
+        _ => None,
+    }
+}
+
+/// The number of bytes `value` occupies once escaped.
+///
+/// Equal to `value.len()` for anything without a character [`env_value_escape`] rewrites, which
+/// is every value in a normal run: hex keys, paths, ports and integers.
+fn escaped_value_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|c| env_value_escape(c).map_or(c.len_utf8(), str::len))
+        .sum()
+}
+
 /// The exact byte length [`render_env_file`] will produce for `env`.
 ///
 /// Kept separate so the render can size its buffer in one allocation; see there for why that
-/// matters.
+/// matters. Lengths are in bytes throughout — `str::len` and `char::len_utf8` both are — so a
+/// multi-byte passphrase is counted the same way it is written.
 fn env_file_len(env: &PpEnv) -> usize {
     env.iter().fold(ENV_FILE_HEADER.len(), |acc, (key, value)| {
         // `KEY="VALUE"\n`: the two names plus the four bytes of punctuation around them.
-        acc + key.len() + value.len() + 4
+        acc + key.len() + escaped_value_len(value) + 4
     })
 }
 
@@ -469,16 +504,22 @@ fn env_file_len(env: &PpEnv) -> usize {
 ///
 /// Every byte is pushed straight into that buffer. A `format!` per line would build the
 /// passphrase's `KEY="VALUE"` in a plain `String` that is dropped unscrubbed, which is the leak
-/// `Zeroizing` is here to prevent. For the same reason the buffer is sized to the finished
-/// length up front: growing it reallocates, and the old allocation is freed with the plaintext
-/// still in it.
+/// `Zeroizing` is here to prevent. Escaping is done the same way, character by character into
+/// the same buffer, rather than into an escaped copy that would be dropped in the clear. For
+/// the same reason the buffer is sized to the finished length up front: growing it reallocates,
+/// and the old allocation is freed with the plaintext still in it.
 fn render_env_file(env: &PpEnv) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(env_file_len(env)));
     out.push_str(ENV_FILE_HEADER);
     for (key, value) in env.iter() {
         out.push_str(key);
         out.push_str("=\"");
-        out.push_str(value);
+        for c in value.chars() {
+            match env_value_escape(c) {
+                Some(escaped) => out.push_str(escaped),
+                None => out.push(c),
+            }
+        }
         out.push_str("\"\n");
     }
     out
@@ -1130,20 +1171,20 @@ impl WalletMode for PaymentProcessor {
             view_key,
             public_spend_key,
         });
-        // The rendered fee has to be the one the rest of the protocol is run at: the processor
-        // ignores any per-request fee and takes it from here.
-        let rendered_fee = env
-            .iter()
-            .find(|(key, _)| key == "FEE_PER_GRAM")
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default();
-        if rendered_fee != self.cfg.params.fee_rate.to_string() {
-            return Err(anyhow!(
-                "the payment processor would be run at FEE_PER_GRAM {rendered_fee} while the \
-                 protocol is at params.fee_rate {}; the modes would not be comparable",
-                self.cfg.params.fee_rate
-            ));
-        }
+        // The processor ignores any per-request fee and takes its fee from `FEE_PER_GRAM`, so
+        // the value it runs at has to be `params.fee_rate` or the three modes are not
+        // comparable. There is no runtime check here because there is nothing left to check:
+        // `render_pp_env` sets that entry from `params.fee_rate` and nothing else writes it, so
+        // comparing the rendered value back against `params.fee_rate` could only ever compare
+        // an expression with itself. The regression guard is
+        // `the_rendered_fee_tracks_the_protocols_fee_rate`, which varies `params.fee_rate` and
+        // asserts the rendered entry follows it. Neither the test nor this log protects against
+        // the processor ignoring or clamping the value once it has it; that is only visible in
+        // the fees the run actually pays.
+        info!(
+            "[{PAYMENT_PROCESSOR}] running at FEE_PER_GRAM {}",
+            self.cfg.params.fee_rate
+        );
         write_env_file(&work_dir.join(".env"), &env)?;
 
         // --- daemon ---------------------------------------------------------------------
@@ -2091,6 +2132,19 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_fee_tracks_the_protocols_fee_rate() {
+        // This is the guarantee the spawn path relies on instead of a runtime comparison: the
+        // fee the processor is run at comes from `params.fee_rate` and from nowhere else, so
+        // the modes cannot end up being run at two different fees. A constant here, or a fee
+        // read from the processor's own configuration, would not follow this.
+        let mut cfg = test_config();
+        cfg.params.fee_rate = 5;
+        assert_eq!(env_of(&cfg)["FEE_PER_GRAM"], "5");
+        cfg.params.fee_rate = 37;
+        assert_eq!(env_of(&cfg)["FEE_PER_GRAM"], "37");
+    }
+
+    #[test]
     fn the_network_is_set_because_the_processor_defaults_to_mainnet() {
         let env = env_of(&test_config());
         assert_eq!(env["TARI_NETWORK"], "esmeralda");
@@ -2170,8 +2224,24 @@ mod tests {
         // The body is assembled by hand rather than by `format!` so no plaintext copy of the
         // passphrase is left in freed heap. The file itself is a reproduction artefact a human
         // reads, so pin its exact bytes against that rewrite.
+        // The values are one of each shape a real run produces — a name, a URL with punctuation
+        // in it, a path, a port and a hex key — because escaping must leave all of them exactly
+        // as they were.
         let text = render_env_file(&PpEnv(vec![
             ("TARI_NETWORK".to_string(), "esmeralda".to_string()),
+            (
+                "DATABASE_URL".to_string(),
+                "sqlite:///work/payments.db?mode=rwc".to_string(),
+            ),
+            (
+                "OFFLINE_SIGNER_PATH".to_string(),
+                "tools/minotari_offline_signer".to_string(),
+            ),
+            ("LISTEN_PORT".to_string(), "18000".to_string()),
+            (
+                "ACCOUNTS__BENCH__VIEW_KEY".to_string(),
+                "0a1b2c3d4e5f".to_string(),
+            ),
             (
                 "OFFLINE_SIGNER_PASSPHRASE".to_string(),
                 "hunter2".to_string(),
@@ -2182,7 +2252,42 @@ mod tests {
             "# Written by wallet-benchmarks. Every variable here is also set directly on the\n# \
              payment processor's process, so editing this file has no effect on a running\n# \
              harness; it is here so a run can be reproduced by \
-             hand.\nTARI_NETWORK=\"esmeralda\"\nOFFLINE_SIGNER_PASSPHRASE=\"hunter2\"\n"
+             hand.\nTARI_NETWORK=\"esmeralda\"\nDATABASE_URL=\"sqlite:///work/payments.db?\
+             mode=rwc\"\nOFFLINE_SIGNER_PATH=\"tools/minotari_offline_signer\"\nLISTEN_PORT=\"\
+             18000\"\nACCOUNTS__BENCH__VIEW_KEY=\"0a1b2c3d4e5f\"\nOFFLINE_SIGNER_PASSPHRASE=\"\
+             hunter2\"\n"
+        );
+    }
+
+    #[test]
+    fn a_passphrase_with_quotes_and_newlines_cannot_break_the_file_apart() {
+        // The passphrase is whatever the operator's environment holds, and the file is read
+        // back by the processor, which is spawned in the directory it is written to. A bare
+        // quote would end the entry early and a bare newline would split it in two, leaving a
+        // fragment the parser reads as another variable — or refuses outright, with a message
+        // that names anything but the passphrase.
+        let env = PpEnv(vec![
+            ("TARI_NETWORK".to_string(), "esmeralda".to_string()),
+            (
+                "OFFLINE_SIGNER_PASSPHRASE".to_string(),
+                "a\"b\\c\nd".to_string(),
+            ),
+        ]);
+        let text = render_env_file(&env);
+        assert!(
+            text.ends_with("OFFLINE_SIGNER_PASSPHRASE=\"a\\\"b\\\\c\\nd\"\n"),
+            "unexpected render: {}",
+            *text
+        );
+        // Three lines of header, one per entry: the newline in the value did not become one.
+        assert_eq!(text.lines().count(), 5);
+        // The escape has to be counted before the buffer is sized, or the render reallocates
+        // and frees the passphrase unscrubbed — on exactly the value that needed escaping.
+        assert_eq!(env_file_len(&env), text.len());
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "the buffer grew while rendering"
         );
     }
 

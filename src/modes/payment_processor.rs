@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use tari_transaction_components::transaction_components::Transaction;
 use tari_utilities::ByteArray;
 use tokio::{io::AsyncWriteExt, process::Child, sync::Mutex};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     binaries::{self, BinaryVersion},
@@ -330,7 +330,7 @@ fn map_payment_state(
 /// Written to disk for inspection and reproducibility *and* set directly on the child
 /// process, so a stale `.env` somewhere above the working directory cannot win — `dotenv`
 /// searches upwards from the current directory.
-fn render_pp_env(cfg: &HarnessConfig, ctx: &PpEnvContext) -> Vec<(String, String)> {
+fn render_pp_env(cfg: &HarnessConfig, ctx: &PpEnvContext) -> PpEnv {
     let pp = &cfg.payment_processor;
     let mut env = vec![
         // `mode=rwc` so sqlx creates the file. Without it the processor refuses to start on a
@@ -350,7 +350,7 @@ fn render_pp_env(cfg: &HarnessConfig, ctx: &PpEnvContext) -> Vec<(String, String
         ),
         (
             "OFFLINE_SIGNER_PASSPHRASE".to_string(),
-            ctx.signer_passphrase.clone(),
+            ctx.signer_passphrase.to_string(),
         ),
         // Defaults to `MainNet`, which would derive the wrong addresses for every recipient.
         ("TARI_NETWORK".to_string(), tari_network_name(&cfg.network)),
@@ -407,7 +407,7 @@ fn render_pp_env(cfg: &HarnessConfig, ctx: &PpEnvContext) -> Vec<(String, String
         "ACCOUNTS__BENCH__PUBLIC_SPEND_KEY".to_string(),
         ctx.public_spend_key.clone(),
     ));
-    env
+    PpEnv(env)
 }
 
 /// Everything `render_pp_env` needs that is not in the configuration.
@@ -415,19 +415,47 @@ struct PpEnvContext {
     payments_db: PathBuf,
     daemon_url: String,
     offline_signer: PathBuf,
-    signer_passphrase: String,
+    signer_passphrase: Zeroizing<String>,
     view_key: String,
     public_spend_key: String,
 }
 
+/// The processor's environment, which scrubs its own values when it is dropped.
+///
+/// `OFFLINE_SIGNER_PASSPHRASE` is the offline signer's keystore passphrase, and this is the
+/// shape it spends most of its life in: it is rendered into the `.env` and set on the
+/// processor's process from here. Left as a bare `Vec`, every reset would leave another
+/// plaintext copy in freed heap and the `Zeroizing` on the field it came from would be
+/// decorative.
+struct PpEnv(Vec<(String, String)>);
+
+impl std::ops::Deref for PpEnv {
+    type Target = [(String, String)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for PpEnv {
+    fn drop(&mut self) {
+        for (_, value) in &mut self.0 {
+            value.zeroize();
+        }
+    }
+}
+
 /// Serialises an environment list as a `.env` file.
-fn render_env_file(env: &[(String, String)]) -> String {
-    let mut out = String::from(
+///
+/// The body is `Zeroizing` for the same reason [`PpEnv`] scrubs itself: it holds the signer's
+/// passphrase in the clear on its way to `std::fs::write`.
+fn render_env_file(env: &PpEnv) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::from(
         "# Written by wallet-benchmarks. Every variable here is also set directly on the\n# \
          payment processor's process, so editing this file has no effect on a running\n# harness; \
          it is here so a run can be reproduced by hand.\n",
-    );
-    for (key, value) in env {
+    ));
+    for (key, value) in env.iter() {
         out.push_str(&format!("{key}=\"{value}\"\n"));
     }
     out
@@ -438,8 +466,8 @@ fn render_env_file(env: &[(String, String)]) -> String {
 /// This file carries the offline signer's keystore passphrase and the benchmark account's
 /// view key: whoever can read it can watch the account and sign for it. The seed book is
 /// already treated this way, and the `.env` holds the same class of secret.
-fn write_env_file(path: &Path, env: &[(String, String)]) -> Result<()> {
-    std::fs::write(path, render_env_file(env))
+fn write_env_file(path: &Path, env: &PpEnv) -> Result<()> {
+    std::fs::write(path, render_env_file(env).as_bytes())
         .with_context(|| format!("Could not write {}", path.display()))?;
     crate::secrets::restrict_file(path)
 }
@@ -795,8 +823,11 @@ impl PaymentProcessor {
             }
         }
         let binary = self.cfg.payment_processor.offline_signer_binary.clone();
-        let passphrase = self.signer_passphrase.to_string();
-        let env = [("TARI_PASSPHRASE", passphrase.as_str())];
+        // Borrowed, not copied: an owned `String` here would be a second plaintext of the
+        // keystore passphrase that nothing scrubs when it is dropped, which is exactly what
+        // the `Zeroizing` on the field exists to prevent.
+        let passphrase = self.signer_passphrase.as_str();
+        let env = [("TARI_PASSPHRASE", passphrase)];
 
         let status = Self::run_tool(
             &binary,
@@ -819,7 +850,7 @@ impl PaymentProcessor {
             )
             .await?;
         }
-        let (init_args, init_env) = signer_init_invocation(&passphrase, &seed.seed_words);
+        let (init_args, init_env) = signer_init_invocation(passphrase, &seed.seed_words);
         Self::run_tool(
             &binary,
             &init_args,
@@ -1027,7 +1058,11 @@ impl WalletMode for PaymentProcessor {
         // signer above, this cannot be moved off the process table from here. It is recorded
         // in `KNOWN_FINDINGS` rather than worked around: a wrapper script or a temp file would
         // trade a disclosure for an injection surface.
-        let mut create = globals.clone();
+        //
+        // The argv is `Zeroizing` all the same: the disclosure is the process table, not the
+        // harness's heap, and there is no reason to leave the password and the mnemonic in
+        // freed memory after the call as well.
+        let mut create = Zeroizing::new(globals.clone());
         create.extend([
             "create".to_string(),
             "--password".to_string(),
@@ -1043,7 +1078,7 @@ impl WalletMode for PaymentProcessor {
 
         // The processor watches the account by view key and public spend key; it never sees
         // the seed.
-        let mut show_keys = globals.clone();
+        let mut show_keys = Zeroizing::new(globals.clone());
         show_keys.extend([
             "show-keys".to_string(),
             "--password".to_string(),
@@ -1068,7 +1103,7 @@ impl WalletMode for PaymentProcessor {
             payments_db: payments_db.clone(),
             daemon_url: self.daemon_url.clone(),
             offline_signer: self.cfg.payment_processor.offline_signer_binary.clone(),
-            signer_passphrase: self.signer_passphrase.to_string(),
+            signer_passphrase: self.signer_passphrase.clone(),
             view_key,
             public_spend_key,
         });
@@ -1130,7 +1165,7 @@ impl WalletMode for PaymentProcessor {
         let pp_log = std::fs::File::create(work_dir.join("payment_processor.log"))?;
         let pp_log_err = pp_log.try_clone()?;
         let mut pp_cmd = tokio::process::Command::new(&pp_binary);
-        for (key, value) in &env {
+        for (key, value) in env.iter() {
             pp_cmd.env(key, value);
         }
         pp_cmd
@@ -2012,11 +2047,12 @@ mod tests {
             payments_db: PathBuf::from("/work/payments.db"),
             daemon_url: "http://127.0.0.1:9000".to_string(),
             offline_signer: PathBuf::from("tools/minotari_offline_signer"),
-            signer_passphrase: "secret".to_string(),
+            signer_passphrase: Zeroizing::new("secret".to_string()),
             view_key: "aa".to_string(),
             public_spend_key: "bb".to_string(),
         })
-        .into_iter()
+        .iter()
+        .cloned()
         .collect()
     }
 
@@ -2101,7 +2137,7 @@ mod tests {
 
     #[test]
     fn the_env_file_is_written_in_a_form_a_human_can_reuse() {
-        let text = render_env_file(&[("FEE_PER_GRAM".to_string(), "5".to_string())]);
+        let text = render_env_file(&PpEnv(vec![("FEE_PER_GRAM".to_string(), "5".to_string())]));
         assert!(text.contains("FEE_PER_GRAM=\"5\""));
         assert!(text.starts_with('#'), "the file has to explain itself");
     }
@@ -2113,11 +2149,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
-        let env: Vec<(String, String)> = render_pp_env(&test_config(), &PpEnvContext {
+        let env = render_pp_env(&test_config(), &PpEnvContext {
             payments_db: PathBuf::from("/work/payments.db"),
             daemon_url: "http://127.0.0.1:9000".to_string(),
             offline_signer: PathBuf::from("tools/minotari_offline_signer"),
-            signer_passphrase: "the-signer-passphrase".to_string(),
+            signer_passphrase: Zeroizing::new("the-signer-passphrase".to_string()),
             view_key: "aa".to_string(),
             public_spend_key: "bb".to_string(),
         });

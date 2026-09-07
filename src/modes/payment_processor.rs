@@ -455,11 +455,22 @@ const ENV_FILE_HEADER: &str = "# Written by wallet-benchmarks. Every variable he
 /// it is written as itself.
 ///
 /// Values are not all harness-generated: `OFFLINE_SIGNER_PASSPHRASE` is whatever the operator
-/// put in their environment, and a passphrase may legitimately contain a quote, a backslash or
-/// a newline. Unescaped, a quote ends the entry early and a newline splits it across two lines
-/// and corrupts every entry after it — and this file is read back, because the processor is
-/// spawned with the working directory it is written into and `dotenv` searches from there. The
-/// escapes are the ones a dotenv parser reads back as the original bytes.
+/// put in their environment, and a passphrase may legitimately contain a quote, a backslash, a
+/// newline or a dollar sign. This file is read back, because the processor is spawned with the
+/// working directory it is written into and calls `dotenv::dotenv()` from there.
+///
+/// The table is matched to that one parser — `dotenv` 0.15.0, the version the processor pins —
+/// and not to any general convention, so check it against that crate before changing it:
+///
+/// - `\` and `"` would otherwise end the entry early or swallow the next character.
+/// - A newline would split the entry across two lines and corrupt every entry after it.
+/// - `$` is substituted for another variable's value *inside* double quotes: the crate tests for
+///   `$` before it tests for the quote state, so an unescaped `$` in a passphrase is silently
+///   replaced with something unrelated, with no error. `\$` restores a literal `$`.
+/// - A carriage return is deliberately left raw. The crate's escaped-character match accepts only
+///   `\`, `'`, `"`, `$`, space and `n`; `\r` falls to its error arm, and because the parser
+///   propagates the first error, one escaped CR would fail that line and every line after it. A raw
+///   CR is not special inside double quotes and round-trips verbatim.
 ///
 /// This is the single definition [`escaped_value_len`] and [`render_env_file`] both go through,
 /// so the length a buffer is sized to cannot drift from the bytes written into it. Keys are
@@ -469,7 +480,7 @@ fn env_value_escape(c: char) -> Option<&'static str> {
         '\\' => Some("\\\\"),
         '"' => Some("\\\""),
         '\n' => Some("\\n"),
-        '\r' => Some("\\r"),
+        '$' => Some("\\$"),
         _ => None,
     }
 }
@@ -2283,6 +2294,56 @@ mod tests {
         assert_eq!(text.lines().count(), 5);
         // The escape has to be counted before the buffer is sized, or the render reallocates
         // and frees the passphrase unscrubbed — on exactly the value that needed escaping.
+        assert_eq!(env_file_len(&env), text.len());
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "the buffer grew while rendering"
+        );
+    }
+
+    #[test]
+    fn a_dollar_sign_in_a_passphrase_is_not_read_back_as_another_variable() {
+        // `dotenv` 0.15.0 — the version the processor pins — substitutes environment variables
+        // on an unescaped `$` even inside double quotes, because it tests for `$` before it
+        // tests for the quote state. Left bare, a passphrase of `s$HOME!` is read back as some
+        // unrelated path, silently and without an error, which is worse than a broken file.
+        let env = PpEnv(vec![(
+            "OFFLINE_SIGNER_PASSPHRASE".to_string(),
+            "s$HOME!".to_string(),
+        )]);
+        let text = render_env_file(&env);
+        assert!(
+            text.ends_with("OFFLINE_SIGNER_PASSPHRASE=\"s\\$HOME!\"\n"),
+            "unexpected render: {}",
+            *text
+        );
+        assert_eq!(env_file_len(&env), text.len());
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "the buffer grew while rendering"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_in_a_passphrase_is_written_raw() {
+        // The same parser has no `\r` escape: `r` falls to its error arm, and it propagates the
+        // first error, so an escaped CR would fail that line and every line after it. A raw CR
+        // is not special inside double quotes and comes back verbatim, so it is written as
+        // itself — and being written as itself is also what the length arithmetic assumes.
+        let env = PpEnv(vec![
+            ("OFFLINE_SIGNER_PASSPHRASE".to_string(), "a\rb".to_string()),
+            ("TARI_NETWORK".to_string(), "esmeralda".to_string()),
+        ]);
+        let text = render_env_file(&env);
+        assert!(
+            text.contains("OFFLINE_SIGNER_PASSPHRASE=\"a\rb\"\n"),
+            "unexpected render: {}",
+            *text
+        );
+        // The entry after it is still an entry, which is what an escaped CR would have cost.
+        assert!(text.ends_with("TARI_NETWORK=\"esmeralda\"\n"));
         assert_eq!(env_file_len(&env), text.len());
         assert_eq!(
             text.capacity(),

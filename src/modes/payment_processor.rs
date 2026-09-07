@@ -1524,9 +1524,21 @@ impl WalletMode for PaymentProcessor {
                         // 3. The authoritative fee, from the kernel of the transaction the daemon
                         //    stored. Neither the processor nor the daemon's API report a fee, so
                         //    this is the only place it exists.
-                        if let Ok(Some(serialized)) =
-                            self.stored_transaction(&tx.kernel_excess_hex).await
-                        {
+                        let stored = match self.stored_transaction(&tx.kernel_excess_hex).await {
+                            Ok(stored) => stored,
+                            // Said out loud like every other enrichment step, so a fee that
+                            // goes missing here is a line in the log rather than a silent gap
+                            // in the report.
+                            Err(e) => {
+                                warn!(
+                                    "[{PAYMENT_PROCESSOR}] could not read the stored transaction \
+                                     for kernel {}: {e:#}",
+                                    tx.kernel_excess_hex
+                                );
+                                None
+                            },
+                        };
+                        if let Some(serialized) = stored {
                             match decode_transaction(&serialized) {
                                 Ok(decoded) => {
                                     enrichment.transaction_fee = Some(decoded.fee);
@@ -1638,13 +1650,34 @@ impl PaymentProcessor {
         let excess = hex::decode(kernel_excess_hex)
             .with_context(|| format!("`{kernel_excess_hex}` is not hex"))?;
         let conn = self.daemon_db().await?;
-        let mut statement = conn.prepare(
-            "SELECT serialized_transaction FROM completed_transactions WHERE kernel_excess = ?1",
-        )?;
-        let row = statement
-            .query_row(rusqlite::params![excess], |row| row.get::<_, Vec<u8>>(0))
-            .ok();
-        Ok(row)
+        stored_transaction_row(&conn, &excess)
+    }
+}
+
+/// The `serialized_transaction` blob the daemon holds for one kernel excess.
+///
+/// `None` means the daemon has no such row and nothing else. Every other sqlite failure is
+/// returned rather than folded into `None`, because the daemon is still running and scanning
+/// while this reads its database: a transient "database is locked" that reported itself as an
+/// absent row would leave a missing fee with no reason anywhere in the log.
+fn stored_transaction_row(
+    conn: &rusqlite::Connection,
+    kernel_excess: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let mut statement = conn.prepare(
+        "SELECT serialized_transaction FROM completed_transactions WHERE kernel_excess = ?1",
+    )?;
+    match statement.query_row(rusqlite::params![kernel_excess], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) {
+        Ok(serialized) => Ok(Some(serialized)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "Could not read the daemon's stored transaction for kernel excess {}",
+                hex::encode(kernel_excess)
+            )
+        }),
     }
 }
 
@@ -2188,6 +2221,58 @@ mod tests {
         // A zero fee would be indistinguishable from a free transaction and would quietly
         // break every balance reconciliation that follows.
         assert!(decode_transaction(b"not json").is_err());
+    }
+
+    /// A stand-in for the two columns of the daemon's `completed_transactions` this reads.
+    fn daemon_db_with(serialized: &dyn rusqlite::ToSql) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE completed_transactions (kernel_excess BLOB, serialized_transaction \
+             BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO completed_transactions VALUES (?1, ?2)",
+            rusqlite::params![vec![0xaau8, 0xbb], serialized],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_transaction_the_daemon_has_not_stored_yet_is_simply_absent() {
+        let conn = daemon_db_with(&vec![1u8, 2, 3]);
+        assert_eq!(
+            stored_transaction_row(&conn, &[0xaa, 0xbb]).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        // Until a payment confirms the daemon has no row for it, which is an ordinary state
+        // of the world and not a failure.
+        assert_eq!(stored_transaction_row(&conn, &[0xcc, 0xdd]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_failure_is_not_reported_as_a_missing_transaction() {
+        // The daemon is still running and scanning while enrichment reads its database, so
+        // "database is locked" is a live possibility. Folded into `None` it would look
+        // exactly like an unconfirmed payment and would take a fee out of the profile with
+        // nothing in the log to say why. sqlite's weak typing gives a stand-in failure that
+        // needs no lock: a column the daemon fills with a blob, holding an integer.
+        let conn = daemon_db_with(&7i64);
+        let err = stored_transaction_row(&conn, &[0xaa, 0xbb]).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("Could not read the daemon's stored transaction"),
+            "unexpected error: {text}"
+        );
+        // Naming the excess is what makes the warning at the call site actionable.
+        assert!(text.contains("aabb"), "unexpected error: {text}");
+    }
+
+    #[test]
+    fn a_query_against_a_daemon_database_without_the_table_is_an_error() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(stored_transaction_row(&conn, &[0xaa]).is_err());
     }
 
     #[test]

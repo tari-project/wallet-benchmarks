@@ -56,6 +56,9 @@ locks itself out or rejects a transaction under load is measured doing so.
   so a profile always names the software that produced it. A binary reporting the wrong version
   refuses the run rather than quietly producing a profile that claims a pin it never had.
 * Funds on Esmeralda: one UTXO of at least `A_fund` (10,000 tXTM by default) per mode.
+* For `payment_processor` only: the manual preflight gate has to have been passed at the current
+  pins. See [Preflight](#preflight-prove-the-seam-before-trusting-a-mode-3-number) — it needs a
+  live chain and funds, so nothing in `cargo test` or `cargo run -- plan` can stand in for it.
 
 ## Running it
 
@@ -205,6 +208,41 @@ representations were compared field by field — same 17 serde-visible fields, s
 names, same two `#[serde(skip)]`, every reachable field type identical, and no serde-surface
 change in `tari_script` or in the reachable part of `tari_common_types`. **That compatibility is
 incidental, not guaranteed. Re-verify it whenever either pin moves.**
+
+### Preflight: prove the seam before trusting a mode 3 number
+
+The field-by-field comparison above is a reading of two source trees. It is not a demonstration
+that a `WalletOutput` the daemon wrote is one the processor can spend, and no amount of code in
+this repository can turn it into one: the seam is only exercised when a real daemon locks a real
+funded UTXO and a real processor deserialises it. **So mode 3 has a manual gate. Run it once,
+against live Esmeralda, before any mode 3 profile is worth reading, and again whenever any of
+the four pins moves.** It cannot be run from CI and it is not part of `cargo run -- run`.
+
+The gate is one funded payment, end to end:
+
+```bash
+export HARNESS_WALLET_PW=... HARNESS_SIGNER_PASSPHRASE=...
+./tools/fetch.sh                                              # all four binaries, at their pins
+cargo run --release -- prepare                                # prints the addresses to fund
+# fund the payment_processor seed's address with at least A_fund, wait for it to confirm, then:
+cargo run --release -- run --modes payment_processor --scenarios B0,S0,S1
+```
+
+What is being watched is whether a batch reaches `Confirmed`. The failure this gate exists to
+catch looks like a batch that never leaves `AwaitingSignature` or `SigningInProgress`, with a
+deserialisation error against `WalletOutput` in `payment_processor.log` under the run's working
+directory (`data/payment_processor/<seed label>/`), retried ten times and then failed. The scan
+scenarios passing proves nothing about the seam — the daemon scans on its own and the processor
+is not involved.
+
+**If it fails, escalate upstream. Do not work around it here.** A harness that reshapes a
+`WalletOutput` on its way between two services is no longer measuring those two services, and
+the profile it produces would describe software nobody runs. The fix belongs in whichever of the
+two pins is wrong, and moving a pin means moving it in all the places it is written down:
+`tools/fetch.sh` (the revision that gets built), the `[pins]` section of `benchmark.toml` and
+`benchmark.example.toml` (the version string asserted at start-up), the two tables above, and —
+for `minotari-cli` only, because the harness links it as a library as well as spawning it —
+`Cargo.toml` and `metrics::MINOTARI_CLI_REV`.
 
 ### Signer keystore
 

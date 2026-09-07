@@ -445,18 +445,41 @@ impl Drop for PpEnv {
     }
 }
 
+/// The header every rendered `.env` starts with.
+const ENV_FILE_HEADER: &str = "# Written by wallet-benchmarks. Every variable here is also set \
+                               directly on the\n# payment processor's process, so editing this \
+                               file has no effect on a running\n# harness; it is here so a run \
+                               can be reproduced by hand.\n";
+
+/// The exact byte length [`render_env_file`] will produce for `env`.
+///
+/// Kept separate so the render can size its buffer in one allocation; see there for why that
+/// matters.
+fn env_file_len(env: &PpEnv) -> usize {
+    env.iter().fold(ENV_FILE_HEADER.len(), |acc, (key, value)| {
+        // `KEY="VALUE"\n`: the two names plus the four bytes of punctuation around them.
+        acc + key.len() + value.len() + 4
+    })
+}
+
 /// Serialises an environment list as a `.env` file.
 ///
 /// The body is `Zeroizing` for the same reason [`PpEnv`] scrubs itself: it holds the signer's
 /// passphrase in the clear on its way to `std::fs::write`.
+///
+/// Every byte is pushed straight into that buffer. A `format!` per line would build the
+/// passphrase's `KEY="VALUE"` in a plain `String` that is dropped unscrubbed, which is the leak
+/// `Zeroizing` is here to prevent. For the same reason the buffer is sized to the finished
+/// length up front: growing it reallocates, and the old allocation is freed with the plaintext
+/// still in it.
 fn render_env_file(env: &PpEnv) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::from(
-        "# Written by wallet-benchmarks. Every variable here is also set directly on the\n# \
-         payment processor's process, so editing this file has no effect on a running\n# harness; \
-         it is here so a run can be reproduced by hand.\n",
-    ));
+    let mut out = Zeroizing::new(String::with_capacity(env_file_len(env)));
+    out.push_str(ENV_FILE_HEADER);
     for (key, value) in env.iter() {
-        out.push_str(&format!("{key}=\"{value}\"\n"));
+        out.push_str(key);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push_str("\"\n");
     }
     out
 }
@@ -2140,6 +2163,49 @@ mod tests {
         let text = render_env_file(&PpEnv(vec![("FEE_PER_GRAM".to_string(), "5".to_string())]));
         assert!(text.contains("FEE_PER_GRAM=\"5\""));
         assert!(text.starts_with('#'), "the file has to explain itself");
+    }
+
+    #[test]
+    fn the_env_file_is_byte_for_byte_what_it_has_always_been() {
+        // The body is assembled by hand rather than by `format!` so no plaintext copy of the
+        // passphrase is left in freed heap. The file itself is a reproduction artefact a human
+        // reads, so pin its exact bytes against that rewrite.
+        let text = render_env_file(&PpEnv(vec![
+            ("TARI_NETWORK".to_string(), "esmeralda".to_string()),
+            (
+                "OFFLINE_SIGNER_PASSPHRASE".to_string(),
+                "hunter2".to_string(),
+            ),
+        ]));
+        assert_eq!(
+            *text,
+            "# Written by wallet-benchmarks. Every variable here is also set directly on the\n# \
+             payment processor's process, so editing this file has no effect on a running\n# \
+             harness; it is here so a run can be reproduced by \
+             hand.\nTARI_NETWORK=\"esmeralda\"\nOFFLINE_SIGNER_PASSPHRASE=\"hunter2\"\n"
+        );
+    }
+
+    #[test]
+    fn the_env_body_is_sized_up_front_so_it_never_reallocates() {
+        // A buffer that grows mid-render copies the passphrase to a fresh allocation and frees
+        // the old one unscrubbed, so the reserved size has to be the finished size exactly:
+        // too small and it reallocates, and there is no point reserving more.
+        let env = render_pp_env(&test_config(), &PpEnvContext {
+            payments_db: PathBuf::from("/work/payments.db"),
+            daemon_url: "http://127.0.0.1:9000".to_string(),
+            offline_signer: PathBuf::from("tools/minotari_offline_signer"),
+            signer_passphrase: Zeroizing::new("the-signer-passphrase".to_string()),
+            view_key: "aa".to_string(),
+            public_spend_key: "bb".to_string(),
+        });
+        let text = render_env_file(&env);
+        assert_eq!(env_file_len(&env), text.len());
+        assert_eq!(
+            text.capacity(),
+            text.len(),
+            "the buffer grew while rendering"
+        );
     }
 
     #[test]

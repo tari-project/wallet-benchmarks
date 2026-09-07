@@ -429,11 +429,46 @@ impl ProcessRole {
             includes_harness: true,
         }
     }
+
+    /// Attaches what was measured for this process to what the mode declared about it.
+    ///
+    /// Every entry in a scan's `processes` breakdown is built this way, so the label and the
+    /// "these figures include the harness" flag have exactly one source — the mode's
+    /// [`WalletMode::resource_processes`] — and cannot drift from the sampler that filled them
+    /// in.
+    pub fn sample(self, usage: &crate::sysprobe::ResourceUsage) -> crate::metrics::ProcessSample {
+        crate::metrics::ProcessSample {
+            process: self.label.to_string(),
+            peak_rss_bytes: usage.peak_rss_bytes,
+            peak_cpu_percent: usage.peak_cpu_percent,
+            includes_harness: self.includes_harness,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sampled_process_carries_the_disclosure_its_mode_declared() {
+        // The label and the "this includes the harness" flag come from the role, not from the
+        // sampling site, so a mode cannot measure one process and describe another.
+        let usage = crate::sysprobe::ResourceUsage {
+            peak_rss_bytes: 512,
+            peak_cpu_percent: 12.5,
+            samples: 3,
+        };
+        let harness = ProcessRole::with_harness("harness").sample(&usage);
+        assert_eq!(harness.process, "harness");
+        assert_eq!(harness.peak_rss_bytes, 512);
+        assert!(harness.includes_harness);
+        assert!(
+            !ProcessRole::external("daemon")
+                .sample(&usage)
+                .includes_harness
+        );
+    }
 
     #[test]
     fn a_wallet_holding_unconfirmed_change_still_reports_its_whole_balance() {

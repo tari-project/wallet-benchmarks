@@ -943,20 +943,13 @@ impl PaymentProcessor {
         inner.processor_sampler = Some(ResourceSampler::start(
             inner.processor.as_ref().and_then(Child::id),
         ));
-        vec![
-            ProcessSample {
-                process: PROCESS_DAEMON.to_string(),
-                peak_rss_bytes: daemon.peak_rss_bytes,
-                peak_cpu_percent: daemon.peak_cpu_percent,
-                includes_harness: false,
-            },
-            ProcessSample {
-                process: PROCESS_PAYMENT_PROCESSOR.to_string(),
-                peak_rss_bytes: processor.peak_rss_bytes,
-                peak_cpu_percent: processor.peak_cpu_percent,
-                includes_harness: false,
-            },
-        ]
+        // Zipped against the roles rather than built from them, so the order the daemon comes
+        // first in is the order the profile calls headline.
+        self.resource_processes()
+            .into_iter()
+            .zip([daemon, processor])
+            .map(|(role, usage)| role.sample(&usage))
+            .collect()
     }
 }
 

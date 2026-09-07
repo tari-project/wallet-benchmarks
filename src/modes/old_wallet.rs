@@ -26,7 +26,7 @@ use tonic::transport::Channel;
 use crate::{
     chain::ChainClient,
     config::HarnessConfig,
-    metrics::{ProcessSample, ScanMetrics},
+    metrics::ScanMetrics,
     modes::{
         Balance,
         Birthday,
@@ -495,12 +495,12 @@ impl WalletMode for OldWallet {
             headline_process: String::new(),
             processes: Vec::new(),
         }
-        .with_processes(vec![ProcessSample {
-            process: PROCESS_CONSOLE_WALLET.to_string(),
-            peak_rss_bytes: usage.peak_rss_bytes,
-            peak_cpu_percent: usage.peak_cpu_percent,
-            includes_harness: false,
-        }])
+        .with_processes(
+            self.resource_processes()
+                .into_iter()
+                .map(|role| role.sample(&usage))
+                .collect(),
+        )
         .finish())
     }
 

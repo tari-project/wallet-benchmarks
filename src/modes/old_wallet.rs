@@ -596,6 +596,8 @@ impl WalletMode for OldWallet {
                 "the console wallet builds and broadcasts inside a single Transfer call"
                     .to_string(),
             ),
+            // A send the console wallet does not accept comes back as a failed `Transfer`.
+            first_broadcast_refused: None,
             tracker: TxTracker::wallet_tx_id(result.transaction_id),
         })
     }

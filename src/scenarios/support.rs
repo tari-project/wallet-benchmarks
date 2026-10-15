@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     metrics::{TxMetric, TxOutcome},
-    modes::{SendRequest, TxState, TxTracker, WalletMode},
+    modes::{SendReceipt, SendRequest, TxState, TxTracker, WalletMode},
 };
 
 /// A broadcast transaction waiting for confirmation, tied back to its [`TxMetric`].
@@ -39,32 +39,7 @@ pub async fn send_recorded(
 
     match mode.send(request).await {
         Ok(receipt) => {
-            let construction_secs = receipt.construction.as_secs_f64();
-            let (batch_id, payment_ids) = match &receipt.tracker {
-                TxTracker::PaymentBatch {
-                    batch_id,
-                    payment_ids,
-                } => (Some(batch_id.clone()), payment_ids.clone()),
-                TxTracker::WalletTxId(_) => (None, Vec::new()),
-            };
-            let metric = TxMetric {
-                label,
-                tx_id: receipt.tx_id,
-                payment_ids,
-                batch_id,
-                outputs,
-                amount,
-                fee: receipt.fee,
-                construction_secs,
-                broadcast_secs: receipt.broadcast.map(|d| d.as_secs_f64()),
-                broadcast_unavailable: receipt.broadcast_unavailable.clone(),
-                submitted_at_secs: submitted_at,
-                construction_done_secs: submitted_at + construction_secs,
-                confirmed_at_secs: None,
-                outcome: TxOutcome::Broadcast,
-                error: None,
-                enrichment: None,
-            };
+            let metric = sent_metric(label, outputs, amount, submitted_at, &receipt);
             (metric, Some(receipt.tracker))
         },
         Err(e) => {
@@ -90,6 +65,49 @@ pub async fn send_recorded(
             };
             (metric, None)
         },
+    }
+}
+
+/// The metric for a send the wallet recorded.
+///
+/// A send whose first broadcast the node refused is still `Broadcast` here, not `Failed`: the
+/// wallet kept it and rebroadcasts it, so it can still be mined, and confirmation tracking
+/// decides how it ends. The refusal goes in `error` so it stays visible.
+fn sent_metric(
+    label: String,
+    outputs: u32,
+    amount: u64,
+    submitted_at: f64,
+    receipt: &SendReceipt,
+) -> TxMetric {
+    let construction_secs = receipt.construction.as_secs_f64();
+    let (batch_id, payment_ids) = match &receipt.tracker {
+        TxTracker::PaymentBatch {
+            batch_id,
+            payment_ids,
+        } => (Some(batch_id.clone()), payment_ids.clone()),
+        TxTracker::WalletTxId(_) => (None, Vec::new()),
+    };
+    TxMetric {
+        label,
+        tx_id: receipt.tx_id,
+        payment_ids,
+        batch_id,
+        outputs,
+        amount,
+        fee: receipt.fee,
+        construction_secs,
+        broadcast_secs: receipt.broadcast.map(|d| d.as_secs_f64()),
+        broadcast_unavailable: receipt.broadcast_unavailable.clone(),
+        submitted_at_secs: submitted_at,
+        construction_done_secs: submitted_at + construction_secs,
+        confirmed_at_secs: None,
+        outcome: TxOutcome::Broadcast,
+        error: receipt
+            .first_broadcast_refused
+            .as_ref()
+            .map(|reason| format!("not accepted at first broadcast: {reason}")),
+        enrichment: None,
     }
 }
 
@@ -594,5 +612,51 @@ mod tests {
         c.error = Some("no funds".to_string());
         let errors = distinct_errors(&[a, b, c], 5);
         assert_eq!(errors, vec!["locked".to_string(), "no funds".to_string()]);
+    }
+
+    fn receipt(first_broadcast_refused: Option<&str>) -> SendReceipt {
+        SendReceipt {
+            tx_id: Some(42),
+            fee: 175,
+            construction: Duration::from_millis(500),
+            broadcast: Some(Duration::from_millis(20)),
+            broadcast_unavailable: None,
+            first_broadcast_refused: first_broadcast_refused.map(ToString::to_string),
+            tracker: TxTracker::wallet_tx_id(42),
+        }
+    }
+
+    #[test]
+    fn an_accepted_send_is_recorded_as_broadcast_with_no_error() {
+        let metric = sent_metric("s4-tx0".to_string(), 1, 1_000, 2.0, &receipt(None));
+        assert_eq!(metric.outcome, TxOutcome::Broadcast);
+        assert_eq!(metric.tx_id, Some(42));
+        assert_eq!(metric.fee, 175);
+        assert_eq!(metric.construction_done_secs, 2.5);
+        assert!(metric.error.is_none());
+    }
+
+    #[test]
+    fn a_refused_but_recorded_send_is_still_followed_and_says_it_was_refused() {
+        // The wallet kept it to rebroadcast, so it may yet be mined: it keeps its id and fee
+        // and stays `Broadcast` for confirmation tracking to settle.
+        let metric = sent_metric(
+            "s4-tx1".to_string(),
+            1,
+            1_000,
+            0.0,
+            &receipt(Some("Transaction not accepted: mempool full")),
+        );
+        assert_eq!(metric.outcome, TxOutcome::Broadcast);
+        assert_eq!(metric.tx_id, Some(42));
+        assert_eq!(metric.fee, 175);
+        assert_eq!(metric.broadcast_secs, Some(0.02));
+        assert_eq!(
+            metric.error.as_deref(),
+            Some("not accepted at first broadcast: Transaction not accepted: mempool full")
+        );
+        // Not counted as a failure, of the wallet or of the harness.
+        assert_eq!(TxTally::of(std::slice::from_ref(&metric)).failed, 0);
+        assert_eq!(count_infrastructure_failures(&[metric]), 0);
     }
 }

@@ -28,7 +28,7 @@ use minotari::{
     db::{self, CompletedTransactionStatus, SqlitePool},
     http::WalletHttpClient,
     init_db,
-    models::WalletEventType,
+    models::{PendingTransactionStatus, WalletEventType},
     scan::{ScanMode, Scanner},
     transactions::{
         fund_locker::FundLocker,
@@ -310,12 +310,18 @@ impl NewWallet {
     ///
     /// The change output has to be written here: the scan recognises the wallet's own sends
     /// by it, so a batch send without it would never be reconciled.
+    ///
+    /// Any failure before the send is recorded releases the reservation, as the library does;
+    /// nothing else in a harness run would. A reservation another request has already claimed
+    /// is left alone. Once the send is recorded nothing is an error: a send the node does not
+    /// accept stays recorded, with its inputs locked, for the monitor to rebroadcast, and the
+    /// node's reason is returned as `Ok(Some(reason))`.
     async fn broadcast_batch(
         &self,
         pool: &SqlitePool,
         signed: SignedOneSidedTransactionResult,
         idempotency_key: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut conn = pool.get()?;
         let account = db::get_account_by_name(&conn, ACCOUNT)?
             .ok_or_else(|| anyhow!("Account `{ACCOUNT}` is missing from the wallet database"))?;
@@ -325,36 +331,38 @@ impl NewWallet {
                 .id
                 .to_string();
         let tx_id = signed.signed_transaction.tx_id;
-        let kernel_excess = signed
-            .signed_transaction
-            .transaction
-            .body()
-            .kernels()
-            .first()
-            .map(|k| k.excess.as_bytes().to_vec())
-            .unwrap_or_default();
-        let serialized = serde_json::to_vec(&signed.signed_transaction.transaction)?;
-        let sent_output_hash = signed
-            .signed_transaction
-            .sent_hashes
-            .first()
-            .map(hex::encode);
-        // Decrypting the key manager is slow, so it is done before the write lock is taken,
-        // as the library does.
-        let view_key = account
-            .get_key_manager(&self.password)?
-            .get_private_view_key();
 
-        // Kept in its own block so the write transaction, which borrows the connection, is
-        // gone before the submission is awaited.
-        {
+        // Everything up to the commit. `Ok(Some(status))` is a reservation that is no longer
+        // pending: the write transaction is dropped unchanged and the reservation is not ours
+        // to release.
+        let record_result = (|| -> Result<(WalletHttpClient, Option<PendingTransactionStatus>)> {
+            // The node's address is checked before anything is recorded, as the library does.
+            let client = WalletHttpClient::new(self.cfg.base_node_url.parse()?)?;
+            let kernel_excess = signed
+                .signed_transaction
+                .transaction
+                .body()
+                .kernels()
+                .first()
+                .map(|k| k.excess.as_bytes().to_vec())
+                .unwrap_or_default();
+            let serialized = serde_json::to_vec(&signed.signed_transaction.transaction)?;
+            let sent_output_hash = signed
+                .signed_transaction
+                .sent_hashes
+                .first()
+                .map(hex::encode);
+            // Decrypting the key manager is slow, so it is done before the write lock is
+            // taken, as the library does.
+            let view_key = account
+                .get_key_manager(&self.password)?
+                .get_private_view_key();
+
             let record =
                 conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(status) = db::claim_pending_transaction_for_broadcast(&record, &pending_id)?
             {
-                return Err(anyhow!(
-                    "The UTXO reservation for `{idempotency_key}` is already {status}"
-                ));
+                return Ok((client, Some(status)));
             }
             db::create_completed_transaction(
                 &record,
@@ -375,23 +383,33 @@ impl NewWallet {
                 )?;
             }
             record.commit()?;
-        }
+            Ok((client, None))
+        })();
 
-        // From here on the send is recorded and the library's monitor owns it: a send the node
-        // does not accept stays locked and is rebroadcast, never released. The benchmark still
-        // counts it as failed.
-        let client = WalletHttpClient::new(self.cfg.base_node_url.parse()?)?;
+        let client = match record_result {
+            Ok((client, None)) => client,
+            Ok((_, Some(status))) => {
+                return Err(anyhow!(
+                    "The UTXO reservation for `{idempotency_key}` is already {status}"
+                ));
+            },
+            Err(e) => {
+                // A failed write rolled back, so the reservation is as it was. `Ok(false)`
+                // means it is no longer pending and belongs to whoever moved it.
+                let _ = db::expire_and_unlock_pending_transaction(&conn, &pending_id);
+                return Err(e);
+            },
+        };
+
         let response = client
             .submit_transaction(signed.signed_transaction.transaction)
             .await;
         let first_broadcast = record_first_broadcast(Some(&conn), tx_id, response);
-        if !first_broadcast.accepted_by_node {
-            return Err(anyhow!(
-                "Transaction not accepted by the network: {}",
-                first_broadcast.node_reason.unwrap_or_default()
-            ));
+        if first_broadcast.accepted_by_node {
+            Ok(None)
+        } else {
+            Ok(Some(first_broadcast.node_reason.unwrap_or_default()))
         }
-        Ok(())
     }
 }
 
@@ -816,20 +834,20 @@ impl WalletMode for NewWallet {
                 .finalize_transaction_and_broadcast(signed, self.cfg.base_node_url.clone())
                 .await?;
             // The library no longer errors when the node turns a recorded send away: it keeps
-            // the send, and its inputs locked, for the monitor to rebroadcast. The benchmark
-            // still counts that send as failed, as it did when the library reported an error.
-            if !finalized.accepted_by_node {
-                return Err(anyhow!(
-                    "Transaction not accepted by the network: {}",
-                    finalized.node_reason.unwrap_or_default()
-                ));
-            }
+            // the send, and its inputs locked, for the monitor to rebroadcast, so it may yet be
+            // mined. It is followed like any other send, with the refusal noted.
+            let first_broadcast_refused = if finalized.accepted_by_node {
+                None
+            } else {
+                Some(finalized.node_reason.unwrap_or_default())
+            };
             return Ok(SendReceipt {
                 tx_id: Some(tx_id),
                 fee,
                 construction,
                 broadcast: Some(broadcast_start.elapsed()),
                 broadcast_unavailable: None,
+                first_broadcast_refused,
                 tracker: TxTracker::wallet_tx_id(tx_id),
             });
         }
@@ -845,7 +863,8 @@ impl WalletMode for NewWallet {
             .await;
 
         let broadcast_start = Instant::now();
-        self.broadcast_batch(&handles.pool, signed, &idempotency_key)
+        let first_broadcast_refused = self
+            .broadcast_batch(&handles.pool, signed, &idempotency_key)
             .await?;
         Ok(SendReceipt {
             tx_id: Some(tx_id),
@@ -853,6 +872,7 @@ impl WalletMode for NewWallet {
             construction,
             broadcast: Some(broadcast_start.elapsed()),
             broadcast_unavailable: None,
+            first_broadcast_refused,
             tracker: TxTracker::wallet_tx_id(tx_id),
         })
     }

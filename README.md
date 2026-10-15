@@ -290,9 +290,12 @@ comparable with ones taken after it, for either wallet:
   way the library's single-recipient path does, so `pending_incoming` now includes change
   straight after a send.
 * **A send the node does not accept is no longer released.** The library keeps it recorded,
-  with its inputs locked, for the monitor to rebroadcast. The harness still counts it as a
-  failed send, but its inputs no longer return to the pool for the next send, which matters
-  most to S4 under contention.
+  with its inputs locked, for the monitor to rebroadcast, so it can still be mined. The
+  harness therefore no longer counts it as failed at send time: it keeps its `tx_id` and fee,
+  carries `not accepted at first broadcast: <reason>` in `error`, and is followed to
+  `confirmed`, `failed` (once the monitor gives up and rejects it) or `timed_out` like any
+  other send. Its inputs no longer return to the pool for the next send, which matters most
+  to S4 under contention.
 * **Each `new_wallet` scan pass now ends by running the transaction monitor** (it never ran
   under `ScanMode::Full` before), which adds a mempool query per pending send to every pass.
   Expect scan and refresh timings (S0, S2, S6, S7) to move slightly.

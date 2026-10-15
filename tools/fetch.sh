@@ -25,9 +25,9 @@ SRC_DIR="${TOOLS_DIR}/src"
 # Keep these in step with the `[pins]` versions in benchmark.example.toml. Changing one
 # without the other makes the start-up assertion fail, which is the point.
 
-# tari, for `minotari_console_wallet` (mode 1). Reports `minotari_console_wallet 5.6.0-pre.1`.
+# tari, for `minotari_console_wallet` (mode 1). Reports `minotari_console_wallet 6.2.0-pre.1`.
 TARI_REPO="https://github.com/tari-project/tari.git"
-TARI_REV="v5.6.0-pre.1"
+TARI_REV="v6.2.0-pre.1"
 
 # tari again, at a *different* revision, for `minotari_offline_signer` (mode 3).
 #
@@ -40,12 +40,12 @@ TARI_REV="v5.6.0-pre.1"
 # signer while still on 4.0.0.
 SIGNER_REV="9f5adb7"
 
-# minotari-cli, for the `minotari` daemon (mode 3's payment receiver). Reports `tari 0.2.0`:
+# minotari-cli, for the `minotari` daemon (mode 3's payment receiver). Reports `tari 0.3.0`:
 # the executable is `minotari` but its clap command is named `tari`. This is the same
 # revision the harness links as a library; keep it in step with `Cargo.toml` and
 # `metrics::MINOTARI_CLI_REV`.
 MINOTARI_CLI_REPO="https://github.com/tari-project/minotari-cli.git"
-MINOTARI_CLI_REV="60fde7b39e20a9d92c3b987a25eb636bf4da2722"
+MINOTARI_CLI_REV="1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8"
 
 # minotari_payment_processor (mode 3). Takes no `--version` flag; the harness reads its
 # version from `GET /health/version` once it is up.

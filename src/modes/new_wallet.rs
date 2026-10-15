@@ -28,11 +28,11 @@ use minotari::{
     db::{self, CompletedTransactionStatus, SqlitePool},
     http::WalletHttpClient,
     init_db,
-    models::{PendingTransactionStatus, WalletEventType},
+    models::WalletEventType,
     scan::{ScanMode, Scanner},
     transactions::{
         fund_locker::FundLocker,
-        manager::TransactionSender,
+        manager::{record_first_broadcast, TransactionSender},
         one_sided_transaction::{unsigned_transaction_binding, OneSidedTransaction, Recipient},
     },
     utils::init_wallet::init_with_seed_words,
@@ -42,8 +42,8 @@ use tari_common::configuration::Network;
 use tari_common_types::{tari_address::TariAddress, transaction::TxId, types::FixedHash};
 use tari_transaction_components::{
     consensus::ConsensusConstantsBuilder,
+    key_manager::TransactionKeyManagerInterface,
     offline_signing::{models::SignedOneSidedTransactionResult, sign_locked_transaction},
-    rpc::models::TxSubmissionRejectionReason,
     MicroMinotari,
 };
 use tari_utilities::ByteArray;
@@ -291,13 +291,10 @@ impl NewWallet {
                         &idempotency_key,
                         account.id,
                     ) {
-                        let pending_id = pending.id.to_string();
-                        let _ = db::update_pending_transaction_status(
+                        let _ = db::expire_and_unlock_pending_transaction(
                             &conn,
-                            &pending_id,
-                            PendingTransactionStatus::Expired,
+                            &pending.id.to_string(),
                         );
-                        let _ = db::unlock_outputs_for_request(&conn, &pending_id);
                     }
                 }
                 Err(e)
@@ -305,23 +302,28 @@ impl NewWallet {
         }
     }
 
-    /// Broadcasts a batch transaction and records it the way the library records its own:
-    /// pending transaction completed, completed transaction stored, submitted through
-    /// [`WalletHttpClient`], then marked broadcast or rejected.
+    /// Broadcasts a batch transaction and records it the way
+    /// `TransactionSender::finalize_transaction_and_broadcast` records its own: the reservation
+    /// claimed, the completed transaction and its `UNCONFIRMED` change output written in one
+    /// write transaction, then submitted through [`WalletHttpClient`] and the node's answer
+    /// filed with `record_first_broadcast`.
+    ///
+    /// The change output has to be written here: the scan recognises the wallet's own sends
+    /// by it, so a batch send without it would never be reconciled.
     async fn broadcast_batch(
         &self,
         pool: &SqlitePool,
         signed: SignedOneSidedTransactionResult,
         idempotency_key: &str,
     ) -> Result<()> {
-        let conn = pool.get()?;
-        let account_id = Self::account_id(pool)?;
+        let mut conn = pool.get()?;
+        let account = db::get_account_by_name(&conn, ACCOUNT)?
+            .ok_or_else(|| anyhow!("Account `{ACCOUNT}` is missing from the wallet database"))?;
         let pending_id =
-            db::find_pending_transaction_by_idempotency_key(&conn, idempotency_key, account_id)?
+            db::find_pending_transaction_by_idempotency_key(&conn, idempotency_key, account.id)?
                 .ok_or_else(|| anyhow!("The UTXO reservation for `{idempotency_key}` is gone"))?
                 .id
                 .to_string();
-        let pending_id = pending_id.as_str();
         let tx_id = signed.signed_transaction.tx_id;
         let kernel_excess = signed
             .signed_transaction
@@ -337,53 +339,59 @@ impl NewWallet {
             .sent_hashes
             .first()
             .map(hex::encode);
+        // Decrypting the key manager is slow, so it is done before the write lock is taken,
+        // as the library does.
+        let view_key = account
+            .get_key_manager(&self.password)?
+            .get_private_view_key();
 
-        db::update_pending_transaction_status(
-            &conn,
-            pending_id,
-            PendingTransactionStatus::Completed,
-        )?;
-        db::create_completed_transaction(
-            &conn,
-            account_id,
-            pending_id,
-            &kernel_excess,
-            &serialized,
-            sent_output_hash,
-            tx_id,
-        )?;
+        // Kept in its own block so the write transaction, which borrows the connection, is
+        // gone before the submission is awaited.
+        {
+            let record =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(status) = db::claim_pending_transaction_for_broadcast(&record, &pending_id)?
+            {
+                return Err(anyhow!(
+                    "The UTXO reservation for `{idempotency_key}` is already {status}"
+                ));
+            }
+            db::create_completed_transaction(
+                &record,
+                account.id,
+                &pending_id,
+                &kernel_excess,
+                &serialized,
+                sent_output_hash,
+                tx_id,
+            )?;
+            if let Some(change_output) = &signed.signed_transaction.change_output {
+                db::insert_unconfirmed_change_output(
+                    &record,
+                    account.id,
+                    &view_key,
+                    &pending_id,
+                    change_output,
+                )?;
+            }
+            record.commit()?;
+        }
 
+        // From here on the send is recorded and the library's monitor owns it: a send the node
+        // does not accept stays locked and is rebroadcast, never released. The benchmark still
+        // counts it as failed.
         let client = WalletHttpClient::new(self.cfg.base_node_url.parse()?)?;
         let response = client
             .submit_transaction(signed.signed_transaction.transaction)
             .await;
-
-        match response {
-            Ok(r)
-                if r.accepted ||
-                    r.rejection_reason == TxSubmissionRejectionReason::AlreadyMined =>
-            {
-                db::mark_completed_transaction_as_broadcasted(&conn, tx_id, 1)?;
-                Ok(())
-            },
-            Ok(r) => {
-                db::mark_completed_transaction_as_rejected(
-                    &conn,
-                    tx_id,
-                    &r.rejection_reason.to_string(),
-                )?;
-                let _ = db::unlock_outputs_for_request(&conn, pending_id);
-                Err(anyhow!(
-                    "Transaction rejected by the network: {}",
-                    r.rejection_reason
-                ))
-            },
-            Err(e) => {
-                db::mark_completed_transaction_as_rejected(&conn, tx_id, &e.to_string())?;
-                let _ = db::unlock_outputs_for_request(&conn, pending_id);
-                Err(anyhow!("Transaction submission failed: {e}"))
-            },
+        let first_broadcast = record_first_broadcast(Some(&conn), tx_id, response);
+        if !first_broadcast.accepted_by_node {
+            return Err(anyhow!(
+                "Transaction not accepted by the network: {}",
+                first_broadcast.node_reason.unwrap_or_default()
+            ));
         }
+        Ok(())
     }
 }
 
@@ -446,9 +454,11 @@ fn open_pool(
 /// balance identical to the µT, because the pre-wipe wallet was holding one output under a
 /// lock that nothing had released and the fresh scan had no locks at all.
 ///
-/// (Nothing releases it in a harness run: expiry is the daemon's `tasks::unlocker`, which
-/// only runs inside the daemon. A send whose transaction never confirms therefore leaves its
-/// input locked for the rest of the run.)
+/// (Little releases it in a harness run: reservation expiry is the daemon's `tasks::unlocker`,
+/// which only runs inside the daemon, and a recorded send the node will not take is released
+/// only once the transaction monitor, which runs after each scan pass, has failed to
+/// rebroadcast it `MAX_BROADCAST_ATTEMPTS` (10) times. A send that never confirms therefore
+/// usually leaves its input locked for the rest of the run.)
 pub(crate) fn held_output_values(
     conn: &rusqlite::Connection,
     account_id: i64,
@@ -802,9 +812,18 @@ impl WalletMode for NewWallet {
                 .await;
 
             let broadcast_start = Instant::now();
-            sender
+            let finalized = sender
                 .finalize_transaction_and_broadcast(signed, self.cfg.base_node_url.clone())
                 .await?;
+            // The library no longer errors when the node turns a recorded send away: it keeps
+            // the send, and its inputs locked, for the monitor to rebroadcast. The benchmark
+            // still counts that send as failed, as it did when the library reported an error.
+            if !finalized.accepted_by_node {
+                return Err(anyhow!(
+                    "Transaction not accepted by the network: {}",
+                    finalized.node_reason.unwrap_or_default()
+                ));
+            }
             return Ok(SendReceipt {
                 tx_id: Some(tx_id),
                 fee,
@@ -855,15 +874,11 @@ impl WalletMode for NewWallet {
         // The wallet learns a transaction landed by scanning up its own outputs, so that is
         // what is asked here.
         //
-        // The `completed_transactions` bookkeeping below would be the tidier source, but
-        // nothing maintains it under `ScanMode::Full`: that mode runs
-        // `ScanCoordinator::unified_scan_loop`, which sets `next_block_to_scan =
-        // last.height + 1` and then guards its `monitor_if_needed` call with
-        // `last.height >= next_block_to_scan`. That is never true, so the transaction monitor
-        // never runs and every transaction stays `Broadcast` for ever. (The equivalent call
-        // in `recent_full_scan_loop`, used by the three-phase fast sync, is not guarded and
-        // does run.) Worth an upstream fix; until then, the outputs table is the wallet's
-        // honest answer, and it is scan-driven rather than monitor-driven.
+        // Since `minotari-cli` 1ab7c8c6 the scan also settles `completed_transactions`
+        // (`Broadcast` -> `MinedUnconfirmed` -> `MinedConfirmed`), so the record below is
+        // maintained under `ScanMode::Full` too. The outputs table stays the first source
+        // anyway: it is what the same scan writes first, and reading it keeps confirmation
+        // times comparable with profiles taken when the transaction monitor never ran.
         for hash in &watched {
             if let Some((height, confirmed_height)) = output_depth(&conn, account_id, hash)? {
                 if height > 0 {

@@ -558,6 +558,7 @@ impl WalletMode for OldWallet {
             .transfer(grpc::TransferRequest {
                 recipients,
                 single_tx: request.outputs.len() > 1,
+                excluded_commitments: Vec::new(),
             })
             .await
             .map_err(|e| anyhow!("Transfer failed: {e}"))?

@@ -243,18 +243,20 @@ Notes on what the numbers mean:
   completion. That wait is reported as `validation_secs` and included in `T_scan`; a set that
   never settles is recorded as `validation_completed: false` rather than failing the run.
 * `new_wallet` confirmation is read from the wallet's outputs table with a narrow query, not
-  through the library's own helpers. Two upstream bugs make the tidier routes unusable: under
-  `ScanMode::Full` the transaction monitor that maintains `completed_transactions` sits behind
-  an unsatisfiable guard in `unified_scan_loop`, so those records never leave `Broadcast`; and
-  `db::get_output_by_id` cannot map its own rows, because the scanner writes `mined_timestamp`
-  with a UTC offset that will not parse back into a `NaiveDateTime`. Both are commented in
-  `modes/new_wallet.rs` and both are worth fixing upstream.
+  through the library's own helpers. `db::get_output_by_id` cannot map its own rows, because
+  the scanner writes `mined_timestamp` with a UTC offset that will not parse back into a
+  `NaiveDateTime`; that is commented in `modes/new_wallet.rs` and worth fixing upstream. Up to
+  `minotari-cli` `60fde7b3` the `completed_transactions` records were no alternative either,
+  since the transaction monitor sat behind an unsatisfiable guard in `unified_scan_loop` and
+  they never left `Broadcast`. From `1ab7c8c6` the scan settles them, but the outputs table is
+  still read first so confirmation times stay comparable.
 * A rescan is compared against the wallet it replaced at the *same height*, and counts every
   output the wallet holds including ones a pending transaction has locked. Both matter: a
   rescan finishes minutes after the snapshot it is checked against, and a lock is a
-  reservation rather than a disposal. Nothing releases an expired lock in a harness run —
-  that is the daemon's `tasks::unlocker` — so a send that never confirms leaves its input
-  locked for the rest of the run, and counting locked outputs as gone made an S6 rescan look
+  reservation rather than a disposal. Nothing releases an expired reservation in a harness
+  run — that is the daemon's `tasks::unlocker` — and a recorded send the node will not take
+  is only released after ten failed rebroadcasts, so a send that never confirms usually leaves
+  its input locked for the rest of the run, and counting locked outputs as gone made an S6 rescan look
   like it had invented one (652 against 651, with the balance identical to the µT).
 * An arm of S5 that does not pay every recipient still gets its duration recorded, but no
   throughput or fee multiplier is derived from it: ten batch calls rejected in 14 ms against a
@@ -274,12 +276,29 @@ The `minotari-cli` dependency is pinned to a git revision in `Cargo.toml`;
 `metrics::MINOTARI_CLI_REV` and `tools/fetch.sh` record the same revision, and every profile
 carries it. Change all three together.
 
-The pin is currently `60fde7b3`, bumped from `84c79e9c`. The five intervening commits are all
-transaction-reservation and idempotency fixes — atomic send idempotency, a replayed send no
-longer tearing down or double-spending a reservation, teardown guarded on the reservation still
-being pending, and the unlocker kept off claimed rows. That is precisely the ground S4 stresses
-under concurrency, so **expect `new_wallet`'s S4 numbers to move** against any profile taken on
-the old pin. The two are not comparable.
+The pin is currently `1ab7c8c6`, bumped from `60fde7b3`, and the tari crates (and the
+console wallet `tools/fetch.sh` builds) move with it from 5.6.0-pre.1 to 6.2.0-pre.1, the
+release that `minotari-cli` revision links. Profiles taken before this bump are not
+comparable with ones taken after it, for either wallet:
+
+* **Every `new_wallet` send now carries a change output.** Input selection charges for the
+  change up front and always leaves change worth at least the fee to spend one input, so fees
+  per transaction rise slightly and a send that would have spent an input exactly now picks
+  another one or fails with `ChangeNotAffordable`. That touches S1, S4 and S5.
+* **A `new_wallet` send's change output is written at send time** as `UNCONFIRMED`, and the
+  scan recognises the send by it. The batch path in `modes/new_wallet.rs` writes it the same
+  way the library's single-recipient path does, so `pending_incoming` now includes change
+  straight after a send.
+* **A send the node does not accept is no longer released.** The library keeps it recorded,
+  with its inputs locked, for the monitor to rebroadcast. The harness still counts it as a
+  failed send, but its inputs no longer return to the pool for the next send, which matters
+  most to S4 under contention.
+* **Each `new_wallet` scan pass now ends by running the transaction monitor** (it never ran
+  under `ScanMode::Full` before), which adds a mempool query per pending send to every pass.
+  Expect scan and refresh timings (S0, S2, S6, S7) to move slightly.
+* **The console wallet moves a major version.** Among the tari changes is "wallet output state
+  consistency" (tari #8066), which touches the output bookkeeping S2's revalidation waits on.
+  `old_wallet` numbers should be re-baselined rather than compared across the bump.
 
 ## Licence
 

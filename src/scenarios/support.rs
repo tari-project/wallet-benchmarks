@@ -72,7 +72,9 @@ pub async fn send_recorded(
 ///
 /// A send whose first broadcast the node refused is still `Broadcast` here, not `Failed`: the
 /// wallet kept it and rebroadcasts it, so it can still be mined, and confirmation tracking
-/// decides how it ends. The refusal goes in `error` so it stays visible.
+/// decides how it ends: confirmed if it is mined, timed out while the wallet keeps retrying
+/// it, failed only if the scan sees its inputs spent by a different transaction. The refusal
+/// goes in `error` so it stays visible.
 fn sent_metric(
     label: String,
     outputs: u32,

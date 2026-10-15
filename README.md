@@ -254,10 +254,11 @@ Notes on what the numbers mean:
   output the wallet holds including ones a pending transaction has locked. Both matter: a
   rescan finishes minutes after the snapshot it is checked against, and a lock is a
   reservation rather than a disposal. Nothing releases an expired reservation in a harness
-  run — that is the daemon's `tasks::unlocker` — and a recorded send the node will not take
-  is only released after ten failed rebroadcasts, so a send that never confirms usually leaves
-  its input locked for the rest of the run, and counting locked outputs as gone made an S6 rescan look
-  like it had invented one (652 against 651, with the balance identical to the µT).
+  run — that is the daemon's `tasks::unlocker` — and nothing releases a recorded send the
+  node will not take either: the monitor only stalls it, and only a manual abandon or the
+  scan seeing its inputs spent elsewhere ends it. A send that never confirms therefore leaves
+  its input locked for the rest of the run, and counting locked outputs as gone made an S6
+  rescan look like it had invented one (652 against 651, with the balance identical to the µT).
 * An arm of S5 that does not pay every recipient still gets its duration recorded, but no
   throughput or fee multiplier is derived from it: ten batch calls rejected in 14 ms against a
   completed individual arm would read as a 25,000x speed-up.
@@ -292,9 +293,11 @@ comparable with ones taken after it, for either wallet:
 * **A send the node does not accept is no longer released.** The library keeps it recorded,
   with its inputs locked, for the monitor to rebroadcast, so it can still be mined. The
   harness therefore no longer counts it as failed at send time: it keeps its `tx_id` and fee,
-  carries `not accepted at first broadcast: <reason>` in `error`, and is followed to
-  `confirmed`, `failed` (once the monitor gives up and rejects it) or `timed_out` like any
-  other send. Its inputs no longer return to the pool for the next send, which matters most
+  carries `not accepted at first broadcast: <reason>` in `error`, and is followed like any
+  other send. The monitor never gives up on it: after ten refused rebroadcasts it is
+  *stalled* (still locked, retried less often), so it ends `confirmed` if it is mined,
+  `timed_out` while it stays stalled, and `failed` only if the scan sees its inputs spent by
+  a different transaction. Its inputs no longer return to the pool for the next send, which matters most
   to S4 under contention.
 * **Each `new_wallet` scan pass now ends by running the transaction monitor** (it never ran
   under `ScanMode::Full` before), which adds a mempool query per pending send to every pass.

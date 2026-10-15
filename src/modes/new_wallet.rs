@@ -44,6 +44,7 @@ use tari_transaction_components::{
     consensus::ConsensusConstantsBuilder,
     key_manager::TransactionKeyManagerInterface,
     offline_signing::{models::SignedOneSidedTransactionResult, sign_locked_transaction},
+    transaction_components::WalletOutput,
     MicroMinotari,
 };
 use tari_utilities::ByteArray;
@@ -285,18 +286,7 @@ impl NewWallet {
             Err(e) => {
                 // Nothing was broadcast, so release the reservation the same way the
                 // library's single-recipient path does when construction fails.
-                if let Ok(conn) = pool.get() {
-                    if let Ok(Some(pending)) = db::find_pending_transaction_by_idempotency_key(
-                        &conn,
-                        &idempotency_key,
-                        account.id,
-                    ) {
-                        let _ = db::expire_and_unlock_pending_transaction(
-                            &conn,
-                            &pending.id.to_string(),
-                        );
-                    }
-                }
+                release_reservation(pool, &idempotency_key);
                 Err(e)
             },
         }
@@ -306,6 +296,10 @@ impl NewWallet {
     /// `TransactionSender::finalize_transaction_and_broadcast` records its own: the send is
     /// recorded by [`record_batch_send`], then submitted through [`WalletHttpClient`] and the
     /// node's answer filed with `record_first_broadcast`.
+    ///
+    /// A failure before the send is recorded releases the reservation, as the library does:
+    /// a bad base node URL, a transaction that will not serialise, or the recording thread
+    /// dying. Failures inside the recording are released by [`record_batch_send`] itself.
     ///
     /// Once the send is recorded nothing is an error: a send the node does not accept stays
     /// recorded, with its inputs locked, for the monitor to rebroadcast, and the node's reason
@@ -321,19 +315,40 @@ impl NewWallet {
         idempotency_key: &str,
     ) -> Result<Option<String>> {
         // The node's address is checked before anything is recorded, as the library does.
-        let client = WalletHttpClient::new(self.cfg.base_node_url.parse()?)?;
-        let tx_id = signed.signed_transaction.tx_id;
+        let prepared = (|| -> Result<(WalletHttpClient, BatchRecord)> {
+            let client = WalletHttpClient::new(self.cfg.base_node_url.parse()?)?;
+            let record = BatchRecord::from_signed(&signed)?;
+            Ok((client, record))
+        })();
+        let (client, record) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                release_reservation(pool, idempotency_key);
+                return Err(e);
+            },
+        };
+        let tx_id = record.tx_id;
 
         let record_pool = pool.clone();
         let password = self.password.clone();
         let key = idempotency_key.to_string();
-        let transaction = tokio::task::spawn_blocking(move || {
-            record_batch_send(&record_pool, &password, &signed, &key)?;
-            Ok::<_, anyhow::Error>(signed.signed_transaction.transaction)
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_batch_send(&record_pool, &password, &key, &record)
         })
-        .await??;
+        .await;
+        match recorded {
+            Ok(result) => result?,
+            Err(e) => {
+                // The recording thread panicked or was cancelled, so it may not have released
+                // anything. Releasing only touches a reservation that is still pending.
+                release_reservation(pool, idempotency_key);
+                return Err(anyhow!("Recording the batch send failed: {e}"));
+            },
+        }
 
-        let response = client.submit_transaction(transaction).await;
+        let response = client
+            .submit_transaction(signed.signed_transaction.transaction)
+            .await;
 
         let file_pool = pool.clone();
         let first_broadcast = tokio::task::spawn_blocking(move || match file_pool.get() {
@@ -350,20 +365,80 @@ impl NewWallet {
     }
 }
 
-/// Records a signed batch send the way `TransactionSender::finalize_transaction_and_broadcast`
-/// does before it submits: the reservation claimed, the completed transaction and its
+/// Releases the reservation filed under `idempotency_key` if it is still pending: expired,
+/// with its outputs unlocked. A reservation that has moved on (claimed for broadcast, or
+/// already released) is left as it is. Failures are ignored; this only runs on a path that is
+/// already returning an error.
+fn release_reservation(pool: &SqlitePool, idempotency_key: &str) {
+    let Ok(conn) = pool.get() else {
+        return;
+    };
+    let Ok(Some(account)) = db::get_account_by_name(&conn, ACCOUNT) else {
+        return;
+    };
+    if let Ok(Some(pending)) =
+        db::find_pending_transaction_by_idempotency_key(&conn, idempotency_key, account.id)
+    {
+        let _ = db::expire_and_unlock_pending_transaction(&conn, &pending.id.to_string());
+    }
+}
+
+/// What [`record_batch_send`] writes for a signed batch send, taken out of the signed result
+/// up front.
+struct BatchRecord {
+    tx_id: TxId,
+    kernel_excess: Vec<u8>,
+    serialized: Vec<u8>,
+    sent_output_hash: Option<String>,
+    change_output: Option<WalletOutput>,
+}
+
+impl BatchRecord {
+    fn from_signed(signed: &SignedOneSidedTransactionResult) -> Result<Self> {
+        let kernel_excess = signed
+            .signed_transaction
+            .transaction
+            .body()
+            .kernels()
+            .first()
+            .map(|k| k.excess.as_bytes().to_vec())
+            .unwrap_or_default();
+        Ok(Self {
+            tx_id: signed.signed_transaction.tx_id,
+            kernel_excess,
+            serialized: serde_json::to_vec(&signed.signed_transaction.transaction)?,
+            sent_output_hash: signed
+                .signed_transaction
+                .sent_hashes
+                .first()
+                .map(hex::encode),
+            change_output: signed.signed_transaction.change_output.clone(),
+        })
+    }
+}
+
+/// Records a batch send the way `TransactionSender::finalize_transaction_and_broadcast` does
+/// before it submits: the reservation claimed, the completed transaction and its
 /// `UNCONFIRMED` change output written in one write transaction.
 ///
 /// The change output has to be written here: the scan recognises the wallet's own sends by
 /// it, so a batch send without it would never be reconciled.
 ///
-/// Any failure before the commit releases the reservation, as the library does; nothing else
-/// in a harness run would. A reservation another request has already claimed is left alone.
+/// Which failures release the reservation:
+///
+/// * none before the reservation is found — no connection, no account, or no pending row under
+///   `idempotency_key` leaves nothing this call could release. The lookup only finds a reservation
+///   that is still `PENDING`, so one already claimed or released fails here, as "gone";
+/// * every failure after it — the key manager not decrypting, the write lock not being granted, an
+///   insert or the commit failing — rolls the write back and then expires the reservation and
+///   unlocks its outputs, as the library does; nothing else in a harness run would;
+/// * except a reservation another request claims between that lookup and this call's own claim: it
+///   is reported as `already <status>` and left alone.
 fn record_batch_send(
     pool: &SqlitePool,
     password: &Zeroizing<String>,
-    signed: &SignedOneSidedTransactionResult,
     idempotency_key: &str,
+    batch: &BatchRecord,
 ) -> Result<()> {
     let mut conn = pool.get()?;
     let account = db::get_account_by_name(&conn, ACCOUNT)?
@@ -378,20 +453,6 @@ fn record_batch_send(
     // pending: the write transaction is dropped unchanged and the reservation is not ours to
     // release.
     let record_result = (|| -> Result<Option<PendingTransactionStatus>> {
-        let kernel_excess = signed
-            .signed_transaction
-            .transaction
-            .body()
-            .kernels()
-            .first()
-            .map(|k| k.excess.as_bytes().to_vec())
-            .unwrap_or_default();
-        let serialized = serde_json::to_vec(&signed.signed_transaction.transaction)?;
-        let sent_output_hash = signed
-            .signed_transaction
-            .sent_hashes
-            .first()
-            .map(hex::encode);
         // Decrypting the key manager is slow, so it is done before the write lock is taken,
         // as the library does.
         let view_key = account.get_key_manager(password)?.get_private_view_key();
@@ -404,12 +465,12 @@ fn record_batch_send(
             &record,
             account.id,
             &pending_id,
-            &kernel_excess,
-            &serialized,
-            sent_output_hash,
-            signed.signed_transaction.tx_id,
+            &batch.kernel_excess,
+            &batch.serialized,
+            batch.sent_output_hash.clone(),
+            batch.tx_id,
         )?;
-        if let Some(change_output) = &signed.signed_transaction.change_output {
+        if let Some(change_output) = &batch.change_output {
             db::insert_unconfirmed_change_output(
                 &record,
                 account.id,
@@ -1112,5 +1173,272 @@ mod tests {
             None,
             "another account's output"
         );
+    }
+
+    const PASSWORD: &str = "record-batch-send-test";
+    const KEY: &str = "s5-batch-test";
+
+    /// A wallet database built by the library itself: one account, one spendable output, and
+    /// a pending reservation under [`KEY`] holding that output locked — the state
+    /// `build_batch` leaves behind for `record_batch_send`.
+    struct Reserved {
+        _dir: tempfile::TempDir,
+        pool: SqlitePool,
+        pending_id: String,
+        input_id: i64,
+    }
+
+    fn reserved_wallet() -> Reserved {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.db");
+        let words = seeds::generate_seed_words().unwrap();
+        let seed = seeds::cipher_seed_from_words(&words).unwrap();
+        init_with_seed_words(seed, PASSWORD, &path, Some(ACCOUNT)).unwrap();
+        let pool = init_db(path).unwrap();
+        let conn = pool.get().unwrap();
+        let account = db::get_account_by_name(&conn, ACCOUNT).unwrap().unwrap();
+
+        conn.execute(
+            "INSERT INTO outputs (account_id, tx_id, output_hash, mined_in_block_hash, \
+             mined_in_block_height, value, mined_timestamp, wallet_output_json, status, is_burn, \
+             maturity) VALUES (?1, 1, ?2, ?2, 100, 1000000, CURRENT_TIMESTAMP, '{}', 'UNSPENT', \
+             0, 0)",
+            rusqlite::params![account.id, vec![1u8; 32]],
+        )
+        .unwrap();
+        let input_id = conn.last_insert_rowid();
+
+        let binding = unsigned_transaction_binding(
+            Some(KEY.to_string()),
+            account.id,
+            &[],
+            MicroMinotari(5),
+            3600,
+            3,
+        );
+        let pending_id = db::create_pending_transaction(
+            &conn,
+            KEY,
+            &binding,
+            account.id,
+            true,
+            MicroMinotari(0),
+            MicroMinotari(0),
+            MicroMinotari(0),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .unwrap();
+        db::lock_output(&conn, input_id, &pending_id, chrono::Utc::now()).unwrap();
+        drop(conn);
+
+        Reserved {
+            _dir: dir,
+            pool,
+            pending_id,
+            input_id,
+        }
+    }
+
+    /// A batch send with a real change output belonging to the wallet's own key manager.
+    fn batch(pool: &SqlitePool) -> BatchRecord {
+        let conn = pool.get().unwrap();
+        let account = db::get_account_by_name(&conn, ACCOUNT).unwrap().unwrap();
+        let key_manager = account
+            .get_key_manager(&Zeroizing::new(PASSWORD.to_string()))
+            .unwrap();
+        let params = tari_transaction_components::test_helpers::TestParams::new(&key_manager);
+        let change = params
+            .create_output(
+                tari_transaction_components::test_helpers::UtxoTestParams::with_value(
+                    MicroMinotari(400_000),
+                ),
+                &key_manager,
+            )
+            .unwrap();
+        BatchRecord {
+            tx_id: TxId::from(77u64),
+            kernel_excess: vec![9u8; 32],
+            serialized: b"{}".to_vec(),
+            sent_output_hash: None,
+            change_output: Some(change),
+        }
+    }
+
+    fn reservation_status(pool: &SqlitePool, pending_id: &str) -> String {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM pending_transactions WHERE id = ?1",
+                [pending_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `(status, locked_by_request_id)` of the reserved input.
+    fn input_lock(pool: &SqlitePool, input_id: i64) -> (String, Option<String>) {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT status, locked_by_request_id FROM outputs WHERE id = ?1",
+                [input_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn count(pool: &SqlitePool, sql: &str) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    const COMPLETED_ROWS: &str = "SELECT COUNT(*) FROM completed_transactions";
+    const UNCONFIRMED_CHANGE_ROWS: &str =
+        "SELECT COUNT(*) FROM outputs WHERE status = 'UNCONFIRMED' AND deleted_at IS NULL";
+
+    #[test]
+    fn a_recorded_batch_send_claims_its_reservation_and_writes_its_change() {
+        let wallet = reserved_wallet();
+        let batch = batch(&wallet.pool);
+        let change_hash = batch.change_output.as_ref().unwrap().output_hash();
+
+        record_batch_send(
+            &wallet.pool,
+            &Zeroizing::new(PASSWORD.to_string()),
+            KEY,
+            &batch,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reservation_status(&wallet.pool, &wallet.pending_id),
+            PendingTransactionStatus::Completed.to_string()
+        );
+        let conn = wallet.pool.get().unwrap();
+        let completed = db::get_completed_transaction_by_id(&conn, batch.tx_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, CompletedTransactionStatus::Completed);
+        let change_status: String = conn
+            .query_row(
+                "SELECT status FROM outputs WHERE output_hash = ?1",
+                [change_hash.to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(change_status, "UNCONFIRMED");
+        // The input stays locked to the send: it is spent by it, not released.
+        assert_eq!(
+            input_lock(&wallet.pool, wallet.input_id),
+            ("LOCKED".to_string(), Some(wallet.pending_id.clone()))
+        );
+    }
+
+    #[test]
+    fn a_reservation_already_claimed_is_refused_and_left_alone() {
+        // Claimed before the call, the reservation is not found at all. (Claimed between the
+        // lookup and the claim, it is refused as `already <status>` instead; either way
+        // nothing is written and nothing released.)
+        let wallet = reserved_wallet();
+        db::update_pending_transaction_status(
+            &wallet.pool.get().unwrap(),
+            &wallet.pending_id,
+            PendingTransactionStatus::Completed,
+        )
+        .unwrap();
+
+        let err = record_batch_send(
+            &wallet.pool,
+            &Zeroizing::new(PASSWORD.to_string()),
+            KEY,
+            &batch(&wallet.pool),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("is gone"), "unexpected error: {err}");
+        assert_eq!(
+            reservation_status(&wallet.pool, &wallet.pending_id),
+            PendingTransactionStatus::Completed.to_string()
+        );
+        assert_eq!(
+            input_lock(&wallet.pool, wallet.input_id),
+            ("LOCKED".to_string(), Some(wallet.pending_id.clone()))
+        );
+        assert_eq!(count(&wallet.pool, COMPLETED_ROWS), 0);
+        assert_eq!(count(&wallet.pool, UNCONFIRMED_CHANGE_ROWS), 0);
+    }
+
+    #[test]
+    fn a_failed_recording_writes_nothing_and_releases_the_reservation() {
+        let wallet = reserved_wallet();
+        let batch = batch(&wallet.pool);
+
+        // A wrong password fails the key manager decrypt, inside the recording.
+        assert!(record_batch_send(
+            &wallet.pool,
+            &Zeroizing::new("not-the-password".to_string()),
+            KEY,
+            &batch,
+        )
+        .is_err());
+
+        assert_eq!(
+            reservation_status(&wallet.pool, &wallet.pending_id),
+            PendingTransactionStatus::Expired.to_string()
+        );
+        assert_eq!(
+            input_lock(&wallet.pool, wallet.input_id),
+            ("UNSPENT".to_string(), None)
+        );
+        assert_eq!(count(&wallet.pool, COMPLETED_ROWS), 0);
+        assert_eq!(count(&wallet.pool, UNCONFIRMED_CHANGE_ROWS), 0);
+    }
+
+    #[test]
+    fn a_failed_insert_rolls_back_the_claim_and_releases_the_reservation() {
+        let wallet = reserved_wallet();
+        let batch = batch(&wallet.pool);
+        // A completed transaction already filed under this id makes the insert fail after the
+        // claim has been made inside the write transaction.
+        {
+            let conn = wallet.pool.get().unwrap();
+            let account = db::get_account_by_name(&conn, ACCOUNT).unwrap().unwrap();
+            db::create_completed_transaction(
+                &conn,
+                account.id,
+                &wallet.pending_id,
+                &[],
+                b"{}",
+                None,
+                batch.tx_id,
+            )
+            .unwrap();
+        }
+
+        assert!(record_batch_send(
+            &wallet.pool,
+            &Zeroizing::new(PASSWORD.to_string()),
+            KEY,
+            &batch,
+        )
+        .is_err());
+
+        assert_eq!(
+            reservation_status(&wallet.pool, &wallet.pending_id),
+            PendingTransactionStatus::Expired.to_string()
+        );
+        assert_eq!(
+            input_lock(&wallet.pool, wallet.input_id),
+            ("UNSPENT".to_string(), None)
+        );
+        assert_eq!(
+            count(&wallet.pool, COMPLETED_ROWS),
+            1,
+            "only the pre-existing row"
+        );
+        assert_eq!(count(&wallet.pool, UNCONFIRMED_CHANGE_ROWS), 0);
     }
 }

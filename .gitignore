@@ -12,3 +12,5 @@
 !/tools/README.md
 # Checkouts fetch.sh clones to build from.
 /tools/src
+
+.claude/worktrees/

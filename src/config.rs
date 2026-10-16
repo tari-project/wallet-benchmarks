@@ -56,7 +56,6 @@ impl Default for HarnessConfig {
     }
 }
 
-
 /// Largest number of items one `POST /v1/payment-batches` accepts.
 ///
 /// `MAX_BATCH_SIZE` in `minotari_payment_processor/src/lib.rs`. A larger request is refused
@@ -180,8 +179,8 @@ pub struct Pins {
 impl Default for Pins {
     fn default() -> Self {
         Self {
-            console_wallet: "5.6.0-pre.1".to_string(),
-            minotari: "0.2.0".to_string(),
+            console_wallet: "6.2.0-pre.1".to_string(),
+            minotari: "0.3.0".to_string(),
             payment_processor: "0.1.0".to_string(),
             offline_signer: "5.3.0-pre.3".to_string(),
         }
@@ -742,8 +741,8 @@ mod tests {
     #[test]
     fn the_version_pins_round_trip_and_default_to_the_shipped_revisions() {
         let cfg = HarnessConfig::default();
-        assert_eq!(cfg.pins.console_wallet, "5.6.0-pre.1");
-        assert_eq!(cfg.pins.minotari, "0.2.0");
+        assert_eq!(cfg.pins.console_wallet, "6.2.0-pre.1");
+        assert_eq!(cfg.pins.minotari, "0.3.0");
         assert_eq!(cfg.pins.offline_signer, "5.3.0-pre.3");
         assert_eq!(cfg.pins.payment_processor, "0.1.0");
 
@@ -759,7 +758,7 @@ mod tests {
         .unwrap();
         assert!(cfg.pins.minotari.is_empty());
         assert_eq!(
-            cfg.pins.console_wallet, "5.6.0-pre.1",
+            cfg.pins.console_wallet, "6.2.0-pre.1",
             "switching one pin off must not clear the others"
         );
     }

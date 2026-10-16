@@ -110,8 +110,8 @@ fn first_line(text: &str) -> Option<String> {
 /// Checks a reported version against a pin.
 ///
 /// The match is a substring test, not equality: every one of these binaries prints its name
-/// alongside the version (`minotari_console_wallet 5.6.0-pre.1`), and two of them disagree
-/// with themselves about what that name is — `minotari --version` prints `tari 0.2.0` because
+/// alongside the version (`minotari_console_wallet 6.2.0-pre.1`), and two of them disagree
+/// with themselves about what that name is — `minotari --version` prints `tari 0.3.0` because
 /// the clap command is named `tari`, while its own `GET /version` reports the name
 /// `minotari`. Pinning the version and ignoring the name is the part that is stable.
 ///
@@ -161,30 +161,30 @@ mod tests {
         let observed = check(
             "minotari_console_wallet",
             "tools/minotari_console_wallet",
-            "minotari_console_wallet 5.6.0-pre.1",
-            "5.6.0-pre.1",
+            "minotari_console_wallet 6.2.0-pre.1",
+            "6.2.0-pre.1",
         )
         .unwrap();
         assert!(observed.pinned);
-        assert_eq!(observed.reported, "minotari_console_wallet 5.6.0-pre.1");
-        assert_eq!(observed.expected, "5.6.0-pre.1");
+        assert_eq!(observed.reported, "minotari_console_wallet 6.2.0-pre.1");
+        assert_eq!(observed.expected, "6.2.0-pre.1");
     }
 
     #[test]
     fn the_binarys_own_name_is_not_part_of_the_pin() {
-        // `minotari --version` prints `tari 0.2.0`: the clap command is named `tari` even
+        // `minotari --version` prints `tari 0.3.0`: the clap command is named `tari` even
         // though the executable and the crate are named `minotari`. Pinning on the name would
         // reject the right binary.
-        assert!(check("minotari", "tools/minotari", "tari 0.2.0", "0.2.0").is_ok());
+        assert!(check("minotari", "tools/minotari", "tari 0.3.0", "0.3.0").is_ok());
     }
 
     #[test]
     fn a_mismatched_version_refuses_the_run_and_says_both_versions() {
-        let err = check("minotari", "tools/minotari", "tari 0.1.0", "0.2.0")
+        let err = check("minotari", "tools/minotari", "tari 0.2.0", "0.3.0")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("tari 0.1.0"), "unexpected error: {err}");
-        assert!(err.contains("0.2.0"), "unexpected error: {err}");
+        assert!(err.contains("tari 0.2.0"), "unexpected error: {err}");
+        assert!(err.contains("0.3.0"), "unexpected error: {err}");
         assert!(err.contains("tools/fetch.sh"), "unexpected error: {err}");
     }
 
@@ -201,16 +201,16 @@ mod tests {
 
     #[test]
     fn a_prefix_of_the_version_is_not_a_match_in_the_wrong_direction() {
-        // `5.6.0-pre.1` must not be satisfied by a binary reporting `5.6.0`.
-        assert!(check("w", "p", "w 5.6.0", "5.6.0-pre.1").is_err());
-        // The other way round is a match, and deliberately so: pinning `5.6.0` accepts every
+        // `6.2.0-pre.1` must not be satisfied by a binary reporting `6.2.0`.
+        assert!(check("w", "p", "w 6.2.0", "6.2.0-pre.1").is_err());
+        // The other way round is a match, and deliberately so: pinning `6.2.0` accepts every
         // pre-release of it, which is what an operator asking for that pin means.
-        assert!(check("w", "p", "w 5.6.0-pre.1", "5.6.0").is_ok());
+        assert!(check("w", "p", "w 6.2.0-pre.1", "6.2.0").is_ok());
     }
 
     #[test]
     fn a_binary_that_cannot_be_run_says_which_one() {
-        let binary = PinnedBinary::new("missing", "/nonexistent/minotari", "0.2.0");
+        let binary = PinnedBinary::new("missing", "/nonexistent/minotari", "0.3.0");
         let err = binary.verify().unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("missing"), "unexpected error: {text}");
@@ -220,8 +220,8 @@ mod tests {
     #[test]
     fn the_first_non_empty_line_is_the_version() {
         assert_eq!(
-            first_line("\n\n  tari 0.2.0  \nmore\n").unwrap(),
-            "tari 0.2.0"
+            first_line("\n\n  tari 0.3.0  \nmore\n").unwrap(),
+            "tari 0.3.0"
         );
         assert_eq!(first_line("   \n  \n"), None);
     }

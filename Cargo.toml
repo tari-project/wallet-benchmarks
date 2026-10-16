@@ -33,19 +33,19 @@ zeroize = "1.8"
 # --- old wallet (minotari_console_wallet) : gRPC ----------------------------
 # `default-features = false` keeps `tari_core`/`tari_comms` out of the build;
 # the generated `tari_rpc` client is not behind that feature.
-minotari_app_grpc = { version = "5.6.0-pre.1", default-features = false }
+minotari_app_grpc = { version = "6.2.0-pre.1", default-features = false }
 tonic = { version = "0.13.1", features = ["tls-ring"] }
 
 # --- new wallet (minotari-cli) : library ------------------------------------
-minotari = { git = "https://github.com/tari-project/minotari-cli", rev = "60fde7b39e20a9d92c3b987a25eb636bf4da2722" }
+minotari = { git = "https://github.com/tari-project/minotari-cli", rev = "1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8" }
 # Same version the wallet library uses, so the pooled connections are the same type. Needed
 # for one narrow query the library cannot answer; see `modes::new_wallet::output_depth`.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 # Same versions the wallet library uses, so the pool it hands out and the one opened here are
 # the same types. Needed to open the wallet database with more than `DB_POOL_SIZE = 5`
 # connections; see `modes::new_wallet::open_pool`.
 r2d2 = "0.8.10"
-r2d2_sqlite = "0.31"
+r2d2_sqlite = "0.34"
 
 # --- payment processor mode : HTTP to the minotari daemon and the processor --------------
 # `rustls-tls` rather than the platform TLS stack: both services are on loopback, so this only
@@ -53,10 +53,10 @@ r2d2_sqlite = "0.31"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # --- shared tari primitives (seeds, addresses, offline signing) -------------
-tari_common = "5.6.0-pre.1"
-tari_common_types = "5.6.0-pre.1"
-tari_crypto = { version = "0.23", features = ["borsh"] }
-tari_transaction_components = "5.6.0-pre.1"
+tari_common = "6.2.0-pre.1"
+tari_common_types = "6.2.0-pre.1"
+tari_crypto = { version = "0.24", features = ["borsh"] }
+tari_transaction_components = "6.2.0-pre.1"
 tari_utilities = { version = "0.10", features = ["std"] }
 
 [dev-dependencies]

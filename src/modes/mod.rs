@@ -202,6 +202,10 @@ pub struct SendReceipt {
     pub broadcast: Option<Duration>,
     /// Why `broadcast` is absent. Ignored when `broadcast` is `Some`.
     pub broadcast_unavailable: Option<String>,
+    /// The node's reason, when it did not accept the first broadcast but the wallet kept the
+    /// send to rebroadcast it. Such a send can still be mined, so it is followed through
+    /// `tracker` like any other; this only keeps the refusal visible in the profile.
+    pub first_broadcast_refused: Option<String>,
     pub tracker: TxTracker,
 }
 

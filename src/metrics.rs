@@ -14,13 +14,12 @@ use crate::{config::HarnessConfig, sysprobe::EnvironmentInfo};
 
 /// Git revision of `minotari-cli` this harness is pinned to. Keep in step with `Cargo.toml`.
 ///
-/// Bumped from `84c79e9c` to current main. The five intervening commits are all
-/// transaction-reservation and idempotency fixes — atomic send idempotency, replayed sends no
-/// longer tearing down or double-spending a reservation, teardown guarded on the reservation
-/// still being pending, and the unlocker kept off claimed rows. That is exactly the ground S4
-/// stresses, so `new_wallet`'s S4 numbers are expected to move against any profile taken on
-/// the old pin.
-pub const MINOTARI_CLI_REV: &str = "60fde7b39e20a9d92c3b987a25eb636bf4da2722";
+/// Bumped from `60fde7b3` to current main, which moves the tari crates to 6.2.0-pre.1. The
+/// intervening commits change what the benchmarks measure: every send now carries a change
+/// output and writes it at send time, a send the node does not accept stays recorded (and
+/// locked) for rebroadcast instead of being released, and each scan pass now ends by running
+/// the transaction monitor. Profiles taken on the old pin are not comparable; see the README.
+pub const MINOTARI_CLI_REV: &str = "1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8";
 
 /// How a scenario ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1018,5 +1017,49 @@ mod tests {
         let parsed: ScenarioReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
         assert_eq!(parsed.total_recorded_fees(), 17);
+    }
+
+    #[test]
+    fn the_minotari_cli_pin_is_the_same_everywhere_it_is_written() {
+        // The library the harness links, the daemon `tools/fetch.sh` builds and the revision
+        // every profile records must be one revision, or a profile describes a wallet that
+        // was never run.
+        let manifest = include_str!("../Cargo.toml");
+        let fetch = include_str!("../tools/fetch.sh");
+        assert!(
+            manifest.contains(&format!("rev = \"{MINOTARI_CLI_REV}\"")),
+            "Cargo.toml does not pin minotari-cli at {MINOTARI_CLI_REV}"
+        );
+        assert!(
+            fetch.contains(&format!("MINOTARI_CLI_REV=\"{MINOTARI_CLI_REV}\"")),
+            "tools/fetch.sh does not build minotari-cli at {MINOTARI_CLI_REV}"
+        );
+
+        // The daemon's `--version` pin is the crate version at that revision.
+        let lock = include_str!("../Cargo.lock");
+        let pin = crate::config::Pins::default().minotari;
+        assert!(
+            lock.contains(&format!(
+                "name = \"minotari\"\nversion = \"{pin}\"\nsource = \
+                 \"git+https://github.com/tari-project/minotari-cli?rev={MINOTARI_CLI_REV}#"
+            )),
+            "Cargo.lock does not resolve minotari {pin} at {MINOTARI_CLI_REV}"
+        );
+    }
+
+    #[test]
+    fn the_console_wallet_pin_matches_the_tari_crates_and_the_build_script() {
+        // The gRPC client and the console wallet it talks to come from the same tari release.
+        let pin = crate::config::Pins::default().console_wallet;
+        let manifest = include_str!("../Cargo.toml");
+        let fetch = include_str!("../tools/fetch.sh");
+        assert!(
+            manifest.contains(&format!("minotari_app_grpc = {{ version = \"{pin}\"")),
+            "Cargo.toml does not link minotari_app_grpc {pin}"
+        );
+        assert!(
+            fetch.contains(&format!("TARI_REV=\"v{pin}\"")),
+            "tools/fetch.sh does not build the console wallet at v{pin}"
+        );
     }
 }

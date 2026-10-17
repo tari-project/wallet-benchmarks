@@ -350,6 +350,11 @@ pub trait WalletMode: Send + Sync {
         usize::MAX
     }
 
+    /// Largest number of outputs one send can list in [`SendRequest::exclude_outputs_of`].
+    fn max_excluded_outputs(&self) -> usize {
+        usize::MAX
+    }
+
     /// The processes this mode's resource samples are attributed to, headline first.
     ///
     /// Replaces the old `samples_include_harness()` flag, which could say nothing useful

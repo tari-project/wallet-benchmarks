@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::{
+    config::RoundPlan,
     metrics::ScenarioReport,
     modes::{OutputSpec, SendRequest, WalletMode},
     scenarios::{
@@ -78,7 +79,11 @@ impl Scenario for UtxoBuildUp {
         }
 
         let mut round_notes = Vec::new();
-        let mut halt: Option<String> = None;
+        // Found before any round runs, not part way through the fan-out hours later.
+        let mut halt = exclusion_limit_failure(&plan, mode.max_excluded_outputs());
+        if halt.is_some() {
+            plan.clear();
+        }
 
         for round in plan {
             let round_started = Instant::now();
@@ -123,9 +128,9 @@ impl Scenario for UtxoBuildUp {
                 break;
             }
 
-            // Spend the largest UTXOs first, one transaction per UTXO. Asking for half (or an
-            // eighth) of a specific UTXO is the closest the harness can steer a wallet that
-            // owns its own input selection; whatever the wallet actually picks is measured.
+            // Spend the largest UTXOs first, one transaction per UTXO, asking for half (or an
+            // eighth) of each. The wallet still picks the inputs, but may not pick outputs
+            // created earlier in this round.
             let first_index = report.transactions.len();
             let mut pending: Vec<Pending> = Vec::new();
             for (i, value) in amounts.iter().take(round.txs as usize).enumerate() {
@@ -270,5 +275,46 @@ impl Scenario for UtxoBuildUp {
             ));
         }
         Ok(report)
+    }
+}
+
+/// The reason S1 cannot run when the last send of some round would have to exclude more
+/// outputs than the mode accepts.
+fn exclusion_limit_failure(plan: &[RoundPlan], limit: usize) -> Option<String> {
+    for round in plan {
+        let needed = round.txs.saturating_sub(1) * u64::from(round.outputs_per_tx);
+        if needed > limit as u64 {
+            return Some(format!(
+                "round {} would exclude {needed} outputs from input selection in its last send, \
+                 but this mode accepts at most {limit}",
+                round.round
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exclusion_limit_failure;
+    use crate::config::Params;
+
+    #[test]
+    fn the_reference_plan_fits_the_console_wallet_limit() {
+        let params = Params::default();
+        let mut plan = params.doubling_plan_from(1);
+        plan.push(params.fanout_plan_from(1));
+        // 63 earlier sends of 8 outputs each.
+        assert_eq!(exclusion_limit_failure(&plan, 504), None);
+    }
+
+    #[test]
+    fn a_scaled_plan_past_the_limit_fails_before_any_round() {
+        let params = Params::default();
+        let mut plan = params.doubling_plan_from(2);
+        plan.push(params.fanout_plan_from(2));
+        let reason = exclusion_limit_failure(&plan, 512).unwrap();
+        assert!(reason.contains("1016"), "{reason}");
+        assert_eq!(exclusion_limit_failure(&plan, usize::MAX), None);
     }
 }

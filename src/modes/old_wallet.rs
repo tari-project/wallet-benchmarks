@@ -648,6 +648,10 @@ impl WalletMode for OldWallet {
         })
     }
 
+    fn max_excluded_outputs(&self) -> usize {
+        MAX_EXCLUDED_COMMITMENTS
+    }
+
     fn resource_processes(&self) -> Vec<ProcessRole> {
         vec![ProcessRole::external(PROCESS_CONSOLE_WALLET)]
     }

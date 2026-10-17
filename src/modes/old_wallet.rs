@@ -57,6 +57,9 @@ const STATUS_COINBASE_UNCONFIRMED: i32 = 12;
 const STATUS_REJECTED: i32 = 7;
 const STATUS_NOT_FOUND: i32 = 11;
 
+/// Most commitments `Transfer` accepts in `excluded_commitments` (`MAX_ALLOWED_QUERY_SIZE`).
+const MAX_EXCLUDED_COMMITMENTS: usize = 512;
+
 /// Label the console wallet process is reported under in the profile's resource breakdown.
 const PROCESS_CONSOLE_WALLET: &str = "console_wallet";
 
@@ -240,6 +243,46 @@ impl OldWallet {
             .map_err(|e| anyhow!("GetTransactionInfo failed: {e}"))?;
         Ok(response.into_inner().transactions.into_iter().next())
     }
+
+    /// Commitments of every output the given transactions created, for `excluded_commitments`.
+    async fn output_commitments_of(&self, trackers: &[TxTracker]) -> Result<Vec<Vec<u8>>> {
+        if trackers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut transaction_ids = Vec::with_capacity(trackers.len());
+        for tracker in trackers {
+            transaction_ids.push(tracker.expect_wallet_tx_id()?);
+        }
+        let mut client = self.client().await?;
+        let response = client
+            .get_transaction_info(grpc::GetTransactionInfoRequest { transaction_ids })
+            .await
+            .map_err(|e| anyhow!("GetTransactionInfo failed: {e}"))?;
+        excluded_commitments(response.into_inner().transactions)
+    }
+}
+
+/// Flattens the transactions' output commitments into one exclusion list, refusing any it
+/// could not make complete: a transaction with no outputs listed, or more than `Transfer` takes.
+fn excluded_commitments(transactions: Vec<grpc::TransactionInfo>) -> Result<Vec<Vec<u8>>> {
+    let mut commitments = Vec::new();
+    for info in transactions {
+        if info.output_commitments.is_empty() {
+            return Err(anyhow!(
+                "Cannot exclude the outputs of tx {}: the wallet lists none",
+                info.tx_id
+            ));
+        }
+        commitments.extend(info.output_commitments);
+    }
+    if commitments.len() > MAX_EXCLUDED_COMMITMENTS {
+        return Err(anyhow!(
+            "{} outputs to exclude from input selection, but Transfer accepts at most \
+             {MAX_EXCLUDED_COMMITMENTS}",
+            commitments.len()
+        ));
+    }
+    Ok(commitments)
 }
 
 #[async_trait]
@@ -537,6 +580,9 @@ impl WalletMode for OldWallet {
     }
 
     async fn send(&self, request: SendRequest) -> Result<SendReceipt> {
+        let excluded_commitments = self
+            .output_commitments_of(&request.exclude_outputs_of)
+            .await?;
         let mut client = self.client().await?;
         let recipients = request
             .outputs
@@ -558,7 +604,7 @@ impl WalletMode for OldWallet {
             .transfer(grpc::TransferRequest {
                 recipients,
                 single_tx: request.outputs.len() > 1,
-                excluded_commitments: Vec::new(),
+                excluded_commitments,
             })
             .await
             .map_err(|e| anyhow!("Transfer failed: {e}"))?
@@ -683,6 +729,36 @@ mod tests {
             grpc::TransactionStatus::MinedConfirmedLocked as i32,
             STATUS_MINED_CONFIRMED_LOCKED
         );
+    }
+
+    fn info(tx_id: u64, outputs: usize) -> grpc::TransactionInfo {
+        grpc::TransactionInfo {
+            tx_id,
+            output_commitments: (0..outputs).map(|i| vec![i as u8; 32]).collect(),
+            ..grpc::TransactionInfo::default()
+        }
+    }
+
+    #[test]
+    fn every_output_of_every_earlier_send_is_excluded() {
+        let commitments = excluded_commitments(vec![info(1, 8), info(2, 2)]).unwrap();
+        assert_eq!(commitments.len(), 10);
+        assert_eq!(commitments[8], vec![0u8; 32]);
+    }
+
+    #[test]
+    fn a_send_without_listed_outputs_cannot_be_excluded() {
+        let error = excluded_commitments(vec![info(1, 8), info(7, 0)]).unwrap_err();
+        assert!(error.to_string().contains("tx 7"));
+    }
+
+    #[test]
+    fn the_exclusion_list_stays_within_what_transfer_accepts() {
+        // The reference fan-out round: 63 earlier sends of 8 outputs each fit.
+        let round: Vec<_> = (0..63).map(|i| info(i, 8)).collect();
+        assert_eq!(excluded_commitments(round).unwrap().len(), 504);
+        let too_many: Vec<_> = (0..65).map(|i| info(i, 8)).collect();
+        assert!(excluded_commitments(too_many).is_err());
     }
 
     #[test]

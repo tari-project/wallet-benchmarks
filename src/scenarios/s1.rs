@@ -127,7 +127,7 @@ impl Scenario for UtxoBuildUp {
             // eighth) of a specific UTXO is the closest the harness can steer a wallet that
             // owns its own input selection; whatever the wallet actually picks is measured.
             let first_index = report.transactions.len();
-            let mut pending = Vec::new();
+            let mut pending: Vec<Pending> = Vec::new();
             for (i, value) in amounts.iter().take(round.txs as usize).enumerate() {
                 let label = format!("s1-r{}-tx{}", round.round, i);
                 let Some(each) = split_value(*value, round.outputs_per_tx) else {
@@ -155,6 +155,9 @@ impl Scenario for UtxoBuildUp {
                     label,
                     outputs,
                     fee_per_gram: params.fee_rate,
+                    // Outputs created earlier in this round can confirm before the round
+                    // ends; a wallet that spends them breaks the round's UTXO count.
+                    exclude_outputs_of: pending.iter().map(|p| p.tracker.clone()).collect(),
                 };
                 let (metric, tracker) = send_recorded(mode, request, round_started).await;
                 let index = report.transactions.len();

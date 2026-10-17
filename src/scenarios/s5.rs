@@ -49,6 +49,17 @@ impl ArmResult {
     fn complete(&self) -> bool {
         self.txs > 0 && self.tally.unsuccessful() == 0
     }
+
+    /// An arm that ran and confirmed nothing paid no one, so the scenario failed.
+    fn failure(&self, arm: &str) -> Option<String> {
+        if self.tally.confirmed > 0 {
+            return None;
+        }
+        Some(format!(
+            "S5 {arm} arm: none of {} transactions confirmed",
+            self.txs
+        ))
+    }
 }
 
 pub struct PaymentThroughput;
@@ -204,6 +215,12 @@ impl Scenario for PaymentThroughput {
             .sum();
         report.note("amount_sent", spent.saturating_sub(report.fees_paid));
         report.reconcile(report.balance_start.saturating_sub(spent));
+        if let Some(reason) = batch.and_then(|b| b.failure("batch")) {
+            report.fail(reason);
+        }
+        if let Some(reason) = individual.failure("individual") {
+            report.fail(reason);
+        }
         Ok(report)
     }
 }
@@ -250,6 +267,7 @@ async fn run_arm(
             label: format!("{prefix}-tx{i}"),
             outputs,
             fee_per_gram: params.fee_rate,
+            exclude_outputs_of: Vec::new(),
         };
         let (metric, tracker) = send_recorded(mode, request, arm_started).await;
         let index = report.transactions.len();
@@ -320,5 +338,15 @@ mod tests {
     fn a_partly_completed_arm_is_not_comparable_either() {
         assert!(!arm(100, 6, 94).complete());
         assert!(!arm(0, 0, 0).complete());
+    }
+
+    #[test]
+    fn an_arm_that_confirmed_nothing_fails_the_scenario() {
+        assert_eq!(
+            arm(10, 0, 10).failure("batch").as_deref(),
+            Some("S5 batch arm: none of 10 transactions confirmed")
+        );
+        assert_eq!(arm(100, 6, 94).failure("individual"), None);
+        assert_eq!(arm(10, 10, 0).failure("batch"), None);
     }
 }

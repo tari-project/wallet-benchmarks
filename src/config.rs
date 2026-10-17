@@ -292,11 +292,8 @@ pub struct Params {
     pub s5_k: u32,
     /// Fee rate (µT per gram) every mode is run at.
     ///
-    /// One value for all three, or the modes cannot be compared. It is 5 rather than the
-    /// protocol minimum of 1 because 5 is what the `minotari` daemon and the payment
-    /// processor both default to (`FEE_PER_GRAM`), and because a fee of 1 has been measured
-    /// taking about an hour to mine on Esmeralda against minutes at 5 — a scenario budget
-    /// spent waiting for a miner is not a measurement of a wallet.
+    /// One value for all three, or the modes cannot be compared. Defaults to the protocol
+    /// minimum of 1.
     ///
     /// `old_wallet` and `new_wallet` are handed this per request. `payment_processor` is not:
     /// the processor takes its fee from `FEE_PER_GRAM` in its own environment, so the harness
@@ -328,7 +325,7 @@ impl Default for Params {
             s4_budget_secs: 900,
             s5_m: 100,
             s5_k: 10,
-            fee_rate: 5,
+            fee_rate: 1,
             s4_amount: 100_000,
             s5_amount: 100_000,
             confirm_timeout_secs: 1_800,
@@ -774,7 +771,7 @@ mod tests {
         let mut cfg: HarnessConfig = toml::from_str(&text).unwrap();
         cfg.resolve_derived();
         cfg.validate().unwrap();
-        assert_eq!(cfg.params.fee_rate, 5);
+        assert_eq!(cfg.params.fee_rate, 1);
         assert_eq!(cfg.pins, Pins::default());
     }
 

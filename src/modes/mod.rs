@@ -89,6 +89,9 @@ pub struct SendRequest {
     pub label: String,
     pub outputs: Vec<OutputSpec>,
     pub fee_per_gram: u64,
+    /// Earlier sends whose outputs this send must not spend. S1 lists the round's earlier
+    /// sends, so each one spends only outputs that existed when the round started.
+    pub exclude_outputs_of: Vec<TxTracker>,
 }
 
 impl SendRequest {
@@ -100,6 +103,7 @@ impl SendRequest {
                 amount,
             }],
             fee_per_gram,
+            exclude_outputs_of: Vec::new(),
         }
     }
 
@@ -533,6 +537,7 @@ mod tests {
                 },
             ],
             fee_per_gram: 5,
+            exclude_outputs_of: Vec::new(),
         };
         assert_eq!(request.total_amount(), 42);
         assert_eq!(SendRequest::single("x", "addr", 7, 5).total_amount(), 7);

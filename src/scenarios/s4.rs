@@ -56,6 +56,7 @@ impl Scenario for ConcurrentConstruction {
         report.utxos_start = mode.unspent_amounts().await?.len() as u64;
 
         let mut level_notes = Vec::new();
+        let mut level_failures = Vec::new();
 
         for level in &params.concurrent_batches {
             let level = *level;
@@ -144,6 +145,10 @@ impl Scenario for ConcurrentConstruction {
                 )
             };
 
+            if let Some(reason) = level_failure(level, &tally) {
+                level_failures.push(reason);
+            }
+
             // Let the wallet catch up before the next level, otherwise the ramp measures a
             // shrinking UTXO pool rather than concurrency.
             let sync_error = mode
@@ -198,6 +203,48 @@ impl Scenario for ConcurrentConstruction {
              measurement",
         );
         report.reconcile(report.balance_start.saturating_sub(report.fees_paid));
+        for reason in level_failures {
+            report.fail(reason);
+        }
         Ok(report)
+    }
+}
+
+/// A level where nothing confirmed measured no construction at all, only refusals.
+fn level_failure(level: u32, tally: &TxTally) -> Option<String> {
+    if tally.confirmed > 0 {
+        return None;
+    }
+    Some(format!(
+        "S4 level {level}: none of {} transactions confirmed",
+        tally.confirmed + tally.unsuccessful()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{level_failure, TxTally};
+
+    #[test]
+    fn a_level_with_no_confirmations_fails() {
+        let tally = TxTally {
+            failed: 8,
+            ..TxTally::default()
+        };
+        assert_eq!(
+            level_failure(8, &tally).as_deref(),
+            Some("S4 level 8: none of 8 transactions confirmed")
+        );
+    }
+
+    #[test]
+    fn a_level_with_some_confirmations_does_not() {
+        // Partial failure under contention is the measurement, not a scenario failure.
+        let tally = TxTally {
+            confirmed: 1,
+            failed: 15,
+            ..TxTally::default()
+        };
+        assert_eq!(level_failure(16, &tally), None);
     }
 }

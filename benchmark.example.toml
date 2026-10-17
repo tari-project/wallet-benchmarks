@@ -75,12 +75,9 @@ s4_budget_secs = 900
 s5_m = 100
 s5_k = 10
 # Fee rate, in µT per gram, every mode is run at. One value for all three, or the modes are not
-# comparable. 5 rather than the protocol minimum of 1: 5 is what the minotari daemon and the
-# payment processor both default to (FEE_PER_GRAM), and a fee of 1 has been measured taking about
-# an hour to mine on Esmeralda against minutes at 5 — a scenario budget spent waiting for a miner
-# measures the miner, not the wallet. payment_processor takes its fee from its own environment, so
-# the harness sets FEE_PER_GRAM from this value and refuses to start if the two disagree.
-fee_rate = 5
+# comparable. payment_processor takes its fee from its own environment, so the harness sets
+# FEE_PER_GRAM from this value and refuses to start if the two disagree.
+fee_rate = 1
 # Amount per output, in µT.
 s4_amount = 100000
 s5_amount = 100000

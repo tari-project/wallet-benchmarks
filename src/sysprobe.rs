@@ -59,16 +59,24 @@ impl EnvironmentInfo {
 
 /// Whether the base node is reachable over loopback or over the network.
 pub fn classify_base_node_path(url: &str) -> String {
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
+    let parsed = url::Url::parse(url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(url::Url::host_str)
+        .unwrap_or_else(|| {
+            let authority = url
+                .split("://")
+                .nth(1)
+                .unwrap_or(url)
+                .split('/')
+                .next()
+                .unwrap_or("");
+            if let Some(rest) = authority.strip_prefix('[') {
+                rest.split(']').next().unwrap_or(authority)
+            } else {
+                authority.split(':').next().unwrap_or("")
+            }
+        });
     if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
         "local".to_string()
     } else {
@@ -158,6 +166,8 @@ mod tests {
     fn base_node_path_is_classified() {
         assert_eq!(classify_base_node_path("http://127.0.0.1:18142"), "local");
         assert_eq!(classify_base_node_path("http://localhost:18142/"), "local");
+        assert_eq!(classify_base_node_path("http://[::1]:18142"), "local");
+        assert_eq!(classify_base_node_path("[::1]:18142"), "local");
         assert_eq!(
             classify_base_node_path("https://rpc.esmeralda.tari.com"),
             "remote"

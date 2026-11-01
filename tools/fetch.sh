@@ -27,7 +27,7 @@ SRC_DIR="${TOOLS_DIR}/src"
 
 # tari, for `minotari_console_wallet` (mode 1). Reports `minotari_console_wallet 6.2.0-pre.1`.
 TARI_REPO="https://github.com/tari-project/tari.git"
-TARI_REV="v6.2.0-pre.2"
+TARI_REV="v6.2.0-pre.1"
 
 # tari again, at a *different* revision, for `minotari_offline_signer` (mode 3).
 #
@@ -38,7 +38,7 @@ TARI_REV="v6.2.0-pre.2"
 # produces nor produce output it can parse — every signing attempt fails and every batch
 # exhausts its retries. 9f5adb7 (v5.3.0-pre.3) is the earliest tari release that ships the
 # signer while still on 4.0.0.
-SIGNER_REV="v6.2.0-pre.2"
+SIGNER_REV="v5.3.0-pre.3"
 
 # minotari-cli, for the `minotari` daemon (mode 3's payment receiver). Reports `tari 0.3.0`:
 # the executable is `minotari` but its clap command is named `tari`. This is the same

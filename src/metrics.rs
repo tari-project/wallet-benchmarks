@@ -734,8 +734,12 @@ fn median(mut values: Vec<f64>) -> f64 {
 /// Computes the deltas the spec calls out, for every mode present in `reports`.
 pub fn compute_deltas(reports: &[ScenarioReport]) -> Vec<Delta> {
     let mut deltas = Vec::new();
-    let mut modes: Vec<&str> = reports.iter().map(|r| r.mode.as_str()).collect();
-    modes.dedup();
+    let mut modes: Vec<&str> = Vec::new();
+    for report in reports {
+        if !modes.contains(&report.mode.as_str()) {
+            modes.push(&report.mode);
+        }
+    }
 
     for mode in modes {
         let scan_of = |id: &str| -> Option<f64> {
@@ -881,6 +885,22 @@ mod tests {
         assert!((by_name("T_scan(S2) - T_scan(B0)") - 15.0).abs() < f64::EPSILON);
         assert!((by_name("T_scan(S6) - T_scan(S2)") - 15.0).abs() < f64::EPSILON);
         assert!((by_name("T_scan(S6) / T_scan(B0)") - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn interleaved_modes_do_not_duplicate_deltas() {
+        let reports = vec![
+            scan_report("old_wallet", "B0", 10.0),
+            scan_report("new_wallet", "B0", 5.0),
+            scan_report("old_wallet", "S2", 25.0),
+            scan_report("new_wallet", "S2", 12.0),
+        ];
+        let deltas = compute_deltas(&reports);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].mode, "old_wallet");
+        assert!((deltas[0].value - 15.0).abs() < f64::EPSILON);
+        assert_eq!(deltas[1].mode, "new_wallet");
+        assert!((deltas[1].value - 7.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1036,7 +1056,7 @@ mod tests {
         );
 
         // The daemon's `--version` pin is the crate version at that revision.
-        let lock = include_str!("../Cargo.lock");
+        let lock = include_str!("../Cargo.lock").replace("\r\n", "\n");
         let pin = crate::config::Pins::default().minotari;
         assert!(
             lock.contains(&format!(
@@ -1050,7 +1070,9 @@ mod tests {
     #[test]
     fn the_console_wallet_pin_matches_the_tari_crates_and_the_build_script() {
         // The gRPC client and the console wallet it talks to come from the same tari release.
-        let pin = crate::config::Pins::default().console_wallet;
+        let pins = crate::config::Pins::default();
+        let pin = pins.console_wallet;
+        let signer_pin = pins.offline_signer;
         let manifest = include_str!("../Cargo.toml");
         let fetch = include_str!("../tools/fetch.sh");
         assert!(
@@ -1060,6 +1082,10 @@ mod tests {
         assert!(
             fetch.contains(&format!("TARI_REV=\"v{pin}\"")),
             "tools/fetch.sh does not build the console wallet at v{pin}"
+        );
+        assert!(
+            fetch.contains(&format!("SIGNER_REV=\"v{signer_pin}\"")),
+            "tools/fetch.sh does not build the offline signer at v{signer_pin}"
         );
     }
 }

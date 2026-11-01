@@ -88,6 +88,22 @@ pub fn probe_version(path: &Path, args: &[&str]) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let line = first_line(&stdout).or_else(|| first_line(&stderr));
+    if !output.status.success() {
+        return match line {
+            Some(detail) => Err(anyhow!(
+                "`{} {}` exited with {}: {detail}",
+                path.display(),
+                args.join(" "),
+                output.status
+            )),
+            None => Err(anyhow!(
+                "`{} {}` exited with {} and printed nothing",
+                path.display(),
+                args.join(" "),
+                output.status
+            )),
+        };
+    }
     match line {
         Some(line) => Ok(line),
         None => Err(anyhow!(
@@ -230,7 +246,26 @@ mod tests {
     fn a_real_binary_can_be_probed() {
         // `echo` is not a wallet, but it proves the plumbing reads a child's stdout rather
         // than guessing.
+        #[cfg(unix)]
         let version = probe_version(Path::new("/bin/echo"), &["harness 1.2.3"]).unwrap();
+        #[cfg(windows)]
+        let version = probe_version(Path::new("cmd"), &["/C", "echo harness 1.2.3"]).unwrap();
         assert_eq!(version, "harness 1.2.3");
+    }
+
+    #[test]
+    fn a_binary_that_exits_non_zero_fails_to_probe_even_when_it_prints_output() {
+        #[cfg(unix)]
+        let err = probe_version(Path::new("/bin/sh"), &["-c", "echo 'fatal error' >&2; exit 1"])
+            .unwrap_err()
+            .to_string();
+        #[cfg(windows)]
+        let err = probe_version(
+            Path::new("cmd"),
+            &["/C", "echo fatal error 1>&2 && exit /b 1"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fatal error"), "unexpected error: {err}");
     }
 }
